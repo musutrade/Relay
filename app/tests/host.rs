@@ -669,3 +669,63 @@ fn complete_local_cli_example_validates_after_path_substitution() {
         assert!(!job.publish);
     }
 }
+
+#[test]
+fn native_codex_item_failure_can_recover_but_fatal_errors_cannot() {
+    let item_error = "print(json.dumps({'type':'item.completed','item':{'id':'e1','type':'error','message':'temporary tool failure'}}))";
+    let initial = "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'initial plan'}}))";
+    for (body, expected, summary, usage) in [
+        (
+            format!("{initial}\n{item_error}\n{NATIVE_CODEX_SUCCESS}"),
+            Outcome::Success,
+            "native completed",
+            Some(9),
+        ),
+        (
+            format!("{initial}\n{item_error}"),
+            Outcome::Failure,
+            "initial plan",
+            None,
+        ),
+        (
+            format!("{initial}\nprint('malformed')\n{NATIVE_CODEX_SUCCESS}"),
+            Outcome::Failure,
+            "native completed",
+            Some(9),
+        ),
+        (
+            format!(
+                "{initial}\nprint(json.dumps({{'type':'error','message':'fatal transport failure'}}))\n{NATIVE_CODEX_SUCCESS}"
+            ),
+            Outcome::Failure,
+            "native completed",
+            Some(9),
+        ),
+        (
+            format!(
+                "{initial}\n{item_error}\nprint(json.dumps({{'type':'turn.failed','error':{{'message':'failed'}}}}))"
+            ),
+            Outcome::Failure,
+            "initial plan",
+            None,
+        ),
+        (
+            format!("{initial}\n{item_error}\n{NATIVE_CODEX_SUCCESS}\nsys.exit(4)"),
+            Outcome::Failure,
+            "native completed",
+            Some(9),
+        ),
+    ] {
+        let f = native_fixture("codex_cli", &body, "codex-cli 0.200.0");
+        let result = f.run(&f.task(1));
+        assert_eq!(result.outcome, expected, "{result:?}");
+        let command = result.agent.unwrap();
+        let provider = command.provider.unwrap();
+        assert_eq!(provider.summary, summary);
+        assert_eq!(provider.usage.input_tokens, usage);
+        if expected == Outcome::Success {
+            assert_eq!(command.exit_code, Some(0));
+            assert!(command.error.is_none());
+        }
+    }
+}
