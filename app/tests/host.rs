@@ -5,6 +5,7 @@ use serde_json::json;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -121,7 +122,11 @@ fn fake_agent_tests_and_draft_adapter_use_private_snapshot_and_literal_input() {
         fs::read_to_string(workspace.join("original.txt")).unwrap(),
         "original\n"
     );
-    assert!(!workspace.join(".git").exists());
+    assert!(workspace.join(".git").is_dir());
+    assert_ne!(
+        fs::read(workspace.join(".git/config")).unwrap(),
+        fs::read(fixture.temp.path().join("source/.git/config")).unwrap()
+    );
     assert!(workspace.join("published.txt").exists());
     assert!(!fixture.temp.path().join("source/changed.txt").exists());
     assert!(!injection_target.exists());
@@ -133,6 +138,153 @@ fn fake_agent_tests_and_draft_adapter_use_private_snapshot_and_literal_input() {
             & 0o777,
         0o700
     );
+}
+
+fn initialize_parent_repository(fixture: &Fixture) {
+    let result = Command::new("/usr/bin/git")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args(["init", "--quiet", "--template="])
+        .arg(fixture.temp.path())
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    fs::write(fixture.temp.path().join("home-only-file"), "outside task\n").unwrap();
+}
+
+#[test]
+fn ordinary_task_git_root_and_status_exclude_parent_repository() {
+    let fixture = Fixture::new(
+        "git rev-parse --show-toplevel > git-root.txt && git status --porcelain --untracked-files=all > git-status.txt",
+    );
+    initialize_parent_repository(&fixture);
+    let result = fixture.run(&fixture.task(1));
+    assert_eq!(result.outcome, Outcome::Success, "{result:?}");
+    let workspace = fixture.workspace(1).canonicalize().unwrap();
+    assert_eq!(
+        fs::read_to_string(workspace.join("git-root.txt"))
+            .unwrap()
+            .trim(),
+        workspace.to_str().unwrap()
+    );
+    let status = fs::read_to_string(workspace.join("git-status.txt")).unwrap();
+    assert!(status.contains("original.txt"));
+    assert!(!status.contains("home-only-file"));
+    assert!(!status.contains("../"));
+    assert!(!status.contains("source/"));
+    assert_eq!(
+        fs::read_to_string(fixture.temp.path().join("home-only-file")).unwrap(),
+        "outside task\n"
+    );
+    let git_config = fs::read_to_string(workspace.join(".git/config")).unwrap();
+    assert!(git_config.contains("hooksPath = /dev/null"));
+    assert!(!workspace.join(".git/hooks").exists());
+}
+
+#[test]
+fn ordinary_task_git_discovery_stops_when_private_metadata_is_removed() {
+    let fixture = Fixture::new(
+        "mv .git ../saved-private-git; git rev-parse --show-toplevel > git-root.txt 2> git-error.txt",
+    );
+    initialize_parent_repository(&fixture);
+    let result = fixture.run(&fixture.task(1));
+    assert_eq!(result.outcome, Outcome::Failure, "{result:?}");
+    assert_eq!(result.agent.unwrap().exit_code, Some(128));
+    assert!(
+        fs::read(fixture.workspace(1).join("git-root.txt"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn source_git_files_and_symlinks_are_never_copied_or_followed() {
+    for use_symlink in [false, true] {
+        let fixture = Fixture::new("git rev-parse --show-toplevel > git-root.txt");
+        initialize_parent_repository(&fixture);
+        let source_git = fixture.temp.path().join("source/.git");
+        fs::remove_dir_all(&source_git).unwrap();
+        let parent_git = fixture.temp.path().join(".git");
+        let parent_config = fs::read(parent_git.join("config")).unwrap();
+        if use_symlink {
+            symlink(&parent_git, &source_git).unwrap();
+        } else {
+            fs::write(&source_git, format!("gitdir: {}\n", parent_git.display())).unwrap();
+        }
+        let result = fixture.run(&fixture.task(1));
+        assert_eq!(result.outcome, Outcome::Success, "{result:?}");
+        let workspace = fixture.workspace(1).canonicalize().unwrap();
+        let metadata = fs::symlink_metadata(workspace.join(".git")).unwrap();
+        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+        assert_eq!(
+            fs::read_to_string(workspace.join("git-root.txt"))
+                .unwrap()
+                .trim(),
+            workspace.to_str().unwrap()
+        );
+        assert_eq!(fs::read(parent_git.join("config")).unwrap(), parent_config);
+        assert!(
+            fs::symlink_metadata(&source_git)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+                == use_symlink
+        );
+    }
+}
+
+#[test]
+fn inherited_git_redirects_are_removed_before_running_task_commands() {
+    let mut fixture = Fixture::new(
+        "test -z \"${GIT_DIR+x}${GIT_WORK_TREE+x}${GIT_COMMON_DIR+x}${GIT_INDEX_FILE+x}${GIT_OBJECT_DIRECTORY+x}${GIT_ALTERNATE_OBJECT_DIRECTORIES+x}${GIT_SHALLOW_FILE+x}\" && git rev-parse --show-toplevel > git-root.txt && git add original.txt",
+    );
+    initialize_parent_repository(&fixture);
+    // Inject into only the supervisor subprocess, without mutating this test
+    // process's environment or racing the other parallel host tests.
+    let wrapper = fixture.temp.path().join("supervisor-with-git-env.py");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/usr/bin/python3\nimport os, sys\nroot = {}\nos.environ.update({{'GIT_DIR': root + '/.git', 'GIT_WORK_TREE': root, 'GIT_COMMON_DIR': root + '/.git', 'GIT_INDEX_FILE': root + '/outside-index', 'GIT_OBJECT_DIRECTORY': root + '/.git/objects', 'GIT_ALTERNATE_OBJECT_DIRECTORIES': root + '/.git/objects', 'GIT_SHALLOW_FILE': root + '/outside-shallow', 'GIT_CEILING_DIRECTORIES': '/'}})\nos.execv({}, [{}, *sys.argv[1:]])\n",
+            serde_json::to_string(&fixture.temp.path().to_str().unwrap()).unwrap(),
+            serde_json::to_string(env!("CARGO_BIN_EXE_relay-app")).unwrap(),
+            serde_json::to_string(env!("CARGO_BIN_EXE_relay-app")).unwrap(),
+        ),
+    ).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.config.supervisor_program = Some(wrapper);
+    let result = fixture.run(&fixture.task(1));
+    assert_eq!(result.outcome, Outcome::Success, "{result:?}");
+    let workspace = fixture.workspace(1).canonicalize().unwrap();
+    assert_eq!(
+        fs::read_to_string(workspace.join("git-root.txt"))
+            .unwrap()
+            .trim(),
+        workspace.to_str().unwrap()
+    );
+    assert!(workspace.join(".git/index").is_file());
+    assert!(!fixture.temp.path().join("outside-index").exists());
+    assert!(!fixture.temp.path().join(".git/index").exists());
+    assert!(!fixture.temp.path().join("outside-shallow").exists());
+    assert_eq!(
+        fs::read_dir(fixture.temp.path().join(".git/objects"))
+            .unwrap()
+            .count(),
+        2 // The empty info/ and pack/ directories created by Git init.
+    );
+}
+
+#[test]
+fn unrepresentable_git_ceiling_fails_before_running_agent() {
+    let mut fixture = Fixture::new("touch should-not-run");
+    fixture.config.workspace_root = fixture.temp.path().join("runs:with-colon");
+    let result = fixture.run(&fixture.task(1));
+    assert_eq!(result.outcome, Outcome::Failure, "{result:?}");
+    assert!(result.error.unwrap().contains("Git discovery ceiling"));
+    assert!(result.agent.is_none());
+    assert!(!fixture.workspace(1).join("should-not-run").exists());
 }
 
 #[test]
