@@ -91,3 +91,32 @@ node app/tests/ui_logic_test.cjs
 
 
 UI 的依赖免费 Node 状态测试覆盖重复提交、保留幂等 key 重试、认证过期、退出取消请求、旧响应/新选择竞争、网络恢复、活跃任务补入列表和未知诊断。可选真实浏览器脚本为 `python3 app/tests/ui_smoke.py`，使用 `app/tests/browser-requirements.txt` 固定依赖和官方 Playwright Chromium。当前 dot cloud 环境阻止浏览器启动/访问 localhost；GitHub CI 提供独立 browser job 执行桌面/手机 viewport 与交互断言并保存仅含假数据的截图。是否通过请以该提交的 CI 结果为准，不能将状态测试替代真实浏览器验收。
+
+## 原生 Codex / Claude CLI profile
+
+旧 `agents` 命令 profile 保持兼容。`native_agents` 提供封闭的 `codex_cli` / `claude_cli` 协议适配；两类 profile 名称不能重复。job 的 `agent` 仍只引用可信配置中的名字，不接受用户指定程序、参数、环境变量或模型 ID。
+
+```json
+{
+  "native_agents": {
+    "codex": {"provider":"codex_cli", "program":"/absolute/path/codex"},
+    "claude": {"provider":"claude_cli", "program":"/absolute/path/claude", "max_turns":8, "max_budget_usd":2.0}
+  }
+}
+```
+
+这是需要加入完整 host 配置的片段。程序必须已安装；可选 `model` 来自部署者自己的账户配置，省略时由 CLI 选择。`effort`、Claude `max_turns` / `max_budget_usd` 也只由可信配置指定。不要把展示名猜成供应商模型 ID。`env` 仅供可信部署者配置已有 CLI 所需环境；Relay 不保存或代办登录、密钥与付款。
+
+```sh
+cargo run -p relay-app -- doctor /absolute/path/config.json
+```
+
+`doctor` 只调用已配置 CLI 的版本与帮助入口，输出 JSON 能力诊断；不发出模型请求。`compatible` 仅表示本地接口满足调用要求，认证与模型访问始终标记 `unknown`。Claude 无人值守运行要求 v2.1.259+ 及相应参数。任务执行前再次进行受 supervisor 管理的检查，所有检查共享任务期限。缺少功能或检查失败时停止，不退回不安全的权限模式。
+
+只读能力单独探测：当前 Claude 需要 restricted 模式、仅 Read/Glob/Grep 工具、禁用 MCP/自定义命令的完整能力。Codex 开发调用可用，但只读审查返回 `review_profile_unsupported`，因为其 read-only sandbox 不等于禁用项目 MCP/hooks。机器上的托管设置仍属于可信部署边界，不承诺对恶意 CLI 或托管 hooks 隔离。
+
+原生调用使用 stdin 传需求、JSONL 输出以及显式权限参数。供应商事件在排空 stdout 时增量解析，独立于用户可见的截断日志；限制单事件、摘要、标识符与 usage 的保留大小。成功需要进程正常退出以及有效成功终态。缺失或非法终态、供应商错误、权限拒绝、预算耗尽、非零退出都不能成为成功。结果的 provider 信息保留实际报告的模型与会话标识；未报告的字段不猜测，也不表示 Relay 实现了可恢复会话。
+
+`GET /api/config` 与 MCP 配置结果仅公开 profile 名称、供应商、配置模型/effort 和未知认证状态，不公开程序路径、完整命令或环境。原生适配是 CLI 子进程集成，不是 SDK 或托管模型服务；现阶段离线验收使用假 CLI，真实账户、模型费用与供应商端行为仍需在明确授权的环境单独验收。
+
+接口依据：[Codex 非交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)、[Claude 非交互模式](https://code.claude.com/docs/en/headless)、[Claude CLI 参数](https://code.claude.com/docs/en/cli-reference)。CLI 接口会演进，安装版本与能力探测结果优先。

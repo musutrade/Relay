@@ -3,6 +3,7 @@
 pub mod host;
 pub mod http;
 pub mod mcp;
+pub mod providers;
 
 use host::{Host, HostConfig, Job};
 use relay::{Store, Task};
@@ -125,7 +126,22 @@ impl Application {
         Ok(json!({"active":active,"recovery_required":recovery_required,"diagnostic":diagnostic}))
     }
     pub fn public_config(&self) -> Value {
-        json!({"repositories":self.config.repositories.keys().collect::<Vec<_>>(),"agents":self.config.agents.keys().collect::<Vec<_>>(),"tests":self.config.tests.keys().collect::<Vec<_>>()})
+        let agents: Vec<_> = self
+            .config
+            .agents
+            .keys()
+            .chain(self.config.native_agents.keys())
+            .collect();
+        let native_agents: Vec<_> = self
+            .config
+            .native_agents
+            .iter()
+            .map(|(name, profile)| {
+                json!({"name": name, "provider": profile.provider, "model": profile.model,
+                "effort": profile.effort, "authentication": "unknown"})
+            })
+            .collect();
+        json!({"repositories":self.config.repositories.keys().collect::<Vec<_>>(),"agents":agents,"native_agents":native_agents,"tests":self.config.tests.keys().collect::<Vec<_>>()})
     }
     pub fn cancel(&self, id: i64) -> Result<Value> {
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;

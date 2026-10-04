@@ -32,7 +32,7 @@ jobs:
         run: python3 app/tests/ui_smoke.py
       - name: Preserve fake-data UI screenshots
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: relay-ui-smoke
           path: .relay/ui-smoke/*.png

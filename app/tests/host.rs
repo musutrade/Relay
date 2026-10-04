@@ -412,3 +412,185 @@ fn fast_workspace_growth_is_checked_before_success() {
     let result = fixture.run(&fixture.task(1));
     assert_eq!(result.outcome, Outcome::Failure, "{}", result.to_json());
 }
+
+fn native_fixture(provider: &str, body: &str, version: &str) -> Fixture {
+    let mut f = Fixture::new("exit 77");
+    let script = f.temp.path().join("fake-native.py");
+    let help = "--json --ephemeral --sandbox --skip-git-repo-check --config --ignore-user-config --ignore-rules --model --effort --output-format --verbose --permission-prompts --no-session-persistence --max-turns --max-budget-usd --restricted --tools --allowedTools --disallowedTools --disable-slash-commands --strict-mcp-config --mcp-config";
+    fs::write(&script,format!("#!/usr/bin/python3\nimport json, os, sys, subprocess, time\nif '--version' in sys.argv:\n print({})\nelif '--help' in sys.argv:\n print({})\nelse:\n prompt = sys.stdin.read()\n with open('invocation.json','w') as file: json.dump({{'args':sys.argv[1:],'input':prompt}},file)\n{}\n",serde_json::to_string(version).unwrap(),serde_json::to_string(help).unwrap(),body.lines().map(|line|format!(" {line}")).collect::<Vec<_>>().join("\n"))).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    f.config.agents.clear();
+    f.config.native_agents.insert(
+        "fake".into(),
+        serde_json::from_value(
+            json!({"provider":provider,"program":script,"model":"requested-model"}),
+        )
+        .unwrap(),
+    );
+    f
+}
+const NATIVE_CODEX_SUCCESS: &str = "print(json.dumps({'type':'thread.started','thread_id':'fake-session'}))\nprint(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'native completed'}}))\nprint(json.dumps({'type':'turn.completed','usage':{'input_tokens':9,'output_tokens':3}}))";
+const NATIVE_CLAUDE_SUCCESS: &str = "print(json.dumps({'type':'system','subtype':'init','session_id':'fake-claude','model':'reported-model'}))\nprint(json.dumps({'type':'result','subtype':'success','is_error':False,'result':'claude completed','permission_denials':[],'usage':{'input_tokens':7,'output_tokens':2}}))";
+
+#[test]
+fn native_codex_protocol_survives_truncated_capture_and_uses_stdin() {
+    let body = format!(
+        "for _ in range(12000): print(json.dumps({{'type':'future.progress','text':'x'*100}}))\n{NATIVE_CODEX_SUCCESS}"
+    );
+    let f = native_fixture("codex_cli", &body, "codex-cli 0.200.0");
+    let mut task = f.task(1);
+    let mut job = f.job();
+    job.requirements = "literal $(touch injected)\n--dangerously-skip-permissions".into();
+    task.payload = serde_json::to_string(&job).unwrap();
+    let result = f.run(&task);
+    assert_eq!(result.outcome, Outcome::Success, "{result:?}");
+    let command = result.agent.unwrap();
+    assert!(command.stdout_truncated);
+    let provider = command.provider.unwrap();
+    assert_eq!(provider.summary, "native completed");
+    assert_eq!(provider.cli_version.as_deref(), Some("0.200.0"));
+    assert_eq!(provider.requested_model.as_deref(), Some("requested-model"));
+    assert_eq!(provider.reported_model, None);
+    let invocation: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.workspace(1).join("invocation.json")).unwrap()).unwrap();
+    assert_eq!(invocation["input"], job.requirements);
+    assert!(
+        !invocation["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == &job.requirements)
+    );
+    assert_eq!(invocation["args"].as_array().unwrap().last().unwrap(), "-");
+    assert!(!f.workspace(1).join("injected").exists());
+}
+
+#[test]
+fn native_claude_version_gate_never_starts_unsupported_model_run() {
+    let f = native_fixture("claude_cli", NATIVE_CLAUDE_SUCCESS, "2.1.258 (Claude Code)");
+    let result = f.run(&f.task(1));
+    assert_eq!(result.outcome, Outcome::Failure);
+    assert!(!f.workspace(1).join("invocation.json").exists());
+    assert!(result.agent.unwrap().error.unwrap().contains("2.1.259"));
+    let f = native_fixture("claude_cli", NATIVE_CLAUDE_SUCCESS, "2.1.259 (Claude Code)");
+    let result = f.run(&f.task(1));
+    assert_eq!(result.outcome, Outcome::Success, "{result:?}");
+    assert_eq!(
+        result
+            .agent
+            .unwrap()
+            .provider
+            .unwrap()
+            .reported_model
+            .as_deref(),
+        Some("reported-model")
+    );
+}
+
+#[test]
+fn native_fail_closed_on_protocol_errors_denials_missing_terminal_and_nonzero() {
+    for (provider, body) in [
+        ("codex_cli", "print('malformed')".into()),
+        (
+            "codex_cli",
+            "print(json.dumps({'type':'turn.started'}))".into(),
+        ),
+        ("codex_cli", format!("{NATIVE_CODEX_SUCCESS}\nsys.exit(4)")),
+        (
+            "codex_cli",
+            format!("print('x'*65537)\n{NATIVE_CODEX_SUCCESS}"),
+        ),
+        (
+            "claude_cli",
+            format!(
+                "print(json.dumps({{'type':'system','subtype':'permission_denied'}}))\n{NATIVE_CLAUDE_SUCCESS}"
+            ),
+        ),
+    ] {
+        let f = native_fixture(provider, &body, "2.1.259");
+        let result = f.run(&f.task(1));
+        assert_eq!(result.outcome, Outcome::Failure, "{result:?}");
+        assert!(result.agent.unwrap().provider.is_some());
+    }
+}
+
+#[test]
+fn native_config_rejects_collisions_and_doctor_probe_has_no_model_call() {
+    let mut f = native_fixture("codex_cli", NATIVE_CODEX_SUCCESS, "codex-cli 0.200.0");
+    let host = Host::new(f.config.clone()).unwrap();
+    let probe = host.probe_native("fake", false).unwrap();
+    assert!(!probe.read_only_supported);
+    assert_eq!(fs::read_dir(&f.config.workspace_root).unwrap().count(), 0);
+    f.config.agents.insert(
+        "fake".into(),
+        serde_json::from_value(json!({"program":"/bin/true"})).unwrap(),
+    );
+    assert!(Host::new(f.config).is_err());
+}
+
+#[test]
+fn native_cleanup_reaps_descendants_even_after_successful_terminal() {
+    let body = format!(
+        "child = subprocess.Popen(['/bin/sleep','60'],start_new_session=True)\nwith open('child.pid','w') as file: file.write(str(child.pid))\n{NATIVE_CODEX_SUCCESS}"
+    );
+    let f = native_fixture("codex_cli", &body, "codex-cli 0.200.0");
+    let result = f.run(&f.task(1));
+    assert_eq!(result.outcome, Outcome::Success, "{result:?}");
+    assert_pid_reaped(&f.workspace(1).join("child.pid"));
+}
+
+#[test]
+fn native_cancellation_keeps_cleanup_and_timeout_outcomes() {
+    let body = "with open('running.pid','w') as file: file.write(str(os.getpid()))\nwhile True: print(json.dumps({'type':'future.progress'}),flush=True); time.sleep(0.01)";
+    let mut f = native_fixture("codex_cli", body, "codex-cli 0.200.0");
+    f.config.timeout_seconds = 1;
+    let result = f.run(&f.task(1));
+    assert_eq!(result.outcome, Outcome::TimedOut, "{result:?}");
+    assert_pid_reaped(&f.workspace(1).join("running.pid"));
+    f.config.timeout_seconds = 5;
+    let host = Host::new(f.config.clone()).unwrap();
+    let task = f.task(2);
+    let flag = Arc::new(AtomicBool::new(false));
+    let cloned = flag.clone();
+    let runner = thread::spawn(move || host.execute(&task, cloned));
+    wait_for_file(&f.workspace(2).join("running.pid"));
+    flag.store(true, Ordering::Release);
+    let result = runner.join().unwrap();
+    assert_eq!(result.outcome, Outcome::Cancelled, "{result:?}");
+    assert_pid_reaped(&f.workspace(2).join("running.pid"));
+}
+
+#[test]
+fn native_metadata_and_escaped_text_converge_to_persistence_budget() {
+    let body = "print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':'\\x01'*10000}))";
+    let f = native_fixture("claude_cli", body, "2.1.259");
+    let mut result = f.run(&f.task(1));
+    assert_eq!(result.outcome, Outcome::Success, "{result:?}");
+    let command = result.agent.as_mut().unwrap();
+    command.stdout = "\u{1}".repeat(8192);
+    command.stderr = command.stdout.clone();
+    result.tests = result.agent.clone();
+    result.draft_pr = result.agent.clone();
+    let encoded = result.to_json();
+    assert!(encoded.len() <= MAX_RESULT_BYTES);
+    let restored: RunResult = serde_json::from_str(&encoded).unwrap();
+    assert!(restored.agent.unwrap().provider.unwrap().summary_truncated);
+}
+
+#[test]
+fn probe_escaped_output_fits_supervisor_envelope_and_never_calls_model() {
+    let f = native_fixture(
+        "codex_cli",
+        "raise RuntimeError('must not call model')",
+        "codex-cli 0.200.0",
+    );
+    let script = f.temp.path().join("fake-native.py");
+    let source = fs::read_to_string(&script).unwrap().replace(" print(\"codex-cli 0.200.0\")", " print(\"codex-cli 0.200.0\"); sys.stdout.write('\\x01'*60000); sys.stderr.write('\\x02'*60000)");
+    fs::write(script, source).unwrap();
+    let probe = Host::new(f.config.clone())
+        .unwrap()
+        .probe_native("fake", false)
+        .unwrap();
+    assert_eq!(probe.cli_version, "0.200.0");
+    assert_eq!(fs::read_dir(&f.config.workspace_root).unwrap().count(), 0);
+}

@@ -75,3 +75,7 @@ CLI 仅把文件和参数映射到库调用并输出 JSON。不应让 CLI 演变
 `app/` 的开发 schema、配置、supervisor 和 transport 不进入内核。内核仅新增最多 100 项的 ID 游标读取，不新增执行/取消状态。应用在同一 SQLite 文件维护自身 cancellation 与 unknown diagnostic 元数据；取消前使用 immediate transaction 读取核心 claim 并写请求，避免不同进程 claim/取消竞争。运行中的取消手柄按完整 id/generation/owner 匹配。
 
 HTTP worker 遇到 host Unknown 或落库失败仍保留 claimed，不按时间重试。host 成功确认进程树结束后，应用将业务 success/failure/cancelled/timed_out 作为不透明 result 调用核心 finish。网页呈现业务结果；MCP 只提供提交/读取，不引入第二个工作流状态机。详见 [运行说明](application.md)。
+
+## 原生 CLI 协议边界
+
+`app/src/providers.rs` 负责可信原生 profile、固定 CLI 参数与有界 JSONL 终态归一化；supervisor 在排空输出时解析，不从截断日志反推成功。退出码和供应商终态共同决定应用结果。版本/帮助探测不证明账户认证或模型访问可用。供应商、模型与会话信息仍只是核心不透明结果的一部分，不增加核心业务状态或自动重试。
