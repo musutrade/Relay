@@ -148,3 +148,31 @@ fn concurrent_duplicate_submissions_share_one_task() {
     let ids: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     assert!(ids.iter().all(|id| *id == ids[0]));
 }
+
+#[test]
+fn bounded_task_history_uses_stable_id_cursor() {
+    let mut store = relay::Store::open(":memory:").unwrap();
+    for index in 1..=4 {
+        store.submit(&format!("history-{index}"), "opaque").unwrap();
+    }
+    assert!(store.list(None, 0).is_err());
+    assert!(store.list(None, 101).is_err());
+    assert_eq!(
+        store
+            .list(None, 2)
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect::<Vec<_>>(),
+        vec![4, 3]
+    );
+    assert_eq!(
+        store
+            .list(Some(3), 2)
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect::<Vec<_>>(),
+        vec![2, 1]
+    );
+}

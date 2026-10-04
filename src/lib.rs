@@ -197,6 +197,18 @@ impl Store {
             .ok_or(Error::NotFound)
     }
 
+    /// Bounded cursor-based history, newest first. Payloads remain opaque.
+    pub fn list(&self, before: Option<i64>, limit: usize) -> Result<Vec<Task>> {
+        if limit == 0 || limit > 100 {
+            return Err(Error::Invalid("list limit"));
+        }
+        let mut statement = self.conn.prepare(&format!(
+            "{SELECT} WHERE (?1 IS NULL OR id < ?1) ORDER BY id DESC LIMIT ?2"
+        ))?;
+        let rows = statement.query_map(params![before, limit as i64], row)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn active_claim(&self) -> Result<Option<Task>> {
         Ok(self
             .conn

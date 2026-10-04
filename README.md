@@ -1,65 +1,68 @@
 # Relay
 
-Relay 是一个小型、本地、持久化的任务交接内核：用 Rust 库和 CLI，把不透明任务可靠地交给外部执行器。当前基础是 SQLite 队列、提交幂等、单任务领取、所有权校验和有界结果。
+Relay 将整理好的开发需求交给外部命令行 Agent，在独立工作区中执行、测试并保存有界结果。Rust / SQLite 内核只负责持久队列、幂等提交与所有权栅栏；HTTP、MCP、开发工作流和进程管理都在独立的 `relay-app` 中。
 
-它不运行模型，不实现开发工作流，也不启动网络服务。外部 Agent 整理需求，适配器提交任务，开发执行器决定如何完成工作；可信宿主负责工作区和进程生命周期。
+## 先跑完整的无凭据演示
 
-## 快速开始
-
-需要 Rust 工具链和 C 编译器；SQLite 由 `rusqlite` 的 `bundled` 功能构建，无需另装 SQLite 服务。在仓库根目录运行：
+需要 Linux、Rust（版本固定在 `rust-toolchain.toml`）、C 编译器和 Python 3。演示不调用付费模型、不推送 Git、不创建真实 PR。
 
 ```sh
-cargo test
-workdir=$(mktemp -d)
-db="$workdir/relay.db"
-printf '%s' 'Inspect the repository and return a short plan.' > "$workdir/payload.txt"
-cargo run --quiet -- "$db" submit example-1 "$workdir/payload.txt"
-cargo run --quiet -- "$db" claim worker-1
+cargo test --workspace
+umask 077
+mkdir -p .relay
+python3 examples/make-demo-config.py > .relay/config.json
+# 用你自己选择的 32–256 字节非空白 ASCII 字符串设置本地访问口令
+read -rs -p 'Relay token: ' RELAY_TOKEN; echo
+export RELAY_TOKEN
+cargo run -p relay-app -- serve .relay/config.json .relay/relay.db
 ```
 
-上面的全新数据库中，第一个任务的 ID 和第一次领取的 generation 都是 `1`。执行工作后，用同一次领取的 ID、generation、owner 写回结果：
+打开 http://127.0.0.1:8787，输入同一口令，选择 `demo` 仓库、`fake` Agent、`demo` 测试，提交需求。任务会经历排队 → 执行 → 完成；结果包含每阶段输出和工作区路径。`relay-result.txt` 只写入该任务的独立快照，源仓库不变。页面适配手机尺寸，支持重试提交、刷新状态、查看结果和请求取消。口令只保存在页面内存中，刷新后需重输。
 
-```sh
-printf '%s' 'Plan prepared.' > "$workdir/result.txt"
-cargo run --quiet -- "$db" finish 1 1 worker-1 "$workdir/result.txt"
-cargo run --quiet -- "$db" get 1
-```
+默认只监听回环地址。手机远程访问需要你自行配置可信的 TLS 隧道或反向代理；本项目不会自动开放端口或部署服务。不要把无 TLS 的 bearer token 暴露到公网。
 
-已有数据库请使用实际 `claim` 返回的 ID 和 generation，不要硬编码示例值。任务 JSON 包含 `id`、`key`、`payload`、`state`、`generation`、`owner`、`result`。
+## 三个入口，同一个队列
 
-CLI 成功响应以 JSON 写到 stdout；错误以 `{"error":"..."}` 写到 stderr 并返回非零退出状态。任务 payload 和 result 是 UTF-8 文本，内核不解释其内容，也不会把它们作为命令执行。
+- **网页 / HTTP**：`relay-app serve <config.json> <db-path> [127.0.0.1:8787]`；同一进程运行可信宿主 worker
+- **MCP stdio**：`relay-app mcp <config.json> <db-path>`；提供提交、查询、列表和配置工具，另起上述服务负责执行。MCP 是可信本机进程接口，stdout 只输出协议消息
+- **内核 CLI**：`cargo run -p relay -- <db-path> <command>`；保留不透明任务的 submit / claim / finish / get / active / confirm-stopped-and-requeue，可用于本机诊断和受控恢复
 
-## 命令
+HTTP `/api/*` 均要求 `Authorization: Bearer …`。主要接口：
 
 ```text
-relay <db-path> submit <key> <payload-file>
-relay <db-path> claim <owner>
-relay <db-path> finish <task-id> <generation> <owner> <result-file>
-relay <db-path> get <task-id>
-relay <db-path> active
-relay <db-path> confirm-stopped-and-requeue <task-id> <generation> <owner>
+GET  /api/config
+GET  /api/status
+GET  /api/tasks?before=<id>      # 最近 100 项，按 id 倒序
+POST /api/tasks                 # {key,job:{repository,requirements,agent,test,publish}}
+GET  /api/tasks/<id>
+POST /api/tasks/<id>/cancel
 ```
 
-- 同一 key 与相同 payload 返回原任务；同一 key 配不同 payload 被拒绝
-- 同一个数据库最多有一个 `claimed` 任务；剩余任务保持 `queued`
-- `claim` 返回任务或 `null`；`null` 可能表示没有排队任务，也可能表示已有任务被领取。用 `active` 查看当前领取或得到 `null`
-- payload 最大 64 KiB，result 最大 16 KiB，key 和 owner 为 1–128 字节；按 UTF-8 字节数计量
-- `finish` 必须匹配当前任务的 generation 和 owner，完成后进入 `finished`
-- 相同 claim 和相同 result 的重复 `finish` 返回原结果；完成后不能改写为不同结果
-- 领取不会自动过期。崩溃后仍保持 `claimed`，不会凭时间流逝重试
+同一 key 与相同规范化 job 返回原任务；同 key 配不同 job 返回 409。发送超时后应保留原 key 重试，避免重复执行。身份口令不是任务 owner；owner 仅是数据库一致性标识。
 
-只有可信宿主确认旧执行进程及其子进程已经停止，才可调用 `confirm-stopped-and-requeue`。命令本身不能证明进程已停止，也不会停止进程或清理工作区。重新领取会获得新的 generation；旧持有者不能再写回结果，但已经发生的外部副作用无法撤销。
+## 接入真实开发 Agent
 
-## 开发与边界
+把允许访问的本地仓库、Agent、测试和 PR 命令显式写入配置。请求只引用配置中的名字，不能指定任意程序、路径或 shell。可以配置 Codex、Claude 或其他现有 CLI；模型与供应商凭据由这些外部 CLI 自行管理，Relay 不存储或代办凭据。命令失败和测试失败作为开发结果保存，内核不理解业务状态。
+
+配置、占位符、工作区限制、可选 draft PR 流程及恢复方法见 [运行说明](docs/application.md)。首次接真实 CLI 前先确认其当前版本的调用参数、权限与费用。演示配置是可直接运行的契约示例，不假设你已安装任何模型 CLI。
+
+## 可靠性边界
+
+- 内核最大 payload 64 KiB、result 16 KiB；key / owner 1–128 UTF-8 字节
+- 同一个数据库只有一个活跃 claim；每次领取增加 generation，过期执行器不能覆盖新结果
+- 取消是请求：只有宿主确认本次进程树已结束，才写入取消结果并释放串行槽位
+- 服务重启不会推断旧进程已经停止；未知 claim 保持占用并要求人工核对
+- 独立工作区和 Linux supervisor 是可信本机程序的生命周期管理，不是防恶意代码的安全沙箱，也不保证外部副作用恰好一次
+- 当前不提供多租户、分布式调度、动态插件、自动部署或生产环境强隔离
+
+## 开发验证
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+python3 -m unittest discover -s app/tests -p '*_test.py'
+node app/tests/ui_logic_test.cjs
 ```
 
-先运行与修改相关的快速测试，必要时再扩大验证范围。不要为小改动引入全宿主扫描或重复的昂贵验证。
-
-数据库路径及其目录必须由可信本地 OS 账户控制。owner 是一致性标识，不是身份认证凭据；能写数据库的调用方处于同一信任域。当前没有网络监听、远程认证、分布式调度、动态插件或 UI。
-
-详见 [架构](docs/architecture.md)、[设计决策](docs/adr/0001-local-durable-core.md) 和 [下一步](docs/next-steps.md)。
+[架构与边界](docs/architecture.md) · [内核设计](docs/adr/0001-local-durable-core.md) · [应用运行说明](docs/application.md)

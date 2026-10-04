@@ -1,6 +1,6 @@
 # Repository guidance
 
-Relay is a small local durable handoff core, not a full agent platform.
+Relay has a small local durable core and a separate usable application adapter, not a general agent platform.
 
 ## Preserve the boundary
 
@@ -8,7 +8,7 @@ Relay is a small local durable handoff core, not a full agent platform.
 - Keep the CLI thin and machine-readable: JSON responses, no alternate state machine
 - Keep requirements, payload semantics, model calls, GitHub integration, development workflow, and evidence policy outside the core
 - Let the trusted host own workspace cleanup and process lifecycle
-- Do not add network listeners, dynamic plugins, distributed services, or automatic claim expiry without an explicit requirement
+- The explicitly requested loopback HTTP/UI and MCP adapters belong in `app/`; do not add dynamic plugins, distributed services, or automatic claim expiry
 - Never infer that an old execution stopped merely because a timeout elapsed; manual requeue requires trusted-host confirmation
 - Do not claim exactly-once external effects: generation fencing protects database transitions only
 
@@ -19,7 +19,7 @@ Relay is a small local durable handoff core, not a full agent platform.
 - Use immediate transactions for state changes that check and update shared queue state
 - Preserve byte-size limits and UTF-8 validation at every public entry point
 - Add focused tests for changed behavior, especially concurrency, restart, idempotency, and stale ownership
-- Run relevant tests first; before delivery run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`
+- Run relevant tests first; before delivery run `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`
 - State which checks passed, failed, or could not run; do not turn a small change into repeated full-host scans or inherited process bureaucracy
 - Update the concise architecture notes when a responsibility boundary changes; add an ADR only for a consequential design decision
 - Use English for code and identifiers; concise Chinese is preferred for user-facing project explanations
