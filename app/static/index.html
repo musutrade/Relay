@@ -32,9 +32,10 @@
   </header>
   <main id="main" class="shell">
     <div class="intro"><div><div class="eyebrow">YOUR LOCAL HANDOFF</div><h1>把需求交给 Relay</h1><p>选择仓库，提交任务，在这里跟进每一次交接</p></div><span class="local-tag"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M8 10V7a4 4 0 0 1 8 0v3" stroke="currentColor" stroke-width="1.7"/></svg>本地执行 · 持久队列</span></div>
+    <p id="logout-error" class="auth-error" role="alert" hidden></p>
     <section id="auth-panel" class="panel auth" aria-labelledby="auth-title">
-      <div><h2 id="auth-title">连接你的工作台</h2><p>输入服务端配置的访问令牌，读取仓库配置与任务队列</p></div>
-      <form id="auth-form" autocomplete="off"><label class="sr-only" for="token">访问令牌</label><div class="auth-controls"><input id="token" type="password" placeholder="粘贴访问令牌" autocomplete="off" autocapitalize="none" spellcheck="false" required aria-describedby="token-note auth-error"><button id="connect" class="button primary" type="submit">连接工作台<span aria-hidden="true">→</span></button></div><p id="token-note" class="auth-note">令牌仅保存在当前页面内存中，不写入网址或浏览器存储</p><p id="auth-error" class="auth-error" role="alert" hidden></p></form>
+      <div><h2 id="auth-title">连接你的工作台</h2><p id="auth-description">正在检查登录方式…</p></div>
+      <form id="auth-form" autocomplete="off"><div id="session-fields" hidden><div class="field"><label for="username">用户名</label><input id="username" autocomplete="username" autocapitalize="none" spellcheck="false" disabled></div><div class="field"><label for="password">密码</label><input id="password" type="password" autocomplete="current-password" disabled></div></div><label id="token-label" class="sr-only" for="token">访问令牌</label><div class="auth-controls"><input id="token" type="password" placeholder="粘贴访问令牌" autocomplete="off" autocapitalize="none" spellcheck="false" disabled aria-describedby="token-note auth-error"><button id="connect" class="button primary" type="submit" disabled>连接工作台<span aria-hidden="true">→</span></button></div><p id="token-note" class="auth-note">令牌仅保存在当前页面内存中，不写入网址或浏览器存储</p><p id="auth-error" class="auth-error" role="alert" hidden></p></form>
     </section>
     <div id="network-banner" class="banner error" role="alert" hidden><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.7"/><path d="M12 7v6m0 3v.1" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><div><strong>暂时无法同步</strong><p id="network-message"></p></div><button id="refresh-error" type="button" class="button small banner-action">重试</button></div>
     <div id="recovery-banner" class="banner" role="alert" hidden><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m10.3 4-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3l-8-14a2 2 0 0 0-3.4 0Z" stroke="currentColor" stroke-width="1.7"/><path d="M12 9v5m0 3v.1" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><div><strong>执行状态需要人工核对</strong><p>宿主尚未确认旧执行已停止。请在服务端检查进程、工作区及可能发生的外部操作，确认安全后再恢复；此页面不会自动重排任务</p></div></div>
@@ -61,7 +62,7 @@
     'use strict';
     const $ = id => document.getElementById(id);
     const fields = ['workflow', 'repository', 'requirements', 'agent', 'test'];
-    const state = { token: '', session: 0, authenticated: false, connecting: false, controllers: new Set(), timer: null, syncing: false, refreshAgain: false, revision: 0, tasks: [], config: null, ordinarySelection: null, status: null, selectedId: null, selection: 0, detailController: null, filter: 'all', pending: null, submitting: false, submitVersion: 0, canceling: new Set(), cancelRequested: new Set(), cancelTarget: null, online: false };
+    const state = { authMode: null, loggingOut: false, token: '', session: 0, authenticated: false, connecting: false, controllers: new Set(), timer: null, syncing: false, refreshAgain: false, revision: 0, tasks: [], config: null, ordinarySelection: null, status: null, selectedId: null, selection: 0, detailController: null, filter: 'all', pending: null, submitting: false, submitVersion: 0, canceling: new Set(), cancelRequested: new Set(), cancelTarget: null, online: false };
     class ApiError extends Error { constructor(message, status = 0) { super(message); this.status = status; } }
     function announce(message) { $('announcement').textContent = message; }
     function showMessage(id, message, kind = '') { const node = $(id); node.textContent = message; node.hidden = !message; if (id === 'form-message') node.className = 'form-message ' + kind; }
@@ -75,12 +76,12 @@
       const abort = () => controller.abort();
       if (options.signal) { if (options.signal.aborted) controller.abort(); else options.signal.addEventListener('abort', abort, { once: true }); }
       try {
-        const response = await fetch(path, { method: options.method || 'GET', credentials: 'omit', cache: 'no-store', redirect: 'error', headers: { Authorization: 'Bearer ' + state.token, Accept: 'application/json', ...(options.body ? { 'Content-Type': 'application/json' } : {}) }, ...(options.body ? { body: JSON.stringify(options.body) } : {}), signal: controller.signal });
+        const response = await fetch(path, { method: options.method || 'GET', credentials: path.startsWith('/auth/') || state.authMode !== 'bearer' ? 'same-origin' : 'omit', cache: 'no-store', redirect: 'error', headers: { ...(state.authMode === 'bearer' && path.startsWith('/api/') ? { Authorization: 'Bearer ' + state.token } : {}), Accept: 'application/json', ...(options.body ? { 'Content-Type': 'application/json' } : {}) }, ...(options.body ? { body: JSON.stringify(options.body) } : {}), signal: controller.signal });
         let data;
         try { data = await response.json(); } catch (_) { throw new ApiError('服务端返回了无法读取的响应（HTTP ' + response.status + '）', response.status); }
         if (!response.ok) {
           const detail = data && typeof data.error === 'string' ? data.error.slice(0, 400) : '';
-          if (response.status === 401 || response.status === 403) throw new ApiError('访问令牌无效或无权访问，请重新连接', response.status);
+          if (response.status === 401 || response.status === 403) throw new ApiError(state.authMode === 'bearer' ? '访问令牌无效或无权访问，请重新连接' : '登录已失效或无权访问，请重新登录', response.status);
           throw new ApiError(detail || '请求未成功（HTTP ' + response.status + '）', response.status);
         }
         return data;
@@ -159,13 +160,13 @@
     function updateSize() { const bytes = new TextEncoder().encode($('requirements').value).length; $('requirements-size').textContent = (bytes / 1024).toFixed(1) + ' / 32 KiB'; $('requirements-size').classList.toggle('limit', bytes > 32768); }
     function populateSelect(id, values, empty) { const select = $(id); select.replaceChildren(); if (empty) { const option = document.createElement('option'); option.value = ''; option.textContent = empty; select.append(option); } values.forEach(value => { const option = document.createElement('option'); option.value = value; option.textContent = value; select.append(option); }); }
     function stopSession({ preservePending = false } = {}) {
-      state.session++; state.authenticated = false; state.connecting = false; state.token = ''; state.online = false; state.syncing = false; state.refreshAgain = false; state.revision++; state.selection++; state.submitVersion++;
+      state.session++; state.authenticated = false; state.connecting = false; state.loggingOut = false; state.token = ''; state.online = false; state.syncing = false; state.refreshAgain = false; state.revision++; state.selection++; state.submitVersion++;
       clearTimeout(state.timer); state.timer = null;
       for (const controller of state.controllers) controller.abort(); state.controllers.clear();
       if (state.detailController) state.detailController.abort(); state.detailController = null;
       state.tasks = []; state.status = null; state.config = null; state.ordinarySelection = null; state.selectedId = null; state.submitting = false; state.canceling.clear(); state.cancelRequested.clear(); state.cancelTarget = null;
       if (!preservePending) { state.pending = null; $('requirements').value = ''; showMessage('form-message', ''); }
-      $('token').value = ''; $('auth-panel').hidden = false; $('connect').disabled = false; $('connect').textContent = '连接工作台 →'; $('token').disabled = false;
+      $('token').value = ''; $('password').value = ''; $('auth-panel').hidden = false; updateAuthForm();
       $('network-banner').hidden = true; $('recovery-banner').hidden = true; $('sync-time').textContent = '连接后每 2 秒同步';
       if ($('cancel-dialog').open) $('cancel-dialog').close();
       populateSelect('workflow', [], '普通任务（不使用工作流）'); populateSelect('repository', [], '连接后选择仓库'); populateSelect('agent', [], '连接后选择'); populateSelect('test', [], '不指定');
@@ -173,7 +174,7 @@
     }
     function handleReadError(error, session) {
       if (session !== state.session || isAborted(error)) return;
-      if (error.status === 401 || error.status === 403) { stopSession({ preservePending: true }); showMessage('auth-error', formatError(error)); if (state.pending) showMessage('form-message', '上次提交尚未确认。重新连接后可继续使用同一请求重试', 'error'); $('token').focus(); return; }
+      if (error.status === 401 || error.status === 403) { stopSession({ preservePending: true }); showMessage('auth-error', formatError(error)); if (state.pending) showMessage('form-message', '上次提交尚未确认。重新连接后可继续使用同一请求重试', 'error'); focusAuth(); return; }
       state.online = false; updateConnection(); $('network-banner').hidden = false; $('network-message').textContent = formatError(error) + '。当前展示的是上次成功读取的数据';
     }
     function scheduleRefresh(session) { clearTimeout(state.timer); if (state.authenticated && session === state.session) state.timer = setTimeout(refresh, 2000); }
@@ -266,11 +267,19 @@
       catch (error) { if (session !== state.session || selection !== state.selection || isAborted(error)) return; if (error.status === 401 || error.status === 403) handleReadError(error, session); else showMessage('detail-error', '详情刷新失败：' + formatError(error)); }
       finally { if (state.detailController === controller) state.detailController = null; }
     }
-    $('auth-form').addEventListener('submit', async event => {
-      event.preventDefault(); if (state.connecting) return; const token = $('token').value.trim(); if (!token) return;
-      state.token = token; $('token').value = ''; state.connecting = true; const session = ++state.session;
-      $('connect').disabled = true; $('connect').textContent = '正在连接…'; $('token').disabled = true; showMessage('auth-error', ''); updateConnection();
-      try {
+    function focusAuth() { $(state.authMode === 'bearer' ? 'token' : 'username').focus(); }
+    function updateAuthForm() {
+      const bearer = state.authMode === 'bearer', session = state.authMode === 'session' || state.authMode === 'hybrid';
+      $('session-fields').hidden = !session; $('token').hidden = !bearer; $('token-label').hidden = !bearer;
+      $('token').disabled = !bearer || state.connecting; $('token').required = bearer;
+      for (const id of ['username', 'password']) { $(id).disabled = !session || state.connecting; $(id).required = session; }
+      $('connect').disabled = state.connecting;
+      $('connect').textContent = state.connecting ? '正在连接…' : !state.authMode ? '重新检查登录方式' : bearer ? '连接工作台 →' : '登录工作台 →';
+      $('auth-description').textContent = !state.authMode ? '检查服务端登录方式后连接工作台' : bearer ? '输入服务端配置的访问令牌，读取仓库配置与任务队列' : '使用服务端配置的用户名和密码登录工作台';
+      $('token-note').textContent = bearer ? '令牌仅保存在当前页面内存中，不写入网址或浏览器存储' : '密码不保存在页面存储中。登录最多保持 7 天；退出或服务重启后需重新登录';
+      $('logout').disabled = state.loggingOut; $('logout').textContent = bearer ? '断开连接' : '退出登录';
+    }
+    async function loadWorkspace(session) {
         const [config, tasks, status] = await Promise.all([api('/api/config').then(readConfig), api('/api/tasks').then(readTasks), api('/api/status').then(readStatus)]);
         if (session !== state.session) return;
         state.config = config; state.tasks = mergeActive(tasks, status); state.status = status; state.authenticated = true; state.connecting = false; state.online = true; state.revision++;
@@ -279,9 +288,59 @@
         $('auth-panel').hidden = true; $('network-banner').hidden = true; updateConnection(); reconcilePending(); updateForm(); render();
         if (!state.pending && (!config.repositories.length || !config.agents.length)) showMessage('form-message', '服务端尚未配置可用的仓库或 Agent，请先完成服务配置', 'error');
         $('sync-time').textContent = '已连接 · 每 2 秒同步'; announce('工作台已连接，共 ' + tasks.length + ' 个任务'); scheduleRefresh(session); $('repository').focus();
-      } catch (error) { if (session !== state.session || isAborted(error)) return; stopSession({ preservePending: true }); showMessage('auth-error', formatError(error)); $('token').focus(); }
+    }
+    async function detectAuth() {
+      if (state.connecting) return;
+      const session = ++state.session; state.connecting = true; updateAuthForm(); updateConnection(); showMessage('auth-error', '');
+      try {
+        const status = await api('/auth/status');
+        if (session !== state.session) return;
+        if (!status || !['bearer', 'session', 'hybrid'].includes(status.mode) || typeof status.authenticated !== 'boolean') throw new ApiError('登录状态格式不符合预期');
+        state.authMode = status.mode;
+        if (status.authenticated && state.authMode !== 'bearer') await loadWorkspace(session);
+      } catch (error) {
+        if (session !== state.session || isAborted(error)) return;
+        stopSession({ preservePending: true }); showMessage('auth-error', '无法确认登录状态，请检查网络后重试');
+      } finally { if (session === state.session) { state.connecting = false; updateAuthForm(); updateConnection(); } }
+    }
+    $('auth-form').addEventListener('submit', async event => {
+      event.preventDefault(); if (state.connecting || state.authenticated) return;
+      if (!state.authMode) { await detectAuth(); return; }
+      const bearer = state.authMode === 'bearer';
+      if (bearer ? !$('token').value.trim() : !$('username').value || !$('password').value) return;
+      state.token = bearer ? $('token').value.trim() : ''; $('token').value = '';
+      state.connecting = true; const session = ++state.session; updateAuthForm(); showMessage('auth-error', ''); showMessage('logout-error', ''); updateConnection();
+      try {
+        if (!bearer) {
+          const credentials = { username: $('username').value, password: $('password').value }; $('password').value = '';
+          const response = await api('/auth/login', { method: 'POST', body: credentials });
+          if (session !== state.session) return;
+          if (!response || response.authenticated !== true) throw new ApiError('登录失败');
+        }
+        await loadWorkspace(session);
+      } catch (error) {
+        if (session !== state.session || isAborted(error)) return;
+        stopSession({ preservePending: true }); showMessage('auth-error', bearer ? formatError(error) : '登录未完成，请检查用户名、密码和网络后重试'); focusAuth();
+      } finally { if (session === state.session) { $('password').value = ''; updateAuthForm(); } }
     });
-    $('logout').addEventListener('click', () => { const pending = Boolean(state.pending); stopSession(); showMessage('auth-error', ''); if (pending) showMessage('auth-error', '已断开连接。刚才的提交可能已保存，请重新连接后先检查任务队列'); announce('已断开连接，页面中的访问令牌已清除'); $('token').focus(); });
+    $('logout').addEventListener('click', async () => {
+      if (!state.authenticated || state.loggingOut) return;
+      const session = state.session, pending = Boolean(state.pending), bearer = state.authMode === 'bearer';
+      state.loggingOut = true; updateAuthForm(); showMessage('logout-error', '');
+      try {
+        if (!bearer) {
+          const response = await api('/auth/logout', { method: 'POST' });
+          if (session !== state.session) return;
+          if (!response || response.authenticated !== false) throw new ApiError('退出未确认');
+        }
+        stopSession(); $('username').value = ''; showMessage('auth-error', '');
+        if (pending) showMessage('auth-error', '已断开连接。刚才的提交可能已保存，请重新连接后先检查任务队列');
+        announce(bearer ? '已断开连接，页面中的访问令牌已清除' : '已退出登录'); focusAuth();
+      } catch (error) {
+        if (session !== state.session || isAborted(error)) return;
+        showMessage('logout-error', '退出登录未确认，会话可能仍然有效。请检查网络后重试退出');
+      } finally { if (session === state.session) { state.loggingOut = false; updateAuthForm(); } }
+    });
     function createKey() { if (crypto.randomUUID) return 'web-' + crypto.randomUUID(); const bytes = new Uint8Array(16); crypto.getRandomValues(bytes); return 'web-' + Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join(''); }
     $('task-form').addEventListener('submit', async event => {
       event.preventDefault(); if (!state.authenticated || state.submitting || (state.status && state.status.recovery_required)) return;
@@ -319,9 +378,9 @@
     darkPreference.addEventListener('change', updateThemeLabel);
     window.addEventListener('online', () => { if (state.authenticated) refresh(); });
     window.addEventListener('beforeunload', event => { if (state.pending) { event.preventDefault(); event.returnValue = ''; } });
-    window.addEventListener('pagehide', () => { state.token = ''; state.session++; clearTimeout(state.timer); for (const controller of state.controllers) controller.abort(); });
-    window.addEventListener('pageshow', event => { if (event.persisted) stopSession(); });
-    updateThemeLabel(); updateForm();
+    window.addEventListener('pagehide', () => { state.token = ''; $('token').value = ''; $('password').value = ''; state.session++; clearTimeout(state.timer); for (const controller of state.controllers) controller.abort(); });
+    window.addEventListener('pageshow', event => { if (event.persisted) { stopSession(); if (state.authMode !== 'bearer') detectAuth(); } });
+    updateThemeLabel(); updateForm(); detectAuth();
   })();
   </script>
 </body>

@@ -1,5 +1,5 @@
 //! Loopback HTTP transport with explicit bearer authentication and bounded inputs.
-use crate::{Application, Error, Submission};
+use crate::{Application, Error, Submission, auth::Auth};
 use axum::{
     Json, Router,
     body::Body,
@@ -16,18 +16,17 @@ use std::sync::Arc;
 #[derive(Clone)]
 struct Web {
     app: Arc<Application>,
-    token: Arc<String>,
+    auth: Arc<Auth>,
 }
 
 pub fn router(app: Arc<Application>, token: String) -> Result<Router, Error> {
-    if token.len() < 32 || token.len() > 256 || !token.bytes().all(|c| c.is_ascii_graphic()) {
-        return Err(Error::Invalid(
-            "RELAY_TOKEN must be 32–256 non-whitespace ASCII bytes".into(),
-        ));
-    }
+    let auth = Auth::bearer(token).map_err(|e| Error::Invalid(e.to_string()))?;
+    Ok(router_with_auth(app, auth))
+}
+pub fn router_with_auth(app: Arc<Application>, auth: Auth) -> Router {
     let state = Web {
         app,
-        token: Arc::new(token),
+        auth: Arc::new(auth),
     };
     let api = Router::new()
         .route("/config", get(config))
@@ -37,26 +36,20 @@ pub fn router(app: Arc<Application>, token: String) -> Result<Router, Error> {
         .route("/tasks/{id}/cancel", post(cancel))
         .layer(DefaultBodyLimit::max(96 * 1024))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
-    Ok(Router::new()
+    Router::new()
         .route("/", get(index))
+        .route("/auth/status", get(auth_status))
+        .route(
+            "/auth/login",
+            post(login).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route("/auth/logout", post(logout))
         .nest("/api", api)
         .with_state(state)
-        .layer(middleware::from_fn(security_headers)))
+        .layer(middleware::from_fn(security_headers))
 }
 async fn authorize(State(state): State<Web>, request: Request, next: Next) -> Response {
-    let supplied = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .unwrap_or("");
-    let expected = state.token.as_bytes();
-    let supplied = supplied.as_bytes();
-    let mut mismatch = expected.len() ^ supplied.len();
-    for (index, byte) in expected.iter().enumerate() {
-        mismatch |= (*byte ^ supplied.get(index).copied().unwrap_or(0)) as usize;
-    }
-    if mismatch != 0 {
+    if !state.auth.authorized(request.headers(), request.method()) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"authentication required"})),
@@ -64,6 +57,54 @@ async fn authorize(State(state): State<Web>, request: Request, next: Next) -> Re
             .into_response();
     }
     next.run(request).await
+}
+async fn auth_status(State(state): State<Web>, headers: axum::http::HeaderMap) -> Json<Value> {
+    Json(json!({"mode":state.auth.mode(), "authenticated":state.auth.session_valid(&headers)}))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Login {
+    username: String,
+    password: String,
+}
+async fn login(
+    State(state): State<Web>,
+    headers: axum::http::HeaderMap,
+    Json(input): Json<Login>,
+) -> Response {
+    let auth = state.auth.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let password = zeroize::Zeroizing::new(input.password);
+        auth.login(&input.username, &password, &headers)
+    })
+    .await
+    .unwrap_or(Err(503));
+    auth_response(result, true)
+}
+async fn logout(State(state): State<Web>, headers: axum::http::HeaderMap) -> Response {
+    auth_response(state.auth.logout(&headers), false)
+}
+fn auth_response(result: Result<String, u16>, authenticated: bool) -> Response {
+    match result {
+        Ok(cookie) => (
+            [(header::SET_COOKIE, cookie)],
+            Json(json!({"authenticated":authenticated})),
+        )
+            .into_response(),
+        Err(code) => {
+            let mut response = (
+                StatusCode::from_u16(code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+                Json(json!({"error":"authentication unavailable or credentials invalid"})),
+            )
+                .into_response();
+            if code == 429 {
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+            }
+            response
+        }
+    }
 }
 async fn security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;

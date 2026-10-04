@@ -395,3 +395,148 @@ fn unknown_host_outcome_preserves_claim_and_diagnostic() {
     assert!(!app.work_once().unwrap());
     assert_eq!(app.get(2).unwrap().state, relay::State::Queued);
 }
+
+#[tokio::test]
+async fn browser_session_http_boundary_and_secret_redaction() {
+    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+    use rand_core::OsRng;
+    use std::os::unix::fs::PermissionsExt;
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("credentials.json");
+    let hash = Argon2::default()
+        .hash_password(b"fixture-password-only", &SaltString::generate(&mut OsRng))
+        .unwrap()
+        .to_string();
+    std::fs::write(
+        &path,
+        json!({"username":"operator", "password_hash":hash}).to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let auth = relay_app::auth::Auth::new(
+        Some(relay_app::auth::Config {
+            mode: relay_app::auth::Mode::Session,
+            credentials_file: path,
+            public_origin: "https://relay.example".into(),
+            allow_insecure_loopback: false,
+        }),
+        None,
+    )
+    .unwrap();
+    let app = Application::open(root.path().join("relay.db"), config(root.path())).unwrap();
+    let router = http::router_with_auth(app, auth);
+    let request = |method: &str, uri: &str, cookie: &str, origin: &str, body: &str| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("cookie", cookie)
+            .header("origin", origin)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    };
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(request("GET", "/api/config", "", "", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let response = router
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/auth/login",
+            "",
+            "https://evil.example",
+            r#"{"username":"operator","password":"fixture-password-only"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = router
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/auth/login",
+            "",
+            "https://relay.example",
+            r#"{"username":"operator","password":"wrong"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response = router
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/auth/login",
+            "",
+            "https://relay.example",
+            r#"{"username":"operator","password":"fixture-password-only"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = response.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    for uri in ["/auth/status", "/api/config", "/api/status", "/api/tasks"] {
+        let response = router
+            .clone()
+            .oneshot(request("GET", uri, &cookie, "", ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        for secret in [&hash, "fixture-password-only", &cookie] {
+            assert!(!text.contains(secret));
+        }
+    }
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/api/tasks/1/cancel",
+                &cookie,
+                "https://evil.example",
+                ""
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/auth/logout",
+                &cookie,
+                "https://relay.example",
+                ""
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        router
+            .oneshot(request("GET", "/api/config", &cookie, "", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}

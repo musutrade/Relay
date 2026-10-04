@@ -1,5 +1,6 @@
 //! Application adapters around Relay's opaque durable core.
 //! All direct database callers belong to the same trusted local OS account.
+pub mod auth;
 pub mod host;
 pub mod http;
 pub mod mcp;
