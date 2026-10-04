@@ -36,13 +36,19 @@ printf '%s\n' "$REV" > "$RELEASE/REVISION" || exit 1
 "$RELEASE/relay-app" doctor "$DATA/config.json"
 ```
 
-`doctor` 只做版本/帮助检查，`compatible` 不代表认证、模型可用性或审查角色验收通过；真实任务还会检查具体角色。凭据仍由外部 CLI 自行管理。执行下面真实 job 会调用模型并可能收费，先核对账户与范围。
+`doctor` 只做版本/帮助检查，`compatible` 不代表认证、模型可用性或审查角色验收通过；真实任务还会检查具体角色。退出码 0 仅说明诊断已完成，务必读取 JSON 中目标 profile 的 `compatible` 和 `probe.read_only_supported`。若旧版 Relay 因帮助未列出 `--max-turns` 而拒绝新 Claude，请升级 Relay 后只重跑此 `doctor` 检查；不要移除 turn/budget 上限。凭据仍由外部 CLI 自行管理。执行下面真实 job 会调用模型并可能收费，先核对账户与范围。
 
 ```json
 {"key":"project-change-001","job":{"repository":"project","requirements":"实现已确认的需求并补充测试","agent":"codex","workflow":"codex-reviewed","publish":false}}
 ```
 
 改用 Claude 开发时同时将 `agent` 改为 `claude`、`workflow` 改为 `claude-reviewed`。代码成果位于结果 `workspace` 指向目录中的 `repository/` Git 仓库；工作流结果提供 candidate SHA，JSON 仅是摘要和定位证据，并非完整代码交付。审查确认后可从该仓库提取提交。需要 draft PR 时按 [应用说明](application.md#可选精确-sha-draft-pr-适配器)另行配置和授权发布；本示例不会推送、合并或部署。
+
+### 自定义 Claude 网关
+
+使用兼容网关时，不必为兼容性检查另登官方账户。按网关要求在本机启动 Relay 的环境中提供 `ANTHROPIC_BASE_URL`，以及 `ANTHROPIC_AUTH_TOKEN`（Bearer）或 `ANTHROPIC_API_KEY`（x-api-key）；若通过服务管理器启动，也须为该服务配置环境。原生 CLI 继承 Relay 进程环境，显式 profile `env` 可覆盖同名变量；敏感值只在本机安全配置，不提交到仓库或诊断报告。需要指定网关模型时，在 developer 和 reviewer profile 中分别填写网关实际支持的 `model`。
+
+受限 reviewer 忽略用户/项目 settings 和 hooks，但可使用上述进程环境；不要为恢复路由而取消 `--restricted`，也不要自动复制用户 settings。`doctor` 和 CLI 登录状态都不能证明自定义端点、鉴权或模型可用，后续真实请求仍须单独授权和验收。变量和鉴权方式见 [Claude 官方网关说明](https://code.claude.com/docs/en/llm-gateway-connect)。
 
 ## 运行、停止和重启
 

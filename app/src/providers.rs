@@ -184,6 +184,22 @@ impl NativeProfile {
         help: &str,
         read_only: bool,
     ) -> Result<String, String> {
+        self.validate_probe_with_max_turns(version, help, read_only, false)
+    }
+
+    pub(crate) fn hidden_max_turns_probe_needed(&self, help: &str) -> bool {
+        self.provider == ProviderKind::ClaudeCli
+            && self.max_turns.is_some()
+            && !help_has_flag(help, "--max-turns")
+    }
+
+    pub(crate) fn validate_probe_with_max_turns(
+        &self,
+        version: &str,
+        help: &str,
+        read_only: bool,
+        hidden_max_turns_verified: bool,
+    ) -> Result<String, String> {
         if read_only && self.provider == ProviderKind::CodexCli {
             return Err("review_profile_unsupported: Codex project MCP/hooks cannot be disabled by the supported CLI contract".into());
         }
@@ -217,7 +233,7 @@ impl NativeProfile {
                 "--effort"
             });
         }
-        if self.max_turns.is_some() {
+        if self.max_turns.is_some() && !hidden_max_turns_verified {
             required.push("--max-turns");
         }
         if self.max_budget_usd.is_some() {
@@ -235,10 +251,7 @@ impl NativeProfile {
             ]);
         }
         for flag in required {
-            if !help
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-                .any(|word| word == flag)
-            {
+            if !help_has_flag(help, flag) {
                 return Err(format!(
                     "CLI help does not advertise required capability {flag}"
                 ));
@@ -246,6 +259,11 @@ impl NativeProfile {
         }
         Ok(version.1)
     }
+}
+
+fn help_has_flag(help: &str, flag: &str) -> bool {
+    help.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .any(|word| word == flag)
 }
 
 fn parse_version(text: &str) -> Option<((u64, u64, u64), String)> {

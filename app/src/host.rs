@@ -694,11 +694,7 @@ impl Host {
         deadline: Instant,
     ) -> Result<ProviderProbe, Box<CommandResult>> {
         let deadline = deadline.min(Instant::now() + Duration::from_secs(10));
-        let mut responses = Vec::new();
-        for (phase, args) in [
-            ("version", vec!["--version".into()]),
-            ("help", profile.help_args()),
-        ] {
+        let probe = |phase: &str, args: Vec<String>| -> Result<CommandResult, Box<CommandResult>> {
             if let Some(outcome) = interrupted(cancellation, deadline) {
                 return Err(Box::new(CommandResult::error(
                     outcome,
@@ -717,12 +713,15 @@ impl Host {
                 timeout_ms: remaining_ms(deadline),
                 output_limit_bytes: MAX_PROBE_CAPTURE,
             };
-            let response = self.run_supervised(spec, cancellation, workspace, phase);
-            if response.outcome != Outcome::Success {
-                return Err(Box::new(CommandResult::error(
-                    response.outcome,
-                    format!("native {phase} probe did not complete successfully"),
-                )));
+            let mut response = self.run_supervised(spec, cancellation, workspace, phase);
+            if response.error.is_some() {
+                if response.outcome == Outcome::Success {
+                    response.outcome = Outcome::Failure;
+                }
+                return Err(Box::new(response));
+            }
+            if !matches!(response.outcome, Outcome::Success | Outcome::Failure) {
+                return Err(Box::new(response));
             }
             if response.stdout_truncated || response.stderr_truncated {
                 return Err(Box::new(CommandResult::error(
@@ -730,16 +729,86 @@ impl Host {
                     format!("native {phase} probe output exceeded its bound"),
                 )));
             }
+            Ok(response)
+        };
+        let mut responses = Vec::new();
+        for (phase, args) in [
+            ("version", vec!["--version".into()]),
+            ("help", profile.help_args()),
+        ] {
+            let response = probe(phase, args)?;
+            if response.outcome != Outcome::Success {
+                return Err(Box::new(CommandResult::error(
+                    response.outcome,
+                    format!("native {phase} probe did not complete successfully"),
+                )));
+            }
             responses.push(format!("{}\n{}", response.stdout, response.stderr));
         }
+        let hidden_max_turns = profile.hidden_max_turns_probe_needed(&responses[1]);
+        if hidden_max_turns {
+            // Only this documented hidden flag has a fallback. Check the version
+            // and every other required capability before making additional probes.
+            let mut without_turns = profile.clone();
+            without_turns.max_turns = None;
+            without_turns
+                .validate_probe(&responses[0], &responses[1], read_only)
+                .map_err(|error| CommandResult::error(Outcome::Failure, error))?;
+            // A successful --help can ignore unknown options. Require the parser
+            // to specifically recognize a missing argument, then accept our value.
+            // Both invocations retain --help and have no prompt/model operation.
+            let missing = probe(
+                "max-turns-missing",
+                vec!["--help".into(), "--max-turns".into()],
+            )?;
+            let diagnostic = format!("{}\n{}", missing.stdout, missing.stderr);
+            let recognized = diagnostic.lines().any(|line| {
+                line.trim()
+                    .strip_prefix("error: option '--max-turns <")
+                    .and_then(|rest| rest.strip_suffix(">' argument missing"))
+                    .is_some_and(|name| {
+                        !name.is_empty()
+                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                    })
+            });
+            if missing.outcome != Outcome::Failure
+                || missing.exit_code != Some(1)
+                || missing.signal.is_some()
+                || !recognized
+            {
+                return Err(Box::new(CommandResult::error(
+                    Outcome::Failure,
+                    "CLI could not verify hidden --max-turns argument parsing",
+                )));
+            }
+            let valid = probe(
+                "max-turns-help",
+                vec![
+                    "--max-turns".into(),
+                    profile.max_turns.expect("configured max_turns").to_string(),
+                    "--help".into(),
+                ],
+            )?;
+            if valid.outcome != Outcome::Success {
+                return Err(Box::new(CommandResult::error(
+                    valid.outcome,
+                    "CLI rejected configured --max-turns in help probe",
+                )));
+            }
+        }
         let cli_version = profile
-            .validate_probe(&responses[0], &responses[1], read_only)
+            .validate_probe_with_max_turns(
+                &responses[0],
+                &responses[1],
+                read_only,
+                hidden_max_turns,
+            )
             .map_err(|error| CommandResult::error(Outcome::Failure, error))?;
         Ok(ProviderProbe {
             provider: profile.provider,
             cli_version,
             read_only_supported: profile
-                .validate_probe(&responses[0], &responses[1], true)
+                .validate_probe_with_max_turns(&responses[0], &responses[1], true, hidden_max_turns)
                 .is_ok(),
         })
     }

@@ -153,7 +153,7 @@ UI 的依赖免费 Node 状态测试覆盖重复提交、保留幂等 key 重试
 cargo run -p relay-app -- doctor /absolute/path/config.json
 ```
 
-`doctor` 只调用已配置 CLI 的版本与帮助入口，输出 JSON 能力诊断；不发出模型请求。`compatible` 仅表示本地接口满足调用要求，认证与模型访问始终标记 `unknown`。Claude 无人值守运行要求 v2.1.259+ 及相应参数。任务执行前再次进行受 supervisor 管理的检查，所有检查共享任务期限。缺少功能或检查失败时停止，不退回不安全的权限模式。
+`doctor` 只调用已配置 CLI 的版本与帮助入口，输出 JSON 能力诊断；不发出模型请求。退出码 0 表示诊断完成，不代表所有 profile 兼容；自动化须检查 JSON 中所需 profile 的 `compatible`，审查能力另看 `probe.read_only_supported`。Claude 的[官方 CLI 文档](https://code.claude.com/docs/en/cli-reference)说明帮助输出不包含所有参数：若配置了但帮助中隐藏 `--max-turns`，Relay 先验证版本和其他必要参数，再用带 `--help` 的缺参/有效值探测确认解析器确实支持该选项；单独 `--help` 成功或普通非零退出均不足以通过。额外探测共享原有 10 秒期限和输出上限；格式不明仍拒绝，不删除 turn/budget 限制。`compatible` 仅表示本地接口满足调用要求，认证与模型访问始终标记 `unknown`。Claude 无人值守运行要求 v2.1.259+ 及相应参数。任务执行前再次进行受 supervisor 管理的检查，所有检查共享任务期限。缺少功能或检查失败时停止，不退回不安全的权限模式。
 
 只读能力单独探测：当前 Claude 需要 restricted 模式、仅 Read/Glob/Grep 工具、禁用 MCP/自定义命令的完整能力。Codex 开发调用可用，但只读审查返回 `review_profile_unsupported`，因为其 read-only sandbox 不等于禁用项目 MCP/hooks。机器上的托管设置仍属于可信部署边界，不承诺对恶意 CLI 或托管 hooks 隔离。
 

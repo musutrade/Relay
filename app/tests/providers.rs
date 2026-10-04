@@ -61,6 +61,18 @@ fn compiles_literal_typed_profiles_and_read_only_variants() {
             "none"
         ]
     );
+    assert!(
+        command
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--max-turns", "5"])
+    );
+    assert!(
+        command
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--max-budget-usd", "2.5"])
+    );
     assert!(command.args.contains(&"--restricted".into()));
     assert!(command.args.contains(&"Read,Glob,Grep".into()));
     assert!(command.args.iter().any(|arg| arg.contains("mcp__*")));
