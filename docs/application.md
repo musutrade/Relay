@@ -20,6 +20,7 @@
 - `timeout_seconds`：整个快照、Agent、测试和 PR 流程的共同期限，1–3600 秒，默认 300
 - `output_limit_bytes`：每阶段 stdout/stderr 分别捕获 1–8192 字节，默认 2048；多余内容继续排空并标注截断，不无限累积
 - `max_snapshot_bytes` / `max_snapshot_entries`：复制输入快照时的字节数和条目限制，默认 50 MiB / 20,000；复制排除 `.git`、`target` 和 `node_modules`，拒绝符号链接和特殊文件
+- `successful_workspace_retention_seconds`：可选成功工作区保留期（60–31536000 秒）；省略不自动清理。失败/未知现场保留，详见 [固定工作区与继续](workspace-continuation.md)
 - `max_retained_workspaces`：默认最多保留 100 个工作区；达到上限后拒绝新执行，需可信操作员先检查和清理。运行期每 250ms 尽力检查相同的字节/条目预算，超限会停止当前命令；快写入可能暂时超过限制，这不是内核文件系统配额
 
 开发 job 示例：
@@ -78,7 +79,7 @@
 4. reviewer 使用受限只读工具检查完整有界 diff 与候选文件，必须返回包含精确 `candidate_sha` 的 JSON verdict、摘要和 findings。错误 SHA、缺字段、截断回答、权限拒绝、非法终态或修改工作区都不通过
 5. 只有普通测试非零退出，或有效 `changes_requested`，才能在剩余预算内触发修复。每次修复生成新候选，重新测试与审查；旧审查结论失效。所有轮次共享总期限，最多保存 4 轮有界证据
 
-工作流 prompt 在保留原始需求上加入宿主指令，使用单独的有界内部输入预算；用户需求仍限 32 KiB。完整 diff 最大 256 KiB，跟踪文件清单最大 64 KiB；超限失败而不让 reviewer 审查截断版本。完整性检查比较实际文件字节和 owner 可执行位与 Git blob，不通过 clean filter 判断；使 checkout 字节不同于提交的 CRLF/encoding/filter 转换暂不支持。拒绝新添加的 gitlink/嵌套仓库，以及私有 Git 元数据的 commondir/alternates 重定向。工作区运行预算涵盖 Git 元数据与证据，仍是尽力检查而非文件系统硬配额。结果增加 `workflow`，含 base/candidate/reviewed SHA、每轮摘要及外部结果核对标志，不增加内核状态，也不提供中途恢复的模型会话。
+工作流 prompt 在保留原始需求上加入宿主指令，使用单独的有界内部输入预算；用户需求仍限 32 KiB。完整 diff 最大 256 KiB，跟踪文件清单最大 64 KiB；超限失败而不让 reviewer 审查截断版本。完整性检查比较实际文件字节和 owner 可执行位与 Git blob，不通过 clean filter 判断；使 checkout 字节不同于提交的 CRLF/encoding/filter 转换暂不支持。拒绝新添加的 gitlink/嵌套仓库，以及私有 Git 元数据的 commondir/alternates 重定向。工作区运行预算涵盖 Git 元数据与证据，仍是尽力检查而非文件系统硬配额。结果增加 `workflow`，含 base/candidate/reviewed SHA、每轮摘要及外部结果核对标志，不增加内核状态，可显式使用 [会话续接](session-continuity.md) 与 [固定工作区继续](workspace-continuation.md)。
 
 ## 可选精确 SHA draft PR 适配器
 
@@ -92,7 +93,7 @@
 
 ## HTTP 与 MCP
 
-HTTP 所有 `/api` 路由校验 bearer token（32–256 非空白 ASCII 字节）。HTML 入口无需 token，但无 token 不能读取任务或配置。页面内存保存 token，没有 URL/token 持久化；响应 `no-store`，无第三方脚本和 CORS 开放。用户可查看任务、提交、请求取消；接口没有运行任意命令、自动恢复或删除工作区入口。
+HTTP 所有 `/api` 路由校验 bearer token（32–256 非空白 ASCII 字节）。HTML 入口无需 token，但无 token 不能读取任务或配置。页面内存保存 token，没有 URL/token 持久化；响应 `no-store`，无第三方脚本和 CORS 开放。用户可查看任务、提交、请求取消及显式继续已停止的失败任务；接口没有运行任意命令、自动恢复或删除工作区入口。
 
 MCP 采用 stdio newline JSON-RPC，支持 `initialize`（协议 2024-11-05）、`ping`、`tools/list`、`tools/call`。工具为 `relay_submit`、`relay_get`、`relay_list`、`relay_config`，只作需求入口和读取结果。每条消息上限 128 KiB；没有 ID 的通知不返回响应，也不会提交任务。MCP 是可信 OS 本机进程接口，不使用 HTTP token。MCP 本身不启动 worker，因此需要同时运行 `serve`。
 
@@ -115,9 +116,9 @@ MCP 配置示例（把路径替换成实际绝对路径）：
 1. 停止本服务领取新工作，读取 `relay <db> active` 的精确 id/generation/owner
 2. 结合工作区内 supervisor 记录和实际 OS 进程核对旧执行及其后代确实已终止；PID 可能复用，不能仅据 PID 杀死无关进程
 3. 检查 GitHub、外部服务和文件结果，决定是否可以重做；保留原工作区和诊断
-4. 确认后，可信本机操作员运行 `relay <db> confirm-stopped-and-requeue <id> <generation> <owner>`；新 generation 用新工作区，旧 generation 不可写回
+4. 确认后，可信本机操作员运行 `relay <db> confirm-stopped-and-requeue <id> <generation> <owner>`；新 generation 复用固定工作区，旧 generation 不可再次执行或写回
 
-若旧任务实际上已成功而只有落库失败，也可用同一 claim 的 `finish` 写回已核实结果。恢复操作有意不暴露到网页。不要通过手工删除数据库或工作区消除未知状态。
+若旧任务实际上已成功而只有落库失败，也可用同一 claim 的 `finish` 写回已核实结果。未知 claimed 的本机恢复有意不暴露到网页。普通已结束失败可使用网页/HTTP/MCP 的显式继续入口，创建引用同一目录的新任务，不改变旧结果。不要通过手工删除数据库或工作区消除未知状态。
 
 ## 验证
 

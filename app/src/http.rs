@@ -34,6 +34,7 @@ pub fn router_with_auth(app: Arc<Application>, auth: Auth) -> Router {
         .route("/tasks", get(list).post(submit))
         .route("/tasks/{id}", get(detail))
         .route("/tasks/{id}/cancel", post(cancel))
+        .route("/tasks/{id}/retry", post(retry))
         .layer(DefaultBodyLimit::max(96 * 1024))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
@@ -158,6 +159,13 @@ async fn submit(
     Json(input): Json<Submission>,
 ) -> Result<(StatusCode, Json<relay::Task>), ApiError> {
     Ok((StatusCode::CREATED, Json(state.app.submit(input)?)))
+}
+async fn retry(
+    State(state): State<Web>,
+    Path(id): Path<i64>,
+    Json(input): Json<crate::RetryRequest>,
+) -> Result<(StatusCode, Json<relay::Task>), ApiError> {
+    Ok((StatusCode::CREATED, Json(state.app.retry(id, input)?)))
 }
 async fn cancel(State(state): State<Web>, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
     Ok(Json(state.app.cancel(id)?))

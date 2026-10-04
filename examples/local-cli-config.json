@@ -6,12 +6,13 @@
   "agents": {},
   "native_agents": {
     "codex": {
-      "provider": "codex_cli",
+      "provider": "codex_app_server",
       "program": "/absolute/path/to/codex",
       "effort": "medium"
     },
     "claude": {
       "provider": "claude_cli",
+      "session_continuity": true,
       "program": "/absolute/path/to/claude",
       "effort": "medium",
       "max_turns": 8,
@@ -19,6 +20,7 @@
     },
     "claude-reviewer": {
       "provider": "claude_cli",
+      "session_continuity": true,
       "program": "/absolute/path/to/claude",
       "effort": "medium",
       "max_turns": 8,

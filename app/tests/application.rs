@@ -380,7 +380,7 @@ fn unknown_host_outcome_preserves_claim_and_diagnostic() {
         .unwrap();
     app.submit(serde_json::from_value(submission("blocked-next")).unwrap())
         .unwrap();
-    std::fs::create_dir(root.path().join("runs/task-1-generation-1")).unwrap();
+    std::fs::create_dir(root.path().join("runs/task-1")).unwrap();
     assert!(matches!(
         app.work_once(),
         Err(relay_app::Error::RecoveryRequired)

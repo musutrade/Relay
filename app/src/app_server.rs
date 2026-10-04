@@ -14,6 +14,7 @@ pub(crate) struct Start {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub resume: Option<String>,
+    pub checkpoint: Option<crate::sessions::Checkpoint>,
 }
 
 pub(crate) struct Driver {
@@ -138,6 +139,11 @@ impl Driver {
                         .is_some_and(|expected| expected != &id)
                     {
                         return Err("app-server resumed a different thread".into());
+                    }
+                    if let Some(checkpoint) = &self.start.checkpoint {
+                        checkpoint
+                            .started(&id)
+                            .map_err(|e| format!("cannot persist started thread: {e}"))?;
                     }
                     self.result.session_id = Some(id.clone());
                     self.result.reported_model = result
@@ -323,6 +329,7 @@ mod tests {
                 model: Some("model".into()),
                 effort: Some("high".into()),
                 resume: resume.map(str::to_owned),
+                checkpoint: None,
             },
         )
     }
