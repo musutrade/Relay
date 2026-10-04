@@ -2,3 +2,8 @@
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+/.relay/
+*.db
+*.db-shm
+*.db-wal
+__pycache__/

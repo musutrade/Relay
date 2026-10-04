@@ -14,7 +14,7 @@ Relay 库 / 本地 CLI → SQLite
 可信宿主
 ```
 
-适配器、Agent、执行器和宿主是责任划分，不要求拆成独立服务。当前仓库只实现 Relay 库与本地 CLI。
+适配器、Agent、执行器和宿主是责任划分，不要求拆成独立服务。当前仓库实现 Relay 库/CLI，以及独立的 `relay-app`：回环 HTTP/UI、MCP stdio、开发 schema 与可信 Linux supervisor。它们复用同一个内核，不把业务语义放入库。
 
 ## 内核做什么
 
@@ -28,7 +28,7 @@ SQLite 是唯一状态源。修改状态使用 immediate transaction，将读取
 
 数据库启用 WAL 与 `synchronous=FULL`，以约束和唯一索引保护基本状态及单一活跃 claim。领取选择最早入队的任务；`active` 可以读取当前 claim，用于区分空队列与被占用的串行位置。
 
-`rusqlite` 使用 bundled SQLite；`serde` / `serde_json` 负责数据与 JSON，`thiserror` 负责错误类型。测试用 `tempfile` 隔离本地数据库。没有网络服务依赖。
+`rusqlite` 使用 bundled SQLite；`serde` / `serde_json` 负责数据与 JSON，`thiserror` 负责错误类型。测试用 `tempfile` 隔离本地数据库。这些内核依赖不包含网络服务；独立应用 package 使用 Axum/Tokio 提供显式请求的 HTTP 入口。
 
 ## 状态与失败处理
 
@@ -65,6 +65,13 @@ CLI 仅把文件和参数映射到库调用并输出 JSON。不应让 CLI 演变
 
 ## 信任模型与非目标
 
-数据库及其父目录受本机账户和文件权限保护。owner 不是秘密；generation 不能抵御能够直接修改数据库的调用方。所有直接访问内核的调用方必须属于同一可信本地域。未来若增加远程入口，认证、授权、输入限制和宿主隔离必须由入口与宿主明确承担。
+数据库及其父目录受本机账户和文件权限保护。owner 不是秘密；generation 不能抵御能够直接修改数据库的调用方。所有直接访问内核的调用方必须属于同一可信本地域。现有应用的 HTTP 入口校验 bearer token、只绑定回环地址并限制请求体；配置的仓库/Agent 名称由宿主 allowlist 控制。远程访问和强隔离需要独立运维配置，不由本机能力隐含保证。
 
 以下内容不进入内核：GitHub 业务逻辑、模型选择或调用、证据与质量报告策略、开发流程决策、审批系统、工作区管理、进程管理、动态插件、分布式微服务、UI，以及完整 Agent 实现。增加功能时，先确定它属于哪个现有责任边界，而不是默认扩张核心。
+
+
+## 应用层状态与取消
+
+`app/` 的开发 schema、配置、supervisor 和 transport 不进入内核。内核仅新增最多 100 项的 ID 游标读取，不新增执行/取消状态。应用在同一 SQLite 文件维护自身 cancellation 与 unknown diagnostic 元数据；取消前使用 immediate transaction 读取核心 claim 并写请求，避免不同进程 claim/取消竞争。运行中的取消手柄按完整 id/generation/owner 匹配。
+
+HTTP worker 遇到 host Unknown 或落库失败仍保留 claimed，不按时间重试。host 成功确认进程树结束后，应用将业务 success/failure/cancelled/timed_out 作为不透明 result 调用核心 finish。网页呈现业务结果；MCP 只提供提交/读取，不引入第二个工作流状态机。详见 [运行说明](application.md)。
