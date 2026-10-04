@@ -367,12 +367,14 @@ impl ProviderResult {
 }
 
 /// Streaming JSONL parser. Storage is independent of total log size; captured stdout
-/// is never used to decide success. After an error we still consume every byte.
+/// is never used to decide success. Fatal errors are sticky, but later lines are
+/// still parsed for bounded diagnostics. Oversized lines are skipped to a newline.
 pub struct ProtocolParser {
     result: ProviderResult,
     line: Vec<u8>,
     error: Option<String>,
     terminal: bool,
+    discarding_line: bool,
     read_only: bool,
     answer_seen: bool,
 }
@@ -384,6 +386,7 @@ impl ProtocolParser {
             line: Vec::new(),
             error: None,
             terminal: false,
+            discarding_line: false,
             read_only: false,
             answer_seen: false,
         }
@@ -393,23 +396,28 @@ impl ProtocolParser {
         self
     }
     pub fn feed(&mut self, bytes: &[u8]) {
-        if self.error.is_some() {
-            return;
-        }
         for &byte in bytes {
             if byte == b'\n' {
-                self.parse_line();
-                self.line.clear();
-                if self.error.is_some() {
-                    break;
+                if !self.discarding_line {
+                    self.parse_line();
                 }
+                self.line.clear();
+                self.discarding_line = false;
+            } else if self.discarding_line {
+                continue;
             } else if self.line.len() < MAX_PROTOCOL_LINE {
                 self.line.push(byte);
             } else {
-                self.error = Some("provider JSONL line exceeds 64 KiB".into());
+                self.record_error("provider JSONL line exceeds 64 KiB".into());
                 self.line.clear();
-                break;
+                self.discarding_line = true;
             }
+        }
+    }
+    fn record_error(&mut self, error: String) {
+        // A later successful terminal must never erase a fatal protocol failure.
+        if self.error.is_none() {
+            self.error = Some(error);
         }
     }
     fn parse_line(&mut self) {
@@ -419,12 +427,12 @@ impl ProtocolParser {
         let event: Value = match serde_json::from_slice(&self.line) {
             Ok(value) => value,
             Err(_) => {
-                self.error = Some("malformed provider JSONL event".into());
+                self.record_error("malformed provider JSONL event".into());
                 return;
             }
         };
         if let Err(error) = self.event(&event) {
-            self.error = Some(error);
+            self.record_error(error);
         }
     }
     fn event(&mut self, event: &Value) -> Result<(), String> {
@@ -437,8 +445,16 @@ impl ProtocolParser {
         }
         if kind == "result" {
             self.result.terminal_reason = string_field(event, "subtype", MAX_FIELD)?;
-        } else if kind == "turn.failed" {
-            self.result.terminal_reason = Some(kind.into());
+        }
+        if self.result.provider == ProviderKind::CodexCli && kind == "turn.failed" {
+            self.finish_terminal(kind)?;
+            return Err("provider turn failed".into());
+        }
+        if self.result.provider == ProviderKind::CodexCli && kind == "error" {
+            if self.result.terminal_reason.is_none() {
+                self.result.terminal_reason = Some("provider_error".into());
+            }
+            return Err("provider reported an unrecoverable stream error".into());
         }
         if let Some(denials) = event.get("permission_denials")
             && !denials.as_array().is_some_and(Vec::is_empty)
@@ -469,14 +485,25 @@ impl ProtocolParser {
                         .get("item")
                         .filter(|value| value.is_object())
                         .ok_or("provider item must be an object")?;
-                    if item.get("type").and_then(Value::as_str) == Some("error")
-                        || item.get("error").is_some_and(|value| !value.is_null())
-                        || matches!(
-                            item.get("status").and_then(Value::as_str),
-                            Some("failed" | "declined")
-                        )
-                    {
-                        return Err("provider item reported an error".into());
+                    let item_type = string_field(item, "type", MAX_FIELD)?
+                        .ok_or("provider item requires a string type")?;
+                    // Codex ErrorItem and failed tool items are non-fatal. The
+                    // agent may recover; only the turn terminal decides success.
+                    // Keep validating the fields we interpret, and do not relax
+                    // explicit permission denials or read-only tool restrictions.
+                    if item_type == "error" {
+                        item.get("message")
+                            .and_then(Value::as_str)
+                            .ok_or("provider error item requires a message")?;
+                    }
+                    if let Some(error) = item.get("error").filter(|value| !value.is_null()) {
+                        error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .ok_or("provider item error requires a message")?;
+                    }
+                    if string_field(item, "status", MAX_FIELD)?.as_deref() == Some("declined") {
+                        return Err("provider item denied permission".into());
                     }
                     if self.read_only
                         && matches!(
@@ -498,7 +525,6 @@ impl ProtocolParser {
                     self.finish_terminal("turn.completed")?;
                     self.usage(event)?;
                 }
-                "turn.failed" => return Err("provider turn failed".into()),
                 _ if kind.starts_with("turn.") || terminal_name(kind) => {
                     return Err("unrecognized provider terminal event".into());
                 }
@@ -614,7 +640,7 @@ impl ProtocolParser {
         Ok(())
     }
     pub fn finish(mut self) -> (ProviderResult, Option<String>) {
-        if self.error.is_none() && !self.line.is_empty() {
+        if !self.discarding_line && !self.line.is_empty() {
             self.parse_line();
         }
         if self.error.is_none() && !self.terminal {

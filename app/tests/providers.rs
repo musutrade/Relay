@@ -166,10 +166,6 @@ fn malformed_missing_failed_unknown_and_duplicate_terminals_fail() {
         "{\"type\":\"turn.failed\"}\n".into(),
         format!("{CODEX_OK}{{\"type\":\"turn.completed\"}}\n"),
         format!("{CODEX_OK}{{\"type\":\"future.completed\"}}\n"),
-        format!("{{\"type\":\"item.completed\",\"item\":{{\"type\":\"error\"}}}}\n{CODEX_OK}"),
-        format!(
-            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"status\":\"failed\"}}}}\n{CODEX_OK}"
-        ),
         format!(
             "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"status\":\"declined\"}}}}\n{CODEX_OK}"
         ),
@@ -250,4 +246,107 @@ fn claude_read_only_accepts_implicit_nonmutating_end_conversation() {
     parser.feed(b"{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"EndConversation\"}]}}\n");
     parser.feed(CLAUDE_OK.replace("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"c-1\",\"model\":\"reported\"}\n", "").as_bytes());
     assert!(parser.finish().1.is_none());
+}
+
+#[test]
+fn codex_nonfatal_items_preserve_the_last_answer_and_usage() {
+    // Codex's SDK calls ErrorItem non-fatal; tool completion may also be failed.
+    // https://github.com/openai/codex/blob/main/sdk/typescript/src/items.ts
+    for item in [
+        json!({"id":"e1","type":"error","message":"tool unavailable"}),
+        json!({"id":"c1","type":"command_execution","command":"false","aggregated_output":"","exit_code":1,"status":"failed"}),
+        json!({"id":"m1","type":"mcp_tool_call","server":"test","tool":"lookup","arguments":{},"error":{"message":"unavailable"},"status":"failed"}),
+        json!({"id":"f1","type":"file_change","changes":[],"status":"failed"}),
+    ] {
+        let stream = format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"initial plan\"}}}}\n{}\n{CODEX_OK}",
+            json!({"type":"item.completed","item":item})
+        );
+        let (result, error) = parse(ProviderKind::CodexCli, &stream);
+        assert!(error.is_none(), "{error:?}: {stream}");
+        assert_eq!(result.summary, "完成✓");
+        assert_eq!(result.terminal_reason.as_deref(), Some("turn.completed"));
+        assert_eq!(result.usage.input_tokens, Some(12));
+        assert_eq!(result.usage.output_tokens, Some(4));
+        // Non-fatal does not itself imply success without a turn terminal.
+        let (_, error) = parse(
+            ProviderKind::CodexCli,
+            &json!({"type":"item.completed","item":item}).to_string(),
+        );
+        assert!(error.unwrap().contains("without a recognized"));
+    }
+}
+
+#[test]
+fn fatal_errors_stay_failed_while_later_metadata_is_collected() {
+    for prefix in [
+        "not json".into(),
+        "{\"type\":42}".into(),
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"status\":42}}"
+            .into(),
+        "{\"type\":\"error\",\"message\":\"transport failed\"}".into(),
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"error\",\"message\":42}}".into(),
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"mcp_tool_call\",\"error\":\"invalid\"}}"
+            .into(),
+        "x".repeat(MAX_PROTOCOL_LINE + 1),
+    ] {
+        let stream = format!("{prefix}\n{CODEX_OK}");
+        // Test both same-buffer continuation and boundaries inside every line.
+        for size in [1, 7, stream.len()] {
+            let mut parser =
+                ProtocolParser::new(ProviderResult::new(&profile(ProviderKind::CodexCli), None));
+            for chunk in stream.as_bytes().chunks(size) {
+                parser.feed(chunk);
+            }
+            let (result, error) = parser.finish();
+            assert!(error.is_some(), "{prefix}");
+            assert_eq!(result.summary, "完成✓");
+            assert_eq!(result.usage.input_tokens, Some(12));
+            assert_eq!(result.terminal_reason.as_deref(), Some("turn.completed"));
+        }
+    }
+    let (_, error) = parse(ProviderKind::CodexCli, &format!("bad\n{{}}\n{CODEX_OK}"));
+    assert_eq!(error.as_deref(), Some("malformed provider JSONL event"));
+}
+
+#[test]
+fn failed_turn_is_terminal_and_cannot_be_corrected_into_success() {
+    let failed = "{\"type\":\"turn.failed\",\"error\":{\"message\":\"model unavailable\"}}\n";
+    for suffix in ["", CODEX_OK] {
+        let (result, error) = parse(ProviderKind::CodexCli, &format!("{failed}{suffix}"));
+        assert_eq!(error.as_deref(), Some("provider turn failed"));
+        assert_eq!(result.terminal_reason.as_deref(), Some("turn.failed"));
+    }
+}
+
+#[test]
+fn oversized_line_resynchronizes_only_at_newline_and_accepts_final_unterminated_line() {
+    let mut parser =
+        ProtocolParser::new(ProviderResult::new(&profile(ProviderKind::CodexCli), None));
+    parser.feed(&vec![b'x'; MAX_PROTOCOL_LINE + 1]);
+    parser.feed(b"{\"type\":\"turn.completed\"}"); // Still the oversized line.
+    parser.feed(b"\n");
+    parser.feed(CODEX_OK.trim_end().as_bytes());
+    let (result, error) = parser.finish();
+    assert!(error.unwrap().contains("64 KiB"));
+    assert_eq!(result.summary, "完成✓");
+    assert_eq!(result.usage.output_tokens, Some(4));
+}
+
+#[test]
+fn invalid_utf8_remains_fatal_and_preserves_later_diagnostics() {
+    let mut parser =
+        ProtocolParser::new(ProviderResult::new(&profile(ProviderKind::CodexCli), None));
+    parser.feed(&[0xff, b'\n']);
+    parser.feed(CODEX_OK.as_bytes());
+    let (result, error) = parser.finish();
+    assert_eq!(error.as_deref(), Some("malformed provider JSONL event"));
+    assert_eq!(result.summary, "完成✓");
+    assert_eq!(result.usage.output_tokens, Some(4));
+    let (result, error) = parse(
+        ProviderKind::CodexCli,
+        "{\"type\":\"error\",\"message\":\"transport failed\"}",
+    );
+    assert!(error.unwrap().contains("unrecoverable"));
+    assert_eq!(result.terminal_reason.as_deref(), Some("provider_error"));
 }
