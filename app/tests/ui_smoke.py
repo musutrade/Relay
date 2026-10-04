@@ -95,10 +95,10 @@ with sync_playwright() as p:
     page.locator('#refresh').click();page.wait_for_timeout(150)
     assert page.locator('#recovery-banner').is_visible()
     assert page.locator('#submit-task').is_disabled()
-    page.locator('.task-button[data-task-id=2]').click()
+    page.locator('.task-button[data-task-id="2"]').click()
     assert page.locator('#detail-warning').is_visible()
     assert '<b>safe</b>' in page.locator('#detail-diagnostic-text').inner_text()
-    page.locator('.task-button[data-task-id=4]').click()
+    page.locator('.task-button[data-task-id="4"]').click()
     assert not page.locator('#detail-diagnostic').is_visible()
     page.screenshot(path=str(SCREENSHOTS / 'relay-recovery-desktop.png'),full_page=True)
     # Network banner with last-known data.
