@@ -4,7 +4,7 @@ Relay 将整理好的开发需求交给外部命令行 Agent，在独立工作�
 
 ## 先跑完整的无凭据演示
 
-需要 Linux、Rust（版本固定在 `rust-toolchain.toml`）、C 编译器和 Python 3。演示不调用付费模型、不推送 Git、不创建真实 PR。
+需要 Linux、Git（`/usr/bin/git`，2.28 或更新版本）、Rust（版本固定在 `rust-toolchain.toml`）、C 编译器和 Python 3。演示不调用付费模型、不推送 Git、不创建真实 PR。
 
 ```sh
 cargo test --workspace

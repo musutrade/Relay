@@ -552,6 +552,63 @@ impl Host {
                 &self.config.workflows[name],
             );
         }
+        // A snapshot needs its own Git boundary even when no reviewed workflow
+        // was selected. Never copy the source's metadata or discover an ancestor.
+        if let Some(outcome) = interrupted(&cancellation, deadline) {
+            result.outcome = outcome;
+            return result;
+        }
+        let git = self.run_supervised(
+            CommandSpec {
+                program: PathBuf::from("/usr/bin/git"),
+                args: vec![
+                    "init".into(),
+                    "--quiet".into(),
+                    "--template=".into(),
+                    "--initial-branch=relay-snapshot".into(),
+                ],
+                env: [
+                    ("PATH", "/usr/bin:/bin"),
+                    ("LC_ALL", "C"),
+                    ("GIT_CONFIG_NOSYSTEM", "1"),
+                    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+                    ("GIT_CONFIG_SYSTEM", "/dev/null"),
+                    ("GIT_TERMINAL_PROMPT", "0"),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+                cwd: repository.clone(),
+                input: String::new(),
+                timeout_ms: remaining_ms(deadline),
+                output_limit_bytes: MAX_CAPTURE,
+                provider: None,
+                read_only: false,
+                clear_env: true,
+            },
+            &cancellation,
+            &workspace,
+            "snapshot-git",
+        );
+        if git.outcome != Outcome::Success {
+            result.outcome = git.outcome;
+            result.error = Some(format!(
+                "cannot initialize private snapshot Git repository: {}",
+                git.error.unwrap_or_else(|| "Git init failed".into())
+            ));
+            return result;
+        }
+        if let Err(error) = OpenOptions::new()
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(repository.join(".git/config"))
+            .and_then(|mut config| {
+                config.write_all(b"\n[core]\n\thooksPath = /dev/null\n\tfsmonitor = false\n")
+            })
+        {
+            result.error = Some(format!("cannot configure private snapshot Git: {error}"));
+            return result;
+        }
         if let Some(profile) = self.config.native_agents.get(&job.agent) {
             let command = self.run_native(
                 profile,
@@ -1302,6 +1359,32 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
     let mut command = Command::new(&spec.program);
     if spec.clear_env {
         command.env_clear();
+    }
+    // Do not let inherited Git redirections select the service's repository.
+    // Trusted per-command values (such as the workflow index) remain supported.
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_SHALLOW_FILE",
+    ] {
+        command.env_remove(key);
+    }
+    // Keep discovery bounded even if an agent removes its private .git directory.
+    if let Some(parent) = spec.cwd.parent() {
+        let ceiling = match std::env::join_paths([parent]) {
+            Ok(ceiling) => ceiling,
+            Err(error) => {
+                return CommandResult::error(
+                    Outcome::Failure,
+                    format!("cannot encode private Git discovery ceiling: {error}"),
+                );
+            }
+        };
+        command.env("GIT_CEILING_DIRECTORIES", ceiling);
     }
     let mut child = match command
         .args(&spec.args)
