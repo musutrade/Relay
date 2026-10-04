@@ -46,7 +46,7 @@ POST /api/tasks/<id>/cancel
 
 可选命名 `workflows` 将开发 → 测试 → 只读审查 → 有界修复绑定同一 candidate SHA；每次修复必须重新测试和审查。GitHub 示例仅推送已批准的精确候选，默认 dry-run。
 
-配置、占位符、工作区限制、可选 draft PR 流程及恢复方法见 [运行说明](docs/application.md)。首次接真实 CLI 前先确认其当前版本的调用参数、权限与费用。演示配置是可直接运行的契约示例，不假设你已安装任何模型 CLI。
+首次本机安装、真实 CLI 完整配置、停止/重启与备份升级见 [Linux 操作手册](docs/operator-guide.md)。配置、占位符、工作区限制、可选 draft PR 流程及恢复方法见 [运行说明](docs/application.md)。首次接真实 CLI 前先确认其当前版本的调用参数、权限与费用。演示配置是可直接运行的契约示例，不假设你已安装任何模型 CLI。
 
 ## 可靠性边界
 
