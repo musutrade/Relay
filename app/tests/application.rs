@@ -10,6 +10,42 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 const TOKEN: &str = "test-only-token-00000000000000000000";
+
+#[test]
+fn public_config_lists_native_agents_without_commands_or_secrets() {
+    let root = TempDir::new().unwrap();
+    let mut config = config(root.path());
+    config.native_agents.insert(
+        "native".into(),
+        serde_json::from_value(json!({
+            "provider":"codex_cli", "program":"/bin/echo", "model":"configured-model",
+            "env":{"PRIVATE_TOKEN":"secret-do-not-expose"}
+        }))
+        .unwrap(),
+    );
+    let app = Application::open(root.path().join("relay.db"), config).unwrap();
+    let public = app.public_config();
+    assert!(
+        public["agents"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("native"))
+    );
+    assert_eq!(public["native_agents"][0]["provider"], "codex_cli");
+    assert_eq!(public["native_agents"][0]["model"], "configured-model");
+    assert_eq!(public["native_agents"][0]["authentication"], "unknown");
+    let serialized = public.to_string();
+    for forbidden in [
+        "PRIVATE_TOKEN",
+        "secret-do-not-expose",
+        "/bin/echo",
+        "program",
+        "env",
+    ] {
+        assert!(!serialized.contains(forbidden));
+    }
+}
+
 fn config(root: &Path) -> HostConfig {
     let repo = root.join("source");
     std::fs::create_dir_all(&repo).unwrap();

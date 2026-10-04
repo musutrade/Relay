@@ -4,6 +4,7 @@
 //! lifecycle management and private snapshot isolation, not an adversarial sandbox.
 //! A separate subreaper process owns every command tree; the application process
 //! never changes its process-wide child-reaping behavior.
+use crate::providers::{NativeProfile, ProtocolParser, ProviderProbe, ProviderResult};
 use relay::{MAX_PAYLOAD_BYTES, MAX_RESULT_BYTES, State, Task};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -21,8 +22,10 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const MAX_REQUIREMENTS: usize = 32 * 1024;
+pub(crate) const MAX_PHASE_INPUT: usize = 64 * 1024;
 const MAX_CONFIG_BYTES: usize = 256 * 1024;
 const MAX_CAPTURE: usize = 8192;
+const MAX_PROBE_CAPTURE: usize = 64 * 1024;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 const TICK: Duration = Duration::from_millis(10);
 
@@ -58,7 +61,10 @@ pub struct CommandProfile {
 pub struct HostConfig {
     pub workspace_root: PathBuf,
     pub repositories: BTreeMap<String, PathBuf>,
+    #[serde(default)]
     pub agents: BTreeMap<String, CommandProfile>,
+    #[serde(default)]
+    pub native_agents: BTreeMap<String, NativeProfile>,
     #[serde(default)]
     pub tests: BTreeMap<String, CommandProfile>,
     #[serde(default)]
@@ -139,7 +145,9 @@ impl Job {
         if !config.repositories.contains_key(&self.repository) {
             return Err(HostError::Job("repository is not allowlisted".into()));
         }
-        if !config.agents.contains_key(&self.agent) {
+        if !config.agents.contains_key(&self.agent)
+            && !config.native_agents.contains_key(&self.agent)
+        {
             return Err(HostError::Job("agent profile is not allowlisted".into()));
         }
         if self
@@ -179,6 +187,8 @@ pub enum Outcome {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderResult>,
     pub outcome: Outcome,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
@@ -191,8 +201,9 @@ pub struct CommandResult {
     pub error: Option<String>,
 }
 impl CommandResult {
-    fn error(outcome: Outcome, error: impl Into<String>) -> Self {
+    pub(crate) fn error(outcome: Outcome, error: impl Into<String>) -> Self {
         Self {
+            provider: None,
             outcome,
             exit_code: None,
             signal: None,
@@ -217,7 +228,7 @@ pub struct RunResult {
     pub error: Option<String>,
 }
 impl RunResult {
-    fn new(outcome: Outcome, error: Option<String>) -> Self {
+    pub(crate) fn new(outcome: Outcome, error: Option<String>) -> Self {
         Self {
             outcome,
             workspace: None,
@@ -238,6 +249,9 @@ impl RunResult {
             .into_iter()
             .flatten()
         {
+            if let Some(provider) = &mut command.provider {
+                provider.bound();
+            }
             if let Some(error) = &mut command.error {
                 truncate_utf8(error, 1024);
             }
@@ -252,6 +266,9 @@ impl RunResult {
                 .into_iter()
                 .flatten()
             {
+                if let Some(provider) = &mut command.provider {
+                    reduced |= provider.shrink();
+                }
                 for (text, truncated) in [
                     (&mut command.stdout, &mut command.stdout_truncated),
                     (&mut command.stderr, &mut command.stderr_truncated),
@@ -271,6 +288,7 @@ impl RunResult {
                     .flatten()
                 {
                     command.error = None;
+                    command.provider = None;
                 }
             }
         }
@@ -315,7 +333,9 @@ impl Host {
         if serde_json::to_vec(&config)?.len() > MAX_CONFIG_BYTES {
             return Err(HostError::Config("configuration exceeds 256 KiB".into()));
         }
-        if config.repositories.is_empty() || config.agents.is_empty() {
+        if config.repositories.is_empty()
+            || (config.agents.is_empty() && config.native_agents.is_empty())
+        {
             return Err(HostError::Config(
                 "at least one repository and agent are required".into(),
             ));
@@ -324,6 +344,7 @@ impl Host {
             .repositories
             .keys()
             .chain(config.agents.keys())
+            .chain(config.native_agents.keys())
             .chain(config.tests.keys())
             .chain(config.draft_pr_adapters.keys())
         {
@@ -338,6 +359,14 @@ impl Host {
                         .into(),
                 ));
             }
+        }
+        for (name, profile) in &config.native_agents {
+            if config.agents.contains_key(name) {
+                return Err(HostError::Config(
+                    "generic and native agent names must not collide".into(),
+                ));
+            }
+            profile.validate().map_err(HostError::Config)?;
         }
         for profile in config
             .agents
@@ -485,7 +514,24 @@ impl Host {
             result.error = Some(error.to_string());
             return result;
         }
-        let mut phases = vec![("agent", &self.config.agents[&job.agent])];
+        let mut phases = Vec::new();
+        if let Some(profile) = self.config.native_agents.get(&job.agent) {
+            let command = self.run_native(
+                profile,
+                &job.requirements,
+                false,
+                &cancellation,
+                &workspace,
+                deadline,
+            );
+            result.outcome = command.outcome;
+            result.agent = Some(command);
+            if result.outcome != Outcome::Success {
+                return result;
+            }
+        } else {
+            phases.push(("agent", &self.config.agents[&job.agent]));
+        }
         if let Some(test) = &job.test {
             phases.push(("tests", &self.config.tests[test]));
         }
@@ -531,6 +577,9 @@ impl Host {
                 env.insert(key.into(), value);
             }
             let spec = CommandSpec {
+                provider: None,
+                read_only: false,
+                clear_env: false,
                 program: profile.program.clone(),
                 args: profile.args.iter().map(|arg| expand(arg)).collect(),
                 env,
@@ -558,7 +607,164 @@ impl Host {
         result
     }
 
-    fn run_supervised(
+    /// Probe only --version/--help. Authentication and model availability are not tested.
+    pub fn probe_native(&self, name: &str, read_only: bool) -> Result<ProviderProbe, HostError> {
+        static NEXT_PROBE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let profile = self
+            .config
+            .native_agents
+            .get(name)
+            .ok_or_else(|| HostError::Config("native profile is not allowlisted".into()))?;
+        let workspace = self.config.workspace_root.join(format!(
+            ".probe-{}-{}",
+            std::process::id(),
+            NEXT_PROBE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(workspace.join("repository"))?;
+        let result = self.probe_profile(
+            profile,
+            read_only,
+            &AtomicBool::new(false),
+            &workspace,
+            Instant::now() + Duration::from_secs(10),
+        );
+        // Unknown is deliberately retained for operator inspection, just like jobs.
+        if result
+            .as_ref()
+            .err()
+            .is_none_or(|failure| failure.outcome != Outcome::Unknown)
+        {
+            fs::remove_dir_all(&workspace)?;
+        }
+        result.map_err(|failure| {
+            HostError::Config(format!(
+                "native probe {:?}: {}",
+                failure.outcome,
+                failure.error.unwrap_or_else(|| "CLI probe failed".into())
+            ))
+        })
+    }
+
+    pub(crate) fn probe_profile(
+        &self,
+        profile: &NativeProfile,
+        read_only: bool,
+        cancellation: &AtomicBool,
+        workspace: &Path,
+        deadline: Instant,
+    ) -> Result<ProviderProbe, Box<CommandResult>> {
+        let deadline = deadline.min(Instant::now() + Duration::from_secs(10));
+        let mut responses = Vec::new();
+        for (phase, args) in [
+            ("version", vec!["--version".into()]),
+            ("help", profile.help_args()),
+        ] {
+            if let Some(outcome) = interrupted(cancellation, deadline) {
+                return Err(Box::new(CommandResult::error(
+                    outcome,
+                    "native compatibility probe interrupted",
+                )));
+            }
+            let spec = CommandSpec {
+                provider: None,
+                read_only: false,
+                clear_env: false,
+                program: profile.program.clone(),
+                args,
+                env: profile.env.clone(),
+                cwd: workspace.join("repository"),
+                input: String::new(),
+                timeout_ms: remaining_ms(deadline),
+                output_limit_bytes: MAX_PROBE_CAPTURE,
+            };
+            let response = self.run_supervised(spec, cancellation, workspace, phase);
+            if response.outcome != Outcome::Success {
+                return Err(Box::new(CommandResult::error(
+                    response.outcome,
+                    format!("native {phase} probe did not complete successfully"),
+                )));
+            }
+            if response.stdout_truncated || response.stderr_truncated {
+                return Err(Box::new(CommandResult::error(
+                    Outcome::Failure,
+                    format!("native {phase} probe output exceeded its bound"),
+                )));
+            }
+            responses.push(format!("{}\n{}", response.stdout, response.stderr));
+        }
+        let cli_version = profile
+            .validate_probe(&responses[0], &responses[1], read_only)
+            .map_err(|error| CommandResult::error(Outcome::Failure, error))?;
+        Ok(ProviderProbe {
+            provider: profile.provider,
+            cli_version,
+            read_only_supported: profile
+                .validate_probe(&responses[0], &responses[1], true)
+                .is_ok(),
+        })
+    }
+
+    pub(crate) fn run_native(
+        &self,
+        profile: &NativeProfile,
+        input: &str,
+        read_only: bool,
+        cancellation: &AtomicBool,
+        workspace: &Path,
+        deadline: Instant,
+    ) -> CommandResult {
+        let compiled = match profile.compile(read_only) {
+            Ok(compiled) => compiled,
+            Err(error) => {
+                let mut result = CommandResult::error(Outcome::Failure, error);
+                result.provider = Some(ProviderResult::new(profile, None));
+                return result;
+            }
+        };
+        let probe = match self.probe_profile(profile, read_only, cancellation, workspace, deadline)
+        {
+            Ok(probe) => probe,
+            Err(failure) => {
+                let mut failure = *failure;
+                failure.provider = Some(ProviderResult::new(profile, None));
+                return failure;
+            }
+        };
+        if let Some(outcome) = interrupted(cancellation, deadline) {
+            let mut failure =
+                CommandResult::error(outcome, "native command interrupted before execution");
+            failure.provider = Some(ProviderResult::new(profile, Some(probe.cli_version)));
+            return failure;
+        }
+        let spec = CommandSpec {
+            provider: Some(ProviderResult::new(profile, Some(probe.cli_version))),
+            read_only,
+            clear_env: false,
+            program: compiled.program,
+            args: compiled.args,
+            env: compiled.env,
+            cwd: workspace.join("repository"),
+            input: input.to_owned(),
+            timeout_ms: remaining_ms(deadline),
+            output_limit_bytes: self.config.output_limit_bytes,
+        };
+        let metadata = spec.provider.clone();
+        let mut result = self.run_supervised(
+            spec,
+            cancellation,
+            workspace,
+            if read_only { "review" } else { "agent" },
+        );
+        if result.provider.is_none() {
+            result.provider = metadata;
+        }
+        result
+    }
+
+    pub(crate) fn run_supervised(
         &self,
         spec: CommandSpec,
         cancellation: &AtomicBool,
@@ -617,7 +823,11 @@ impl Host {
         let mut input_offset = 0;
         let mut resource_error = None;
         let mut next_workspace_check = Instant::now();
-        let mut output = Capture::new(128 * 1024);
+        let mut output = Capture::new(if spec.output_limit_bytes > MAX_CAPTURE {
+            1024 * 1024
+        } else {
+            128 * 1024
+        });
         let mut errors = Capture::new(1024);
         loop {
             if cancellation.load(Ordering::Acquire) || resource_error.is_some() {
@@ -659,8 +869,16 @@ impl Host {
             }
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    let _ = output.drain(&mut stdout);
-                    let _ = errors.drain(&mut stderr);
+                    if output
+                        .drain_to_eof(&mut stdout, None, watchdog)
+                        .and_then(|_| errors.drain_to_eof(&mut stderr, None, watchdog))
+                        .is_err()
+                    {
+                        return CommandResult::error(
+                            Outcome::Unknown,
+                            "supervisor response did not reach EOF within its bound",
+                        );
+                    }
                     if status.success()
                         && !output.truncated
                         && let Ok(mut result) =
@@ -746,6 +964,13 @@ fn future_directory(path: &Path) -> io::Result<PathBuf> {
         resolved.push(component);
     }
     Ok(resolved)
+}
+
+fn remaining_ms(deadline: Instant) -> u64 {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis()
+        .max(1) as u64
 }
 
 fn reap_later(mut child: Child) {
@@ -891,14 +1116,20 @@ fn check_workspace_budget(root: &Path, config: &HostConfig) -> io::Result<()> {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CommandSpec {
-    program: PathBuf,
-    args: Vec<String>,
-    env: BTreeMap<String, String>,
-    cwd: PathBuf,
-    input: String,
-    timeout_ms: u64,
-    output_limit_bytes: usize,
+pub(crate) struct CommandSpec {
+    #[serde(default)]
+    pub(crate) provider: Option<ProviderResult>,
+    #[serde(default)]
+    pub(crate) read_only: bool,
+    #[serde(default)]
+    pub(crate) clear_env: bool,
+    pub(crate) program: PathBuf,
+    pub(crate) args: Vec<String>,
+    pub(crate) env: BTreeMap<String, String>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) input: String,
+    pub(crate) timeout_ms: u64,
+    pub(crate) output_limit_bytes: usize,
 }
 
 /// The binary must dispatch its private `__relay_host_supervisor` mode here before
@@ -927,8 +1158,8 @@ pub fn supervisor_main() -> i32 {
             || spec.timeout_ms == 0
             || spec.timeout_ms > 3_600_000
             || spec.output_limit_bytes == 0
-            || spec.output_limit_bytes > MAX_CAPTURE
-            || spec.input.len() > MAX_REQUIREMENTS
+            || spec.output_limit_bytes > MAX_PROBE_CAPTURE
+            || spec.input.len() > MAX_PHASE_INPUT
         {
             return Err(io::Error::other("invalid supervisor limits"));
         }
@@ -963,7 +1194,11 @@ pub fn supervisor_main() -> i32 {
 
 fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
     let started = Instant::now();
-    let mut child = match Command::new(&spec.program)
+    let mut command = Command::new(&spec.program);
+    if spec.clear_env {
+        command.env_clear();
+    }
+    let mut child = match command
         .args(&spec.args)
         .envs(&spec.env)
         .env_remove("RELAY_TOKEN")
@@ -992,6 +1227,9 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
     let mut input = Some(input);
     let mut input_offset = 0;
     let mut output = Capture::new(spec.output_limit_bytes);
+    let mut protocol = spec
+        .provider
+        .map(|result| ProtocolParser::new(result).read_only(spec.read_only));
     let mut errors = Capture::new(spec.output_limit_bytes);
     let mut error = setup.err().map(|error| error.to_string());
     let mut outcome = Outcome::Failure;
@@ -1033,7 +1271,7 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
             break;
         }
         if let Err(failure) = output
-            .drain(&mut stdout)
+            .drain_protocol(&mut stdout, protocol.as_mut())
             .and_then(|_| errors.drain(&mut stderr))
         {
             error = Some(failure.to_string());
@@ -1102,7 +1340,7 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
         if waited > 0 {
             continue;
         }
-        let _ = output.drain(&mut stdout);
+        let _ = output.drain_protocol(&mut stdout, protocol.as_mut());
         let _ = errors.drain(&mut stderr);
         if Instant::now() >= cleanup_deadline {
             break false;
@@ -1115,10 +1353,34 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
             "not all descendants could be stopped and reaped; manual inspection required".into(),
         );
     }
-    let _ = output.drain(&mut stdout);
-    let _ = errors.drain(&mut stderr);
+    if let Err(failure) = output
+        .drain_to_eof(&mut stdout, protocol.as_mut(), cleanup_deadline)
+        .and_then(|_| errors.drain_to_eof(&mut stderr, None, cleanup_deadline))
+    {
+        if outcome == Outcome::Success {
+            outcome = Outcome::Failure;
+        }
+        if error.is_none() {
+            error = Some(format!(
+                "command output could not be completely drained: {failure}"
+            ));
+        }
+    }
+    let provider = protocol.map(|parser| {
+        let (result, protocol_error) = parser.finish();
+        if let Some(failure) = protocol_error {
+            if outcome == Outcome::Success {
+                outcome = Outcome::Failure;
+            }
+            if error.is_none() {
+                error = Some(failure);
+            }
+        }
+        result
+    });
     let (exit_code, signal) = status.unwrap_or((None, None));
     CommandResult {
+        provider,
         outcome,
         exit_code,
         signal,
@@ -1219,6 +1481,7 @@ fn nonblocking(value: &impl AsRawFd) -> io::Result<()> {
     }
 }
 struct Capture {
+    eof: bool,
     bytes: Vec<u8>,
     limit: usize,
     truncated: bool,
@@ -1226,18 +1489,32 @@ struct Capture {
 impl Capture {
     fn new(limit: usize) -> Self {
         Self {
+            eof: false,
             bytes: Vec::new(),
             limit,
             truncated: false,
         }
     }
     fn drain(&mut self, reader: &mut impl Read) -> io::Result<()> {
+        self.drain_protocol(reader, None)
+    }
+    fn drain_protocol(
+        &mut self,
+        reader: &mut impl Read,
+        mut protocol: Option<&mut ProtocolParser>,
+    ) -> io::Result<()> {
         let mut buffer = [0; 8192];
         // A chatty command must not starve timeout or cancellation checks.
         for _ in 0..8 {
             match reader.read(&mut buffer) {
-                Ok(0) => break,
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
                 Ok(read) => {
+                    if let Some(parser) = &mut protocol {
+                        parser.feed(&buffer[..read]);
+                    }
                     let keep = read.min(self.limit.saturating_sub(self.bytes.len()));
                     self.bytes.extend_from_slice(&buffer[..keep]);
                     self.truncated |= keep < read;
@@ -1246,6 +1523,27 @@ impl Capture {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
             }
+        }
+        Ok(())
+    }
+    fn drain_to_eof(
+        &mut self,
+        reader: &mut impl Read,
+        mut protocol: Option<&mut ProtocolParser>,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        while !self.eof {
+            self.drain_protocol(reader, protocol.as_deref_mut())?;
+            if self.eof {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "output EOF was not observed",
+                ));
+            }
+            thread::sleep(TICK);
         }
         Ok(())
     }
@@ -1264,4 +1562,38 @@ fn truncate_utf8(text: &mut String, maximum: usize) {
         end -= 1;
     }
     text.truncate(end);
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    #[test]
+    fn final_drain_observes_error_beyond_first_sixty_four_kib() {
+        let profile: NativeProfile = serde_json::from_value(serde_json::json!({
+            "provider":"codex_cli", "program":"/bin/true"
+        }))
+        .unwrap();
+        let mut stream = b"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"done\"}}\n{\"type\":\"turn.completed\"}\n".to_vec();
+        for _ in 0..10000 {
+            stream.extend_from_slice(b"{\"type\":\"future.progress\"}\n");
+        }
+        stream.extend_from_slice(b"{\"type\":\"error\",\"message\":\"late failure\"}\n");
+        let mut reader = io::Cursor::new(stream);
+        let mut output = Capture::new(128);
+        let mut parser = ProtocolParser::new(ProviderResult::new(&profile, None));
+        output
+            .drain_protocol(&mut reader, Some(&mut parser))
+            .unwrap();
+        assert!(!output.eof);
+        output
+            .drain_to_eof(
+                &mut reader,
+                Some(&mut parser),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        assert!(output.eof);
+        assert!(output.truncated);
+        assert!(parser.finish().1.unwrap().contains("error"));
+    }
 }

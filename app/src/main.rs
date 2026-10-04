@@ -13,8 +13,25 @@ fn main() {
 }
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("doctor") {
+        if args.len() != 3 {
+            return Err("usage: relay-app doctor <config.json>".into());
+        }
+        let host = relay_app::host::Host::new(HostConfig::load(&args[2])?)?;
+        let profiles: Vec<_> = host.config().native_agents.keys().map(|name| {
+            match host.probe_native(name, false) {
+                Ok(probe) => serde_json::json!({"name":name,"compatible":true,"probe":probe,"authentication":"unknown","model_access":"unknown"}),
+                Err(error) => serde_json::json!({"name":name,"compatible":false,"error":error.to_string(),"authentication":"unknown","model_access":"unknown"}),
+            }
+        }).collect();
+        println!(
+            "{}",
+            serde_json::json!({"profiles":profiles,"model_calls":false,"authentication":"unknown"})
+        );
+        return Ok(());
+    }
     if args.len() < 4 || args.len() > 5 || !matches!(args[1].as_str(), "serve" | "mcp") {
-        return Err("usage: relay-app serve <config.json> <db-path> [127.0.0.1:8787]\n       relay-app mcp <config.json> <db-path>".into());
+        return Err("usage: relay-app serve <config.json> <db-path> [127.0.0.1:8787]\n       relay-app mcp <config.json> <db-path>\n       relay-app doctor <config.json>".into());
     }
     let config = HostConfig::load(&args[2])?;
     let app = Application::open(&args[3], config)?;
