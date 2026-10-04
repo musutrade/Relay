@@ -5,6 +5,7 @@
 //! A separate subreaper process owns every command tree; the application process
 //! never changes its process-wide child-reaping behavior.
 use crate::providers::{NativeProfile, ProtocolParser, ProviderProbe, ProviderResult};
+use crate::workflow::{self, WorkflowConfig, WorkflowResult};
 use relay::{MAX_PAYLOAD_BYTES, MAX_RESULT_BYTES, State, Task};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -66,6 +67,8 @@ pub struct HostConfig {
     #[serde(default)]
     pub native_agents: BTreeMap<String, NativeProfile>,
     #[serde(default)]
+    pub workflows: BTreeMap<String, WorkflowConfig>,
+    #[serde(default)]
     pub tests: BTreeMap<String, CommandProfile>,
     #[serde(default)]
     pub draft_pr_adapters: BTreeMap<String, CommandProfile>,
@@ -87,6 +90,8 @@ pub struct HostConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
     pub repository: String,
     pub requirements: String,
     pub agent: String,
@@ -157,6 +162,13 @@ impl Job {
         {
             return Err(HostError::Job("test profile is not allowlisted".into()));
         }
+        if let Some(name) = &self.workflow {
+            let workflow = config
+                .workflows
+                .get(name)
+                .ok_or_else(|| HostError::Job("workflow profile is not allowlisted".into()))?;
+            workflow.validate_job(self)?;
+        }
         match (self.publish, self.draft_pr_adapter.as_ref()) {
             (true, Some(name)) if config.draft_pr_adapters.contains_key(name) => {}
             (true, _) => {
@@ -220,6 +232,8 @@ impl CommandResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowResult>,
     pub outcome: Outcome,
     pub workspace: Option<PathBuf>,
     pub agent: Option<CommandResult>,
@@ -230,6 +244,7 @@ pub struct RunResult {
 impl RunResult {
     pub(crate) fn new(outcome: Outcome, error: Option<String>) -> Self {
         Self {
+            workflow: None,
             outcome,
             workspace: None,
             agent: None,
@@ -261,7 +276,7 @@ impl RunResult {
             if serialized.len() <= MAX_RESULT_BYTES {
                 return serialized;
             }
-            let mut reduced = false;
+            let mut reduced = value.workflow.as_mut().is_some_and(WorkflowResult::shrink);
             for command in [&mut value.agent, &mut value.tests, &mut value.draft_pr]
                 .into_iter()
                 .flatten()
@@ -345,6 +360,7 @@ impl Host {
             .keys()
             .chain(config.agents.keys())
             .chain(config.native_agents.keys())
+            .chain(config.workflows.keys())
             .chain(config.tests.keys())
             .chain(config.draft_pr_adapters.keys())
         {
@@ -391,6 +407,9 @@ impl Host {
                     "invalid command argument or environment".into(),
                 ));
             }
+        }
+        for workflow in config.workflows.values() {
+            workflow.validate(&config)?;
         }
         config.workspace_root = future_directory(&config.workspace_root)?;
         for repository in config.repositories.values_mut() {
@@ -500,11 +519,13 @@ impl Host {
                 deadline,
                 cancellation: &cancellation,
             };
-            copy_snapshot(
-                &self.config.repositories[&job.repository],
-                &repository,
-                &mut budget,
-            )?;
+            if job.workflow.is_none() {
+                copy_snapshot(
+                    &self.config.repositories[&job.repository],
+                    &repository,
+                    &mut budget,
+                )?;
+            }
             fs::write(&requirements_file, &job.requirements)?;
             fs::write(workspace.join("job.json"), serde_json::to_vec(&job)?)?;
             Ok(())
@@ -515,6 +536,22 @@ impl Host {
             return result;
         }
         let mut phases = Vec::new();
+        if let Some(name) = &job.workflow {
+            return workflow::execute(
+                workflow::Execution {
+                    host: self,
+                    task,
+                    job: &job,
+                    workspace: &workspace,
+                    repository: &repository,
+                    requirements_file: &requirements_file,
+                    deadline,
+                    cancellation: &cancellation,
+                },
+                name,
+                &self.config.workflows[name],
+            );
+        }
         if let Some(profile) = self.config.native_agents.get(&job.agent) {
             let command = self.run_native(
                 profile,
@@ -847,10 +884,9 @@ impl Host {
                 }
             }
             if Instant::now() >= next_workspace_check && resource_error.is_none() {
-                resource_error =
-                    check_workspace_budget(&workspace.join("repository"), &self.config)
-                        .err()
-                        .map(|error| error.to_string());
+                resource_error = check_workspace_budget(workspace, &self.config)
+                    .err()
+                    .map(|error| error.to_string());
                 next_workspace_check = Instant::now() + Duration::from_millis(250);
                 if resource_error.is_some() {
                     input.take();
@@ -887,7 +923,7 @@ impl Host {
                         result.supervisor_pid = Some(pid);
                         if result.outcome != Outcome::Unknown {
                             let resource_error = resource_error.or_else(|| {
-                                check_workspace_budget(&workspace.join("repository"), &self.config)
+                                check_workspace_budget(workspace, &self.config)
                                     .err()
                                     .map(|error| error.to_string())
                             });

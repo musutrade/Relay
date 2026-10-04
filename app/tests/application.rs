@@ -12,6 +12,46 @@ use tower::ServiceExt;
 const TOKEN: &str = "test-only-token-00000000000000000000";
 
 #[test]
+fn public_workflow_metadata_contains_selectors_without_execution_configuration() {
+    let root = TempDir::new().unwrap();
+    let mut config = config(root.path());
+    config.native_agents.insert(
+        "reviewer".into(),
+        serde_json::from_value(json!({
+            "provider":"claude_cli", "program":"/bin/echo", "env":{"SECRET":"hidden"}
+        }))
+        .unwrap(),
+    );
+    config.workflows.insert("checked".into(), serde_json::from_value(json!({
+        "repository":"fixture", "developer":"fake", "reviewer":"reviewer", "test":"pass", "max_repairs":1
+    })).unwrap());
+    let app = Application::open(root.path().join("relay.db"), config).unwrap();
+    let public = app.public_config();
+    assert_eq!(
+        public["workflows"],
+        json!([{
+            "name":"checked", "repository":"fixture", "developer":"fake", "reviewer":"reviewer", "test":"pass", "max_repairs":1
+        }])
+    );
+    let serialized = public.to_string();
+    for forbidden in [
+        "SECRET",
+        "hidden",
+        "/bin/echo",
+        "git_program",
+        "workspace_root",
+    ] {
+        assert!(!serialized.contains(forbidden));
+    }
+    let schema = mcp::handle(&app, json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).unwrap();
+    assert_eq!(
+        schema["result"]["tools"][0]["inputSchema"]["properties"]["job"]["properties"]["workflow"]
+            ["type"],
+        json!(["string", "null"])
+    );
+}
+
+#[test]
 fn public_config_lists_native_agents_without_commands_or_secrets() {
     let root = TempDir::new().unwrap();
     let mut config = config(root.path());

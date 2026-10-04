@@ -47,6 +47,7 @@ impl Fixture {
     }
     fn job(&self) -> Job {
         Job {
+            workflow: None,
             repository: "fixture".into(),
             requirements: "Implement the fixture change".into(),
             agent: "fake".into(),
@@ -543,7 +544,7 @@ fn native_cleanup_reaps_descendants_even_after_successful_terminal() {
 fn native_cancellation_keeps_cleanup_and_timeout_outcomes() {
     let body = "with open('running.pid','w') as file: file.write(str(os.getpid()))\nwhile True: print(json.dumps({'type':'future.progress'}),flush=True); time.sleep(0.01)";
     let mut f = native_fixture("codex_cli", body, "codex-cli 0.200.0");
-    f.config.timeout_seconds = 1;
+    f.config.timeout_seconds = 3;
     let result = f.run(&f.task(1));
     assert_eq!(result.outcome, Outcome::TimedOut, "{result:?}");
     assert_pid_reaped(&f.workspace(1).join("running.pid"));

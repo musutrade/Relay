@@ -4,6 +4,7 @@ pub mod host;
 pub mod http;
 pub mod mcp;
 pub mod providers;
+pub mod workflow;
 
 use host::{Host, HostConfig, Job};
 use relay::{Store, Task};
@@ -141,7 +142,11 @@ impl Application {
                 "effort": profile.effort, "authentication": "unknown"})
             })
             .collect();
-        json!({"repositories":self.config.repositories.keys().collect::<Vec<_>>(),"agents":agents,"native_agents":native_agents,"tests":self.config.tests.keys().collect::<Vec<_>>()})
+        let workflows: Vec<_> = self.config.workflows.iter().map(|(name, workflow)| {
+            json!({"name":name,"repository":workflow.repository,"developer":workflow.developer,
+                "reviewer":workflow.reviewer,"test":workflow.test,"max_repairs":workflow.max_repairs})
+        }).collect();
+        json!({"repositories":self.config.repositories.keys().collect::<Vec<_>>(),"agents":agents,"native_agents":native_agents,"tests":self.config.tests.keys().collect::<Vec<_>>(),"workflows":workflows})
     }
     pub fn cancel(&self, id: i64) -> Result<Value> {
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;

@@ -25,11 +25,11 @@ with sync_playwright() as p:
     context=browser.new_context(viewport={'width':1440,'height':1150},locale='zh-CN')
     page=context.new_page(); errors=[]; requests=[]; submissions=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
-    data={'tasks':[task(3,'queued'),task(2,'claimed'),task(1,'finished',outcome='success')], 'status':{'active':task(2,'claimed'),'recovery_required':False,'diagnostic':None},'post':'success','list_error':False}
+    data={'tasks':[task(3,'queued'),task(2,'claimed'),task(1,'finished',outcome='success')], 'status':{'active':task(2,'claimed'),'recovery_required':False,'diagnostic':None},'post':'success','list_error':False,'config':{'repositories':['relay-demo','api-service'],'agents':['codex','reviewer'],'tests':['unit','full']}}
     def route(r):
         req=r.request; path=req.url.replace(base,''); requests.append((req.method,path,req.headers))
         assert req.headers.get('authorization')=='Bearer test-token',req.headers
-        if path=='/api/config': result={'repositories':['relay-demo','api-service'],'agents':['codex','reviewer'],'tests':['unit','full']}
+        if path=='/api/config': result=data['config']
         elif path=='/api/status': result=data['status']
         elif path=='/api/tasks' and req.method=='GET':
             if data['list_error']: r.abort();return
@@ -38,6 +38,7 @@ with sync_playwright() as p:
             body=req.post_data_json; submissions.append(body)
             assert body['job']['publish'] is False
             if data['post']=='abort': r.abort();return
+            if data['post']=='401': r.fulfill(status=401,content_type='application/json',body=json.dumps({'error':'Unauthorized'}));return
             result={'id':max(t['id'] for t in data['tasks'])+1,'key':body['key'],'payload':json.dumps(body['job'],ensure_ascii=False),'state':'queued','generation':0,'owner':None,'result':None}
             data['tasks'].append(result)
         elif path.endswith('/cancel'): result={'requested':True}
@@ -56,7 +57,33 @@ with sync_playwright() as p:
     assert page.locator('#claimed-count').inner_text()=='1'
     assert page.locator('#finished-count').inner_text()=='1'
     assert page.locator('.task-button').count()==3
+    assert not page.locator('#workflow-field').is_visible(), 'Legacy configuration keeps the ordinary form'
     page.screenshot(path=str(SCREENSHOTS / 'relay-connected-desktop.png'),full_page=True)
+    # Optional named workflows lock configured fields, then restore ordinary choices.
+    page.locator('#logout').click()
+    reviewed={'name':'reviewed','repository':'api-service','developer':'native-codex','reviewer':'reviewer <img src=x onerror=alert(1)>','test':'full','max_repairs':2}
+    data['config']['agents'] += [reviewed['developer'],reviewed['reviewer']]
+    data['config']['workflows']=[reviewed,dict(reviewed,name='review-only',max_repairs=0)]
+    page.locator('#token').fill('test-token');page.locator('#connect').click();page.locator('#auth-panel').wait_for(state='hidden')
+    assert page.locator('#workflow-field').is_visible()
+    assert page.locator('#workflow').input_value()==''
+    page.locator('#test').select_option('unit');page.locator('#workflow').select_option('reviewed')
+    for field,value in [('repository','api-service'),('agent','native-codex'),('test','full')]:
+        assert page.locator('#'+field).input_value()==value
+        assert page.locator('#'+field).is_disabled()
+    assert not page.locator('#requirements').is_disabled()
+    assert '最多修复 2 轮' in page.locator('#workflow-hint').inner_text()
+    assert '<img' in page.locator('#workflow-hint').inner_text()
+    assert page.locator('img').count()==0
+    page.locator('#workflow').select_option('review-only')
+    assert '最多修复 0 轮' in page.locator('#workflow-hint').inner_text()
+    page.locator('#workflow').select_option('')
+    for field,value in [('repository','relay-demo'),('agent','codex'),('test','unit')]:
+        assert page.locator('#'+field).input_value()==value
+        assert not page.locator('#'+field).is_disabled()
+    assert not page.locator('#workflow-hint').is_visible()
+    page.locator('#workflow').select_option('reviewed')
+    page.screenshot(path=str(SCREENSHOTS / 'relay-workflow-desktop.png'),full_page=True)
     # Secure text rendering and clear unknown status.
     data['tasks'][0]['payload']=json.dumps({'repository':'<img src=x onerror=alert(1)>','requirements':'<script>alert(1)</script>\n核查任务','agent':'codex','test':None,'publish':False})
     data['tasks'][0]['state']='finished';data['tasks'][0]['result']=json.dumps({'outcome':'unknown','summary':'<img src=x onerror=alert(1)>'})
@@ -78,11 +105,16 @@ with sync_playwright() as p:
     assert page.locator('#submit-task').inner_text()=='重试原提交'
     assert page.locator('#requirements').is_disabled()
     assert len(submissions)==1
+    assert page.locator('#workflow').is_disabled()
+    assert submissions[0]['job']=={'repository':'api-service','requirements':'实现安全重试的任务流程','agent':'native-codex','test':'full','publish':False,'workflow':'reviewed'}
     data['post']='success';page.locator('#submit-task').click();page.wait_for_timeout(200)
     assert len(submissions)==2 and submissions[0]==submissions[1]
     assert page.locator('#requirements').input_value()==''
     assert not page.locator('#requirements').is_disabled()
     assert page.locator('#detail-title').inner_text()=='任务 #4'
+    assert 'reviewed' in page.locator('#detail-meta').inner_text()
+    assert not page.locator('#workflow').is_disabled()
+    assert page.locator('#repository').is_disabled()
     # Requirements are limited by UTF-8 bytes, independent of JSON payload cap.
     count = len(submissions)
     page.locator('#requirements').fill('界' * 11000)
@@ -115,6 +147,41 @@ with sync_playwright() as p:
     page.set_viewport_size({'width':390,'height':844});page.screenshot(path=str(SCREENSHOTS / 'relay-connected-mobile.png'),full_page=True)
     page.locator('#theme-toggle').click();page.screenshot(path=str(SCREENSHOTS / 'relay-connected-mobile-dark.png'),full_page=True)
     assert page.locator('html').get_attribute('data-theme')=='dark'
+    # Auth interruption preserves the exact workflow request even when config changes.
+    page.locator('#requirements').fill('保留已提交的审查工作流')
+    data['post']='401';page.locator('#submit-task').click();page.locator('#auth-panel').wait_for(state='visible')
+    original=submissions[-1]
+    assert original['job']['workflow']=='reviewed'
+    assert not page.locator('#workflow-field').is_visible()
+    assert page.locator('#workflow').input_value()==''
+    assert page.locator('#workflow-hint').inner_text()==''
+    data['config']={'repositories':['relay-demo'],'agents':['codex'],'tests':['unit'],'workflows':[]}
+    data['post']='success';page.locator('#token').fill('test-token');page.locator('#connect').click();page.locator('#auth-panel').wait_for(state='hidden')
+    assert page.locator('#workflow').input_value()=='reviewed'
+    assert page.locator('#workflow').is_disabled()
+    assert page.locator('#agent').input_value()=='native-codex'
+    page.locator('#submit-task').click();page.wait_for_timeout(200)
+    assert submissions[-1]==original
+    assert page.locator('#workflow').input_value()==''
+    assert not page.locator('#workflow-field').is_visible()
+    assert page.locator('#agent').input_value()=='codex'
+    assert not page.locator('#agent').is_disabled()
+    # Returning through browser history never restores a live authenticated form.
+    page.goto(base+'/away');page.go_back();page.locator('#auth-panel').wait_for(state='visible')
+    assert not page.locator('#workflow-field').is_visible()
+    assert page.locator('#workflow').is_disabled()
+    assert page.locator('#requirements').input_value()==''
+    data['config']={'repositories':['relay-demo','api-service'],'agents':['codex',reviewed['developer'],reviewed['reviewer']],'tests':['unit','full'],'workflows':[reviewed]}
+    page.locator('#token').fill('test-token');page.locator('#connect').click();page.locator('#auth-panel').wait_for(state='hidden')
+    page.locator('#workflow').select_option('reviewed')
+    # The persisted pageshow handler also clears a cached workflow selection.
+    page.evaluate("window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted: true}))")
+    assert page.locator('#auth-panel').is_visible()
+    assert page.locator('#workflow').input_value()==''
+    assert not page.locator('#workflow-field').is_visible()
+    assert page.locator('#workflow-hint').inner_text()==''
+    page.locator('#token').fill('test-token');page.locator('#connect').click();page.locator('#auth-panel').wait_for(state='hidden')
+    page.locator('#workflow').select_option('reviewed')
     # Logout clears sensitive task content and stops polling.
     page.locator('#logout').click();after_logout=len(requests);page.wait_for_timeout(2400)
     assert len(requests)==after_logout
@@ -124,7 +191,10 @@ with sync_playwright() as p:
     assert page.locator('#detail-requirements').inner_text()==''
     assert page.locator('#detail-result').inner_text()==''
     assert page.locator('#token').input_value()==''
+    assert page.locator('#workflow').input_value()==''
+    assert not page.locator('#workflow-field').is_visible()
+    assert page.locator('#workflow-hint').inner_text()==''
     assert not errors, errors
-    print('PASS: auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, logout; no browser errors')
+    print('PASS: optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, logout; no browser errors')
     browser.close()
 server.shutdown()
