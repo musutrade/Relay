@@ -21,6 +21,15 @@ TREE = "c" * 40
 
 class AdapterTests(unittest.TestCase):
     def setUp(self):
+        # Publication fixtures must not inherit the checkout's Git metadata.
+        # Hosted checkout actions may leave config.worktree or other files that
+        # are correctly forbidden in a private workflow publication workspace.
+        temporary = tempfile.TemporaryDirectory()
+        previous = pathlib.Path.cwd()
+        self.addCleanup(temporary.cleanup)
+        self.addCleanup(os.chdir, previous)
+        os.chdir(temporary.name)
+        pathlib.Path(".git").mkdir()
         self.env = {"RELAY_GITHUB_REPOSITORY": "example/project", "RELAY_TASK_ID": "1",
                     "RELAY_GENERATION": "2", "RELAY_DRAFT_PR": "true", "RELAY_BASE_SHA": BASE,
                     "RELAY_CANDIDATE_SHA": CANDIDATE, "RELAY_REVIEWED_SHA": CANDIDATE,
