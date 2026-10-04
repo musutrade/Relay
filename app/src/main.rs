@@ -57,6 +57,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&app),
         std::env::var("RELAY_TOKEN").map_err(|_| "RELAY_TOKEN is required")?,
     )?;
+    // Install both handlers before starting the worker. If registration fails,
+    // no execution has begun and there is no claim to abandon.
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let listener = tokio::net::TcpListener::bind(address).await?;
     eprintln!(
         "Relay listening at http://{} (token required for /api)",
@@ -67,7 +71,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let signal_app = Arc::clone(&app);
     let served = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            tokio::select! {
+                _ = interrupt.recv() => {},
+                _ = terminate.recv() => {},
+            }
             signal_app.stop();
         })
         .await;

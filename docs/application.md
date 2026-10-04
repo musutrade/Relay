@@ -1,5 +1,7 @@
 # 应用运行与恢复
 
+完整真实 CLI 配置、用户目录安装、信号停止、备份与升级步骤见 [Linux 操作手册](operator-guide.md)。
+
 ## 边界与部署方式
 
 `relay` 是不透明队列库与 CLI。`relay-app` 是独立 workspace package，复用同一 SQLite 状态转换，包含 HTTP/UI、MCP、开发 job 校验、有界审查修复工作流和可信 Linux 宿主。Axum/Tokio 仅用于应用 HTTP；libc 用于独立 supervisor 的 Linux 子进程管理。没有动态插件系统或远端 worker 协议。

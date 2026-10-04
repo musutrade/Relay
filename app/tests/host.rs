@@ -595,3 +595,29 @@ fn probe_escaped_output_fits_supervisor_envelope_and_never_calls_model() {
     assert_eq!(probe.cli_version, "0.200.0");
     assert_eq!(fs::read_dir(&f.config.workspace_root).unwrap().count(), 0);
 }
+
+#[test]
+fn complete_local_cli_example_validates_after_path_substitution() {
+    // Validate the shipped full schema and workflow references without invoking a CLI.
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    let mut config: HostConfig =
+        serde_json::from_str(include_str!("../../examples/local-cli-config.json")).unwrap();
+    config.workspace_root = temp.path().join("workspaces");
+    config.repositories.insert("project".into(), source);
+    for profile in config.native_agents.values_mut() {
+        profile.program = "/bin/true".into();
+    }
+    config.tests.get_mut("check").unwrap().program = "/bin/true".into();
+    for workflow in config.workflows.values_mut() {
+        workflow.git_program = "/bin/true".into();
+    }
+    assert!(config.draft_pr_adapters.is_empty());
+    Host::new(config.clone()).unwrap();
+    for (agent, workflow) in [("codex", "codex-reviewed"), ("claude", "claude-reviewed")] {
+        let payload = json!({"repository":"project", "requirements":"Implement change", "agent":agent, "workflow":workflow});
+        let job = Job::from_payload(&payload.to_string(), &config).unwrap();
+        assert!(!job.publish);
+    }
+}

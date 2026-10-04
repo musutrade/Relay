@@ -1,0 +1,59 @@
+{
+  "workspace_root": "/absolute/path/relay-data/workspaces",
+  "repositories": {
+    "project": "/absolute/path/to/clean-git-project"
+  },
+  "agents": {},
+  "native_agents": {
+    "codex": {
+      "provider": "codex_cli",
+      "program": "/absolute/path/to/codex",
+      "effort": "medium"
+    },
+    "claude": {
+      "provider": "claude_cli",
+      "program": "/absolute/path/to/claude",
+      "effort": "medium",
+      "max_turns": 8,
+      "max_budget_usd": 2.0
+    },
+    "claude-reviewer": {
+      "provider": "claude_cli",
+      "program": "/absolute/path/to/claude",
+      "effort": "medium",
+      "max_turns": 8,
+      "max_budget_usd": 2.0
+    }
+  },
+  "tests": {
+    "check": {
+      "program": "/absolute/path/to/project-test-command",
+      "args": [],
+      "env": {}
+    }
+  },
+  "workflows": {
+    "codex-reviewed": {
+      "repository": "project",
+      "developer": "codex",
+      "reviewer": "claude-reviewer",
+      "test": "check",
+      "git_program": "/usr/bin/git",
+      "max_repairs": 1
+    },
+    "claude-reviewed": {
+      "repository": "project",
+      "developer": "claude",
+      "reviewer": "claude-reviewer",
+      "test": "check",
+      "git_program": "/usr/bin/git",
+      "max_repairs": 1
+    }
+  },
+  "draft_pr_adapters": {},
+  "timeout_seconds": 300,
+  "output_limit_bytes": 2048,
+  "max_snapshot_bytes": 52428800,
+  "max_snapshot_entries": 20000,
+  "max_retained_workspaces": 20
+}
