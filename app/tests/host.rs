@@ -530,6 +530,54 @@ fn native_config_rejects_collisions_and_doctor_probe_has_no_model_call() {
 }
 
 #[test]
+fn hidden_claude_turn_limit_is_verified_before_execution_and_read_only_probe() {
+    let mut f = native_fixture("claude_cli", NATIVE_CLAUDE_SUCCESS, "2.1.281 (Claude Code)");
+    let profile = f.config.native_agents.get_mut("fake").unwrap();
+    profile.max_turns = Some(8);
+    profile.max_budget_usd = Some(2.0);
+    let script = f.temp.path().join("fake-native.py");
+    let missing_arg = "elif sys.argv[1:] == ['--help', '--max-turns']:\n print(\"error: option '--max-turns <turns>' argument missing\", file=sys.stderr)\n sys.exit(1)\n";
+    let source = fs::read_to_string(&script)
+        .unwrap()
+        .replace("--max-turns --max-budget-usd", "--max-budget-usd")
+        .replace(
+            "elif '--help' in sys.argv:",
+            &format!("{missing_arg}elif '--help' in sys.argv:"),
+        );
+    fs::write(&script, &source).unwrap();
+    let probe = Host::new(f.config.clone())
+        .unwrap()
+        .probe_native("fake", true)
+        .unwrap();
+    assert!(probe.read_only_supported);
+    let result = f.run(&f.task(1));
+    assert_eq!(result.outcome, Outcome::Success, "{result:?}");
+    let invocation: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.workspace(1).join("invocation.json")).unwrap()).unwrap();
+    let args = invocation["args"].as_array().unwrap();
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == [json!("--max-turns"), json!("8")])
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == [json!("--max-budget-usd"), json!("2")])
+    );
+
+    // Generic help success must not let an unsupported CLI reach the model path.
+    fs::write(&script, source.replace(missing_arg, "")).unwrap();
+    assert!(
+        Host::new(f.config.clone())
+            .unwrap()
+            .probe_native("fake", true)
+            .is_err()
+    );
+    let result = f.run(&f.task(2));
+    assert_eq!(result.outcome, Outcome::Failure);
+    assert!(!f.workspace(2).join("invocation.json").exists());
+}
+
+#[test]
 fn native_cleanup_reaps_descendants_even_after_successful_terminal() {
     let body = format!(
         "child = subprocess.Popen(['/bin/sleep','60'],start_new_session=True)\nwith open('child.pid','w') as file: file.write(str(child.pid))\n{NATIVE_CODEX_SUCCESS}"
