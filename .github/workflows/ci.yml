@@ -9,7 +9,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: Install pinned Rust toolchain
         run: rustup show
       - run: cargo fmt --all -- --check
@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: Install pinned browser test dependencies
         run: python3 -m pip install -r app/tests/browser-requirements.txt
       - name: Install official Playwright Chromium
