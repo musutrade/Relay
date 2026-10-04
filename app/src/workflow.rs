@@ -1,0 +1,1273 @@
+//! Bounded, app-owned development/review workflow. Queue ownership stays in relay.
+//! Each tested and reviewed candidate is an existing immutable Git commit. Native
+//! review permissions and post-phase Git guards are separate requirements.
+use crate::host::{
+    CommandProfile, CommandResult, CommandSpec, Host, HostConfig, HostError, Job, Outcome,
+    RunResult,
+};
+use crate::providers::ProviderKind;
+use relay::Task;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+const MAX_PATCH_BYTES: u64 = 256 * 1024;
+const MAX_REVIEW_BYTES: usize = 4096;
+const MAX_FINDINGS: usize = 8;
+const MAX_FINDING_BYTES: usize = 384;
+const GIT_CAPTURE_BYTES: usize = 64 * 1024;
+fn default_git() -> PathBuf {
+    PathBuf::from("/usr/bin/git")
+}
+fn default_base() -> String {
+    "main".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowConfig {
+    pub repository: String,
+    pub developer: String,
+    pub reviewer: String,
+    pub test: String,
+    #[serde(default)]
+    pub draft_pr_adapter: Option<String>,
+    #[serde(default = "default_git")]
+    pub git_program: PathBuf,
+    #[serde(default)]
+    pub max_repairs: u8,
+    #[serde(default = "default_base")]
+    pub base_branch: String,
+    #[serde(default)]
+    pub github_repository: Option<String>,
+}
+impl WorkflowConfig {
+    pub fn validate(&self, config: &HostConfig) -> Result<(), HostError> {
+        let invalid = |message: &str| HostError::Config(message.into());
+        if !config.repositories.contains_key(&self.repository) {
+            return Err(invalid("workflow repository is not allowlisted"));
+        }
+        if !config.agents.contains_key(&self.developer)
+            && !config.native_agents.contains_key(&self.developer)
+        {
+            return Err(invalid("workflow developer is not allowlisted"));
+        }
+        if !config
+            .native_agents
+            .get(&self.reviewer)
+            .is_some_and(|profile| profile.provider == ProviderKind::ClaudeCli)
+        {
+            return Err(invalid(
+                "review_profile_unsupported: workflow reviewer requires a restricted Claude native profile",
+            ));
+        }
+        config.native_agents[&self.reviewer]
+            .compile(true)
+            .map_err(HostError::Config)?;
+        if !config.tests.contains_key(&self.test) {
+            return Err(invalid("workflow requires an allowlisted test profile"));
+        }
+        if !self.git_program.is_absolute() || !self.git_program.is_file() {
+            return Err(invalid(
+                "workflow git_program requires an existing absolute executable path",
+            ));
+        }
+        if self.max_repairs > 3 {
+            return Err(invalid("workflow max_repairs must be between 0 and 3"));
+        }
+        if !valid_branch(&self.base_branch) {
+            return Err(invalid("workflow base_branch is invalid"));
+        }
+        match (&self.draft_pr_adapter, &self.github_repository) {
+            (Some(adapter), Some(target))
+                if config.draft_pr_adapters.contains_key(adapter)
+                    && valid_github_repository(target) => {}
+            (None, None) => {}
+            _ => {
+                return Err(invalid(
+                    "workflow publication requires a pinned adapter and GitHub owner/repository",
+                ));
+            }
+        }
+        Ok(())
+    }
+    pub fn validate_job(&self, job: &Job) -> Result<(), HostError> {
+        if job.repository != self.repository
+            || job.agent != self.developer
+            || job.test.as_ref().is_some_and(|test| test != &self.test)
+        {
+            return Err(HostError::Job(
+                "workflow repository, developer, and test selectors cannot be overridden".into(),
+            ));
+        }
+        if job.publish
+            && (self.draft_pr_adapter.is_none() || job.draft_pr_adapter != self.draft_pr_adapter)
+        {
+            return Err(HostError::Job(
+                "workflow publishing requires its pinned exact-candidate adapter".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+fn valid_branch(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.starts_with(['-', '.', '/'])
+        && !value.ends_with(['.', '/'])
+        && !value.contains("..")
+        && !value.contains("//")
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b))
+}
+fn valid_github_repository(value: &str) -> bool {
+    let parts: Vec<_> = value.split('/').collect();
+    parts.len() == 2
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.len() <= 100
+                && !part.starts_with('.')
+                && *part != ".."
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewVerdict {
+    Approved,
+    ChangesRequested,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewResult {
+    pub candidate_sha: String,
+    pub verdict: ReviewVerdict,
+    pub summary: String,
+    pub findings: Vec<String>,
+}
+impl ReviewResult {
+    fn parse(text: &str, expected: &str) -> Result<Self, Stop> {
+        if text.len() > MAX_REVIEW_BYTES {
+            return Err(Stop::failure("review result exceeds its bound"));
+        }
+        let review: Self = serde_json::from_str(text)
+            .map_err(|_| Stop::failure("reviewer did not return the required JSON verdict"))?;
+        if review.candidate_sha != expected || !valid_sha(&review.candidate_sha) {
+            return Err(Stop::failure(
+                "review verdict does not identify this candidate SHA",
+            ));
+        }
+        if review.summary.trim().is_empty()
+            || review.summary.len() > 512
+            || review.findings.len() > MAX_FINDINGS
+            || review
+                .findings
+                .iter()
+                .any(|finding| finding.trim().is_empty() || finding.len() > MAX_FINDING_BYTES)
+            || (review.verdict == ReviewVerdict::Approved && !review.findings.is_empty())
+            || (review.verdict == ReviewVerdict::ChangesRequested && review.findings.is_empty())
+        {
+            return Err(Stop::failure(
+                "review verdict has invalid or oversized findings",
+            ));
+        }
+        Ok(review)
+    }
+    fn shrink(&mut self) -> bool {
+        let mut changed = shrink(&mut self.summary);
+        for finding in &mut self.findings {
+            changed |= shrink(finding);
+        }
+        changed
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageSummary {
+    pub outcome: Outcome,
+    pub exit_code: Option<i32>,
+    pub summary: String,
+}
+impl StageSummary {
+    fn from_command(command: &CommandResult) -> Self {
+        let mut summary = command.error.clone().unwrap_or_else(|| {
+            command
+                .provider
+                .as_ref()
+                .map(|provider| provider.summary.clone())
+                .unwrap_or_else(|| format!("{}{}", command.stdout, command.stderr))
+        });
+        truncate(&mut summary, 512);
+        Self {
+            outcome: command.outcome,
+            exit_code: command.exit_code,
+            summary,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundResult {
+    pub round: u8,
+    pub candidate_sha: String,
+    pub developer: StageSummary,
+    pub tests: Option<StageSummary>,
+    pub review: Option<ReviewResult>,
+    pub reviewer: Option<StageSummary>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicationResult {
+    pub dry_run: bool,
+    pub draft: bool,
+    pub repository: String,
+    pub branch: String,
+    pub candidate_sha: String,
+    pub url: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowResult {
+    pub name: String,
+    pub base_sha: Option<String>,
+    pub candidate_sha: Option<String>,
+    pub reviewed_sha: Option<String>,
+    pub rounds: Vec<RoundResult>,
+    pub reconciliation_required: bool,
+    pub publication: Option<PublicationResult>,
+    #[serde(default)]
+    pub evidence_truncated: bool,
+}
+impl WorkflowResult {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            base_sha: None,
+            candidate_sha: None,
+            reviewed_sha: None,
+            rounds: Vec::new(),
+            reconciliation_required: false,
+            publication: None,
+            evidence_truncated: false,
+        }
+    }
+    pub(crate) fn shrink(&mut self) -> bool {
+        let mut changed = false;
+        for round in &mut self.rounds {
+            changed |= shrink(&mut round.developer.summary);
+            if let Some(test) = &mut round.tests {
+                changed |= shrink(&mut test.summary);
+            }
+            if let Some(reviewer) = &mut round.reviewer {
+                changed |= shrink(&mut reviewer.summary);
+            }
+            if let Some(review) = &mut round.review {
+                changed |= review.shrink();
+            }
+        }
+        self.evidence_truncated |= changed;
+        changed
+    }
+}
+fn truncate(text: &mut String, limit: usize) {
+    let mut end = text.len().min(limit);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+}
+fn shrink(text: &mut String) -> bool {
+    if text.is_empty() {
+        false
+    } else {
+        truncate(text, text.len() / 2);
+        true
+    }
+}
+fn valid_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+#[derive(Debug)]
+struct Stop {
+    outcome: Outcome,
+    message: String,
+}
+impl Stop {
+    fn failure(message: impl Into<String>) -> Self {
+        Self {
+            outcome: Outcome::Failure,
+            message: message.into(),
+        }
+    }
+    fn command(command: &CommandResult, phase: &str) -> Self {
+        let mut detail = command
+            .error
+            .clone()
+            .unwrap_or_else(|| command.stderr.clone());
+        truncate(&mut detail, 512);
+        Self {
+            outcome: command.outcome,
+            message: format!("{phase} stopped: {detail}"),
+        }
+    }
+}
+
+pub(crate) struct Execution<'a> {
+    pub host: &'a Host,
+    pub task: &'a Task,
+    pub job: &'a Job,
+    pub workspace: &'a Path,
+    pub repository: &'a Path,
+    pub requirements_file: &'a Path,
+    pub deadline: Instant,
+    pub cancellation: &'a AtomicBool,
+}
+impl Execution<'_> {
+    fn active(&self) -> Result<(), Stop> {
+        if self.cancellation.load(Ordering::Acquire) {
+            Err(Stop {
+                outcome: Outcome::Cancelled,
+                message: "workflow cancelled".into(),
+            })
+        } else if Instant::now() >= self.deadline {
+            Err(Stop {
+                outcome: Outcome::TimedOut,
+                message: "workflow total deadline elapsed".into(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+    fn private_root(&self) -> Result<(), Stop> {
+        for path in [self.workspace, self.repository] {
+            let metadata =
+                fs::symlink_metadata(path).map_err(|error| Stop::failure(error.to_string()))?;
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || path
+                    .canonicalize()
+                    .map_err(|error| Stop::failure(error.to_string()))?
+                    != path
+            {
+                return Err(Stop::failure(
+                    "private workflow root was redirected or removed",
+                ));
+            }
+        }
+        Ok(())
+    }
+    fn env(&self, prompt: &str) -> BTreeMap<String, String> {
+        [
+            ("RELAY_REQUIREMENTS", prompt.to_owned()),
+            (
+                "RELAY_REQUIREMENTS_FILE",
+                self.requirements_file.to_string_lossy().into_owned(),
+            ),
+            (
+                "RELAY_WORKSPACE",
+                self.repository.to_string_lossy().into_owned(),
+            ),
+            ("RELAY_REPOSITORY", self.job.repository.clone()),
+            ("RELAY_TASK_ID", self.task.id.to_string()),
+            ("RELAY_GENERATION", self.task.generation.to_string()),
+            ("RELAY_DRAFT_PR", "false".into()),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value))
+        .collect()
+    }
+    fn profile(
+        &self,
+        profile: &CommandProfile,
+        phase: &str,
+        prompt: &str,
+        extra: &BTreeMap<String, String>,
+    ) -> CommandResult {
+        if let Err(stop) = self.active() {
+            return CommandResult::error(stop.outcome, stop.message);
+        }
+        let prompt_file = self.workspace.join(format!("{phase}-input.txt"));
+        if let Err(error) = fs::write(&prompt_file, prompt) {
+            return CommandResult::error(
+                Outcome::Failure,
+                format!("cannot save bounded phase input: {error}"),
+            );
+        }
+        let expand = |arg: &str| match arg {
+            "{requirements}" => prompt.to_owned(),
+            "{requirements_file}" => prompt_file.to_string_lossy().into_owned(),
+            "{workspace}" => self.repository.to_string_lossy().into_owned(),
+            "{repository}" => self.job.repository.clone(),
+            "{task_id}" => self.task.id.to_string(),
+            "{generation}" => self.task.generation.to_string(),
+            _ => arg.to_owned(),
+        };
+        let mut env = profile.env.clone();
+        env.extend(self.env(prompt));
+        env.insert(
+            "RELAY_REQUIREMENTS_FILE".into(),
+            prompt_file.to_string_lossy().into_owned(),
+        );
+        env.extend(extra.clone());
+        self.host.run_supervised(
+            CommandSpec {
+                program: profile.program.clone(),
+                args: profile.args.iter().map(|arg| expand(arg)).collect(),
+                env,
+                cwd: self.repository.to_path_buf(),
+                input: prompt.to_owned(),
+                timeout_ms: self
+                    .deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .max(1) as u64,
+                output_limit_bytes: if phase == "draft-pr" {
+                    64 * 1024
+                } else {
+                    self.host.config().output_limit_bytes
+                },
+                provider: None,
+                read_only: false,
+                clear_env: false,
+            },
+            self.cancellation,
+            self.workspace,
+            phase,
+        )
+    }
+    fn agent(
+        &self,
+        name: &str,
+        read_only: bool,
+        phase: &str,
+        prompt: &str,
+        extra: &BTreeMap<String, String>,
+    ) -> CommandResult {
+        if let Err(stop) = self.active() {
+            return CommandResult::error(stop.outcome, stop.message);
+        }
+        if let Some(native) = self.host.config().native_agents.get(name) {
+            let mut native = native.clone();
+            native.env.extend(self.env(prompt));
+            native.env.extend(extra.clone());
+            self.host.run_native(
+                &native,
+                prompt,
+                read_only,
+                self.cancellation,
+                self.workspace,
+                self.deadline,
+            )
+        } else if !read_only {
+            self.profile(&self.host.config().agents[name], phase, prompt, extra)
+        } else {
+            CommandResult::error(
+                Outcome::Failure,
+                "generic command reviewers are not permitted",
+            )
+        }
+    }
+    fn git(&self, config: &WorkflowConfig, cwd: &Path, args: &[&str]) -> Result<String, Stop> {
+        self.git_with_index(config, cwd, args, None)
+    }
+    fn git_with_index(
+        &self,
+        config: &WorkflowConfig,
+        cwd: &Path,
+        args: &[&str],
+        index: Option<&Path>,
+    ) -> Result<String, Stop> {
+        self.active()?;
+        let mut fixed: Vec<String> = [
+            "--no-optional-locks",
+            "--no-replace-objects",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "core.fileMode=true",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.excludesFile=/dev/null",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "protocol.file.allow=always",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        if cwd == self.repository {
+            self.private_root()?;
+        }
+        if cwd == self.repository && args.first() != Some(&"init") {
+            let git_dir = self.repository.join(".git");
+            let metadata =
+                fs::symlink_metadata(&git_dir).map_err(|error| Stop::failure(error.to_string()))?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(Stop::failure(
+                    "private Git metadata was redirected or removed",
+                ));
+            }
+            for redirect in [
+                "commondir",
+                "objects/info/alternates",
+                "objects/info/http-alternates",
+            ] {
+                match fs::symlink_metadata(git_dir.join(redirect)) {
+                    Ok(_) => {
+                        return Err(Stop::failure(
+                            "private Git metadata contains an unsupported directory/object redirect",
+                        ));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(Stop::failure(error.to_string())),
+                }
+            }
+            fixed.extend([
+                format!("--git-dir={}", git_dir.display()),
+                format!("--work-tree={}", self.repository.display()),
+            ]);
+        }
+        fixed.extend(args.iter().map(|arg| (*arg).to_owned()));
+        let mut env: BTreeMap<String, String> = [
+            ("PATH", "/usr/bin:/bin"),
+            ("LC_ALL", "C"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_SYSTEM", "/dev/null"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_NO_REPLACE_OBJECTS", "1"),
+            ("GIT_AUTHOR_NAME", "Relay"),
+            ("GIT_AUTHOR_EMAIL", "relay@localhost"),
+            ("GIT_COMMITTER_NAME", "Relay"),
+            ("GIT_COMMITTER_EMAIL", "relay@localhost"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+        if let Some(index) = index {
+            env.insert(
+                "GIT_INDEX_FILE".into(),
+                index.to_string_lossy().into_owned(),
+            );
+        }
+        let result = self.host.run_supervised(
+            CommandSpec {
+                program: config.git_program.clone(),
+                args: fixed,
+                env,
+                cwd: cwd.to_owned(),
+                input: String::new(),
+                timeout_ms: self
+                    .deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .max(1) as u64,
+                output_limit_bytes: GIT_CAPTURE_BYTES,
+                provider: None,
+                read_only: false,
+                clear_env: true,
+            },
+            self.cancellation,
+            self.workspace,
+            "workflow-git",
+        );
+        if result.outcome != Outcome::Success {
+            return Err(Stop::command(&result, "Git"));
+        }
+        if result.stdout_truncated {
+            return Err(Stop::failure("Git control output exceeded its bound"));
+        }
+        Ok(result.stdout)
+    }
+    fn sha(&self, config: &WorkflowConfig, cwd: &Path, reference: &str) -> Result<String, Stop> {
+        let sha = self
+            .git(config, cwd, &["rev-parse", "--verify", reference])?
+            .trim()
+            .to_owned();
+        if !valid_sha(&sha) {
+            return Err(Stop::failure("Git did not return a full commit SHA"));
+        }
+        Ok(sha)
+    }
+    fn clean(&self, config: &WorkflowConfig, cwd: &Path) -> Result<(), Stop> {
+        let status = self.git(
+            config,
+            cwd,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
+        )?;
+        if status.is_empty() {
+            Ok(())
+        } else {
+            Err(Stop::failure(
+                "candidate/source contains uncommitted or untracked changes",
+            ))
+        }
+    }
+    fn verify(&self, config: &WorkflowConfig, candidate: &str) -> Result<(), Stop> {
+        validate_tree(self)?;
+        if self.sha(config, self.repository, "HEAD^{commit}")? != candidate {
+            return Err(Stop::failure(
+                "candidate HEAD changed during a guarded phase",
+            ));
+        }
+        let expected_tree = self.sha(config, self.repository, &format!("{candidate}^{{tree}}"))?;
+        if self.git(config, self.repository, &["write-tree"])?.trim() != expected_tree {
+            return Err(Stop::failure(
+                "candidate index changed during a guarded phase",
+            ));
+        }
+        // Git filters and attributes are mutable metadata. A normalized index
+        // comparison can conceal changed raw bytes, so hash files without filters.
+        let manifest = self.git(
+            config,
+            self.repository,
+            &["ls-tree", "-r", "-z", candidate, "--"],
+        )?;
+        let tracked = parse_manifest(&manifest)?;
+        for batch in tracked.chunks(64) {
+            let mut args = vec!["hash-object", "--no-filters", "--"];
+            let mut argument_bytes = 0usize;
+            for file in batch {
+                self.active()?;
+                argument_bytes += file.path.len();
+                if argument_bytes > 32 * 1024 {
+                    return Err(Stop::failure("tracked path batch exceeds its bound"));
+                }
+                let metadata =
+                    fs::symlink_metadata(self.repository.join(&file.path)).map_err(|error| {
+                        Stop::failure(format!("candidate file is missing: {error}"))
+                    })?;
+                if !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                    || ((metadata.permissions().mode() & 0o100 != 0) != file.executable)
+                {
+                    return Err(Stop::failure(
+                        "candidate file type or executable mode changed",
+                    ));
+                }
+                args.push(&file.path);
+            }
+            let hashes = self.git(config, self.repository, &args)?;
+            let hashes: Vec<_> = hashes.lines().collect();
+            if hashes.len() != batch.len()
+                || hashes
+                    .iter()
+                    .zip(batch)
+                    .any(|(actual, file)| *actual != file.sha)
+            {
+                return Err(Stop::failure(
+                    "candidate raw file contents changed during a guarded phase",
+                ));
+            }
+        }
+        // A fresh index also prevents mutable skip-worktree/assume-unchanged flags
+        // from disguising newly added untracked paths. No clean filters run here.
+        let index = self.repository.join(".git/relay-guard-index");
+        match fs::remove_file(&index) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Stop::failure(error.to_string())),
+        }
+        self.git_with_index(
+            config,
+            self.repository,
+            &["read-tree", candidate],
+            Some(&index),
+        )?;
+        if !self
+            .git_with_index(
+                config,
+                self.repository,
+                &["ls-files", "--others", "--exclude-standard", "--"],
+                Some(&index),
+            )?
+            .is_empty()
+        {
+            return Err(Stop::failure(
+                "candidate gained untracked files during a guarded phase",
+            ));
+        }
+        Ok(())
+    }
+    fn prepare(&self, config: &WorkflowConfig) -> Result<String, Stop> {
+        let source = &self.host.config().repositories[&config.repository];
+        let root = self.git(config, source, &["rev-parse", "--show-toplevel"])?;
+        if Path::new(root.trim()) != source {
+            return Err(Stop::failure(
+                "workflow source must be the Git worktree root",
+            ));
+        }
+        let base = self.sha(config, source, "HEAD^{commit}")?;
+        self.clean(config, source)?;
+        let format = self.git(config, source, &["rev-parse", "--show-object-format"])?;
+        let format = format.trim();
+        if !matches!(format, "sha1" | "sha256") {
+            return Err(Stop::failure("unsupported Git object format"));
+        }
+        self.git(
+            config,
+            self.repository,
+            &[
+                "init",
+                "--template=",
+                "--initial-branch=relay-candidate",
+                &format!("--object-format={format}"),
+            ],
+        )?;
+        let source_path = source
+            .to_str()
+            .ok_or_else(|| Stop::failure("workflow source path must be UTF-8"))?;
+        self.git(
+            config,
+            self.repository,
+            &[
+                "fetch",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--depth=1",
+                source_path,
+                &base,
+            ],
+        )?;
+        self.git(
+            config,
+            self.repository,
+            &["checkout", "--detach", &base, "--"],
+        )?;
+        validate_tree(self)?;
+        if self.sha(config, source, "HEAD^{commit}")? != base {
+            return Err(Stop::failure(
+                "source HEAD changed while preparing the workflow",
+            ));
+        }
+        self.clean(config, source)?;
+        if !self
+            .git(
+                config,
+                self.repository,
+                &["submodule", "status", "--cached"],
+            )?
+            .is_empty()
+        {
+            return Err(Stop::failure("workflow source submodules are unsupported"));
+        }
+        self.verify(config, &base)?;
+        Ok(base)
+    }
+    fn candidate(
+        &self,
+        config: &WorkflowConfig,
+        expected: &str,
+        round: u8,
+    ) -> Result<String, Stop> {
+        if self.sha(config, self.repository, "HEAD^{commit}")? != expected {
+            return Err(Stop::failure(
+                "developer changed HEAD; the trusted host owns candidate commits",
+            ));
+        }
+        validate_tree(self)?;
+        self.git(config, self.repository, &["add", "--all", "--", "."])?;
+        let title = format!(
+            "Relay task {} generation {} candidate {}",
+            self.task.id, self.task.generation, round
+        );
+        // Empty candidates remain explicit commits; publication may report no diff.
+        self.git(
+            config,
+            self.repository,
+            &[
+                "commit",
+                "--no-gpg-sign",
+                "--no-verify",
+                "--allow-empty",
+                "-m",
+                &title,
+            ],
+        )?;
+        let candidate = self.sha(config, self.repository, "HEAD^{commit}")?;
+        self.verify(config, &candidate)?;
+        Ok(candidate)
+    }
+    fn patch(
+        &self,
+        config: &WorkflowConfig,
+        base: &str,
+        candidate: &str,
+        round: u8,
+    ) -> Result<PathBuf, Stop> {
+        let path = self
+            .repository
+            .join(".git")
+            .join(format!("relay-review-{round}.patch"));
+        self.git(
+            config,
+            self.repository,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--binary",
+                &format!("--output={}", path.display()),
+                base,
+                candidate,
+                "--",
+            ],
+        )?;
+        if fs::metadata(&path)
+            .map_err(|error| Stop::failure(error.to_string()))?
+            .len()
+            > MAX_PATCH_BYTES
+        {
+            return Err(Stop::failure(
+                "candidate diff exceeds the 256 KiB review bound",
+            ));
+        }
+        Ok(path)
+    }
+}
+
+struct TrackedFile {
+    path: String,
+    sha: String,
+    executable: bool,
+}
+fn parse_manifest(text: &str) -> Result<Vec<TrackedFile>, Stop> {
+    if text.contains('\u{fffd}') || (!text.is_empty() && !text.ends_with('\0')) {
+        return Err(Stop::failure(
+            "Git tree manifest is not complete supported UTF-8",
+        ));
+    }
+    let mut files = Vec::new();
+    for entry in text.split_terminator('\0') {
+        let (metadata, path) = entry
+            .split_once('\t')
+            .ok_or_else(|| Stop::failure("malformed Git tree manifest"))?;
+        let fields: Vec<_> = metadata.split(' ').collect();
+        if fields.len() != 3
+            || !matches!(fields[0], "100644" | "100755")
+            || fields[1] != "blob"
+            || !valid_sha(fields[2])
+        {
+            return Err(Stop::failure(
+                "workflow tree requires regular Git blobs; symlinks and submodules are unsupported",
+            ));
+        }
+        if path.is_empty()
+            || path.chars().any(char::is_control)
+            || Path::new(path)
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err(Stop::failure("workflow tree contains an unsupported path"));
+        }
+        files.push(TrackedFile {
+            path: path.into(),
+            sha: fields[2].into(),
+            executable: fields[0] == "100755",
+        });
+    }
+    Ok(files)
+}
+
+fn validate_tree(context: &Execution<'_>) -> Result<(), Stop> {
+    context.private_root()?;
+    let mut directories = vec![context.repository.to_owned()];
+    while let Some(directory) = directories.pop() {
+        context.active()?;
+        for entry in fs::read_dir(directory).map_err(|error| Stop::failure(error.to_string()))? {
+            context.active()?;
+            let entry = entry.map_err(|error| Stop::failure(error.to_string()))?;
+            let value = fs::symlink_metadata(entry.path())
+                .map_err(|error| Stop::failure(error.to_string()))?;
+            if value.file_type().is_symlink() || (!value.is_file() && !value.is_dir()) {
+                return Err(Stop::failure("workflow rejects symlinks and special files"));
+            }
+            if value.is_dir() {
+                directories.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn execute(context: Execution<'_>, name: &str, config: &WorkflowConfig) -> RunResult {
+    let mut result = RunResult::new(Outcome::Failure, None);
+    result.workspace = Some(context.workspace.to_owned());
+    let mut workflow = WorkflowResult::new(name);
+    let execution = run(&context, config, &mut result, &mut workflow);
+    match execution {
+        Ok(()) => result.outcome = Outcome::Success,
+        Err(stop) => {
+            result.outcome = stop.outcome;
+            result.error = Some(stop.message);
+        }
+    }
+    result.workflow = Some(workflow);
+    result
+}
+fn run(
+    context: &Execution<'_>,
+    config: &WorkflowConfig,
+    result: &mut RunResult,
+    workflow: &mut WorkflowResult,
+) -> Result<(), Stop> {
+    context
+        .host
+        .probe_profile(
+            &context.host.config().native_agents[&config.reviewer],
+            true,
+            context.cancellation,
+            context.workspace,
+            context.deadline,
+        )
+        .map_err(|command| Stop::command(&command, "reviewer compatibility probe"))?;
+    let base = context.prepare(config)?;
+    workflow.base_sha = Some(base.clone());
+    let mut prior = base.clone();
+    let mut feedback = String::new();
+    for round in 0..=config.max_repairs {
+        context.active()?;
+        workflow.reviewed_sha = None;
+        let extra: BTreeMap<String, String> = [
+            ("RELAY_BASE_SHA".into(), base.clone()),
+            ("RELAY_CANDIDATE_SHA".into(), prior.clone()),
+            ("RELAY_WORKFLOW_ROUND".into(), round.to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let prompt = format!(
+            "Implement the requirements in this workspace. Do not commit, change Git HEAD, publish, or invoke other agents. The trusted host will commit and test your changes.\n\nRequirements:\n{}\n\nPrior round feedback:\n{}",
+            context.job.requirements, feedback
+        );
+        let developer = context.agent(
+            &config.developer,
+            false,
+            &format!("developer-{round}"),
+            &prompt,
+            &extra,
+        );
+        let developer_summary = StageSummary::from_command(&developer);
+        let success = developer.outcome == Outcome::Success;
+        result.agent = Some(developer);
+        if !success {
+            return Err(Stop::command(
+                result.agent.as_ref().expect("agent recorded"),
+                "developer",
+            ));
+        }
+        let candidate = context.candidate(config, &prior, round)?;
+        workflow.candidate_sha = Some(candidate.clone());
+        let extra: BTreeMap<String, String> = [
+            ("RELAY_BASE_SHA".into(), base.clone()),
+            ("RELAY_CANDIDATE_SHA".into(), candidate.clone()),
+            ("RELAY_WORKFLOW_ROUND".into(), round.to_string()),
+        ]
+        .into_iter()
+        .collect();
+        workflow.rounds.push(RoundResult {
+            round,
+            candidate_sha: candidate.clone(),
+            developer: developer_summary,
+            tests: None,
+            review: None,
+            reviewer: None,
+        });
+        let test = context.profile(
+            &context.host.config().tests[&config.test],
+            &format!("tests-{round}"),
+            &context.job.requirements,
+            &extra,
+        );
+        workflow.rounds.last_mut().expect("round recorded").tests =
+            Some(StageSummary::from_command(&test));
+        let ordinary_failure = test.outcome == Outcome::Failure
+            && test.exit_code.is_some_and(|code| code != 0)
+            && test.signal.is_none()
+            && test.error.is_none();
+        let test_success = test.outcome == Outcome::Success;
+        result.tests = Some(test);
+        if !test_success && !ordinary_failure {
+            return Err(Stop::command(
+                result.tests.as_ref().expect("test recorded"),
+                "tests",
+            ));
+        }
+        context.verify(config, &candidate)?;
+        if ordinary_failure {
+            if round == config.max_repairs {
+                return Err(Stop::failure(
+                    "tests failed; workflow repair budget exhausted",
+                ));
+            }
+            let test = result.tests.as_ref().expect("test recorded");
+            feedback = format!(
+                "Candidate {candidate} failed its configured tests (exit {:?}).\nstdout:\n{}\nstderr:\n{}",
+                test.exit_code, test.stdout, test.stderr
+            );
+            truncate(&mut feedback, 12 * 1024);
+            prior = candidate;
+            continue;
+        }
+        let patch = context.patch(config, &base, &candidate, round)?;
+        let prompt = format!(
+            "Review this exact committed candidate read-only against the requirements. Base SHA: {base}. Candidate SHA: {candidate}. The configured tests passed for that SHA. Read the complete diff at {} and relevant candidate files. Report changes_requested for unresolved defects or content you cannot meaningfully review. Do not edit files, run tests, publish, or delegate. Return only JSON with exactly candidate_sha, verdict (approved or changes_requested), summary (1-512 UTF-8 bytes), and findings (at most 8 strings of 1-384 UTF-8 bytes each). Approved requires an empty findings array; changes_requested requires at least one finding. Echo the full candidate SHA.\n\nRequirements:\n{}",
+            patch.display(),
+            context.job.requirements
+        );
+        let reviewer = context.agent(
+            &config.reviewer,
+            true,
+            &format!("reviewer-{round}"),
+            &prompt,
+            &extra,
+        );
+        workflow.rounds.last_mut().expect("round recorded").reviewer =
+            Some(StageSummary::from_command(&reviewer));
+        if reviewer.outcome != Outcome::Success {
+            return Err(Stop::command(&reviewer, "reviewer"));
+        }
+        context.verify(config, &candidate)?;
+        let provider = reviewer
+            .provider
+            .as_ref()
+            .ok_or_else(|| Stop::failure("native reviewer did not produce normalized output"))?;
+        if provider.summary_truncated {
+            return Err(Stop::failure("reviewer verdict was truncated"));
+        }
+        let review = ReviewResult::parse(&provider.summary, &candidate)?;
+        let verdict = review.verdict;
+        feedback = serde_json::to_string(&review).expect("serializable review");
+        workflow.rounds.last_mut().expect("round recorded").review = Some(review);
+        if verdict == ReviewVerdict::Approved {
+            workflow.reviewed_sha = Some(candidate.clone());
+            context.verify(config, &candidate)?;
+            if context.job.publish {
+                if context.sha(config, context.repository, &format!("{base}^{{tree}}"))?
+                    == context.sha(config, context.repository, &format!("{candidate}^{{tree}}"))?
+                {
+                    return Err(Stop::failure(
+                        "approved candidate has no changes to publish",
+                    ));
+                }
+                publish(context, config, result, workflow, &base, &candidate)?;
+            }
+            return Ok(());
+        }
+        if round == config.max_repairs {
+            return Err(Stop::failure(
+                "review requested changes; workflow repair budget exhausted",
+            ));
+        }
+        prior = candidate;
+    }
+    Err(Stop::failure(
+        "workflow stopped without an approved candidate",
+    ))
+}
+fn publish(
+    context: &Execution<'_>,
+    config: &WorkflowConfig,
+    result: &mut RunResult,
+    workflow: &mut WorkflowResult,
+    base: &str,
+    candidate: &str,
+) -> Result<(), Stop> {
+    context.active()?;
+    let adapter = config
+        .draft_pr_adapter
+        .as_ref()
+        .ok_or_else(|| Stop::failure("workflow has no exact-candidate publisher"))?;
+    let repository = config
+        .github_repository
+        .as_ref()
+        .ok_or_else(|| Stop::failure("workflow has no publication target"))?;
+    let profile = &context.host.config().draft_pr_adapters[adapter];
+    let execute = profile
+        .env
+        .get("RELAY_GITHUB_EXECUTE")
+        .is_some_and(|value| value == "1");
+    let mut evidence = format!(
+        "Base: {base}\nCandidate tested and approved: {candidate}\nConfigured tests: {}\nReview: {}\n",
+        config.test,
+        workflow
+            .rounds
+            .last()
+            .and_then(|round| round.review.as_ref())
+            .map(|review| review.summary.as_str())
+            .unwrap_or("")
+    );
+    truncate(&mut evidence, 2048);
+    let extra: BTreeMap<String, String> = [
+        ("RELAY_DRAFT_PR", "true".into()),
+        (
+            "RELAY_GITHUB_EXECUTE",
+            if execute { "1" } else { "0" }.into(),
+        ),
+        ("RELAY_EXACT_CANDIDATE", "true".into()),
+        ("RELAY_REVIEW_VERDICT", "approved".into()),
+        ("RELAY_TEST_OUTCOME", "success".into()),
+        ("RELAY_BASE_SHA", base.into()),
+        ("RELAY_CANDIDATE_SHA", candidate.into()),
+        ("RELAY_REVIEWED_SHA", candidate.into()),
+        ("RELAY_GITHUB_REPOSITORY", repository.clone()),
+        ("RELAY_GITHUB_BASE", config.base_branch.clone()),
+        (
+            "RELAY_GIT_PROGRAM",
+            config.git_program.to_string_lossy().into_owned(),
+        ),
+        ("RELAY_REVIEW_EVIDENCE", evidence),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.into(), value))
+    .collect();
+    let publication = context.profile(profile, "draft-pr", &context.job.requirements, &extra);
+    let success = publication.outcome == Outcome::Success;
+    let terminal = if publication.stdout_truncated {
+        None
+    } else {
+        serde_json::from_str::<serde_json::Value>(publication.stdout.trim()).ok()
+    };
+    let reconciliation = terminal
+        .as_ref()
+        .and_then(|value| value.get("reconciliation_required"))
+        .and_then(serde_json::Value::as_bool);
+    let expected_branch = format!(
+        "relay/task-{}-g{}",
+        context.task.id, context.task.generation
+    );
+    let valid = terminal.as_ref().is_some_and(|value| {
+        value
+            .get("candidate_sha")
+            .and_then(serde_json::Value::as_str)
+            == Some(candidate)
+            && value.get("repository").and_then(serde_json::Value::as_str) == Some(repository)
+            && value.get("branch").and_then(serde_json::Value::as_str)
+                == Some(expected_branch.as_str())
+            && value.get("draft").and_then(serde_json::Value::as_bool) == Some(true)
+            && value.get("dry_run").and_then(serde_json::Value::as_bool) == Some(!execute)
+            && (!execute
+                || value
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|url| valid_pr_url(url, repository)))
+            && reconciliation == Some(false)
+    });
+    let outcome = publication.outcome;
+    result.draft_pr = Some(publication);
+    if outcome == Outcome::Unknown
+        || reconciliation == Some(true)
+        || (success && !valid)
+        || (!success && reconciliation != Some(false))
+    {
+        workflow.reconciliation_required = true;
+        return Err(Stop {
+            outcome: if outcome == Outcome::Unknown {
+                Outcome::Unknown
+            } else {
+                Outcome::Failure
+            },
+            message:
+                "publication outcome requires remote reconciliation; do not retry automatically"
+                    .into(),
+        });
+    }
+    if !success {
+        return Err(Stop::command(
+            result.draft_pr.as_ref().expect("publication recorded"),
+            "publication",
+        ));
+    }
+    workflow.publication = Some(PublicationResult {
+        dry_run: !execute,
+        draft: true,
+        repository: repository.clone(),
+        branch: expected_branch,
+        candidate_sha: candidate.into(),
+        url: if execute {
+            terminal
+                .as_ref()
+                .and_then(|value| value.get("url"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        } else {
+            None
+        },
+    });
+    Ok(())
+}
+
+fn valid_pr_url(url: &str, repository: &str) -> bool {
+    url.strip_prefix(&format!("https://github.com/{repository}/pull/"))
+        .is_some_and(|number| {
+            !number.is_empty()
+                && number.len() <= 20
+                && !number.starts_with('0')
+                && number.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn review_is_exact_strict_and_bounded() {
+        let sha = "a".repeat(40);
+        let verdict = serde_json::json!({"candidate_sha":sha,"verdict":"approved","summary":"Checked", "findings":[]});
+        assert!(ReviewResult::parse(&verdict.to_string(), &sha).is_ok());
+        assert!(ReviewResult::parse(&verdict.to_string(), &"b".repeat(40)).is_err());
+        let mut bad = verdict.clone();
+        bad["extra"] = true.into();
+        assert!(ReviewResult::parse(&bad.to_string(), &sha).is_err());
+        let mut bad = verdict.clone();
+        bad["findings"] = serde_json::json!(["unfixed"]);
+        assert!(ReviewResult::parse(&bad.to_string(), &sha).is_err());
+        let mut bad = verdict;
+        bad["verdict"] = "changes_requested".into();
+        assert!(ReviewResult::parse(&bad.to_string(), &sha).is_err());
+    }
+    #[test]
+    fn publication_targets_are_conservative() {
+        for branch in ["main", "release/v1.2", "feature-name"] {
+            assert!(valid_branch(branch));
+        }
+        for branch in [
+            "-main",
+            "a..b",
+            ".main",
+            "main.lock",
+            "a//b",
+            "a/.b",
+            "a/",
+            "a@{b",
+        ] {
+            assert!(!valid_branch(branch));
+        }
+        assert!(valid_github_repository("org/repo-name"));
+        assert!(!valid_github_repository("https://github.com/org/repo"));
+        assert!(!valid_github_repository("org/../repo"));
+    }
+}

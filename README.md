@@ -44,6 +44,8 @@ POST /api/tasks/<id>/cancel
 
 把允许访问的本地仓库、Agent、测试和 PR 命令显式写入配置。请求只引用配置中的名字，不能指定任意程序、路径或 shell。原生 `native_agents` 支持 Codex / Claude CLI 的有界 JSONL 协议与终态校验；旧通用命令保持兼容。`relay-app doctor <config.json>` 可只探测版本/参数，不调用模型。模型与供应商凭据由这些外部 CLI 自行管理，Relay 不存储或代办凭据。命令失败和测试失败作为开发结果保存，内核不理解业务状态。
 
+可选命名 `workflows` 将开发 → 测试 → 只读审查 → 有界修复绑定同一 candidate SHA；每次修复必须重新测试和审查。GitHub 示例仅推送已批准的精确候选，默认 dry-run。
+
 配置、占位符、工作区限制、可选 draft PR 流程及恢复方法见 [运行说明](docs/application.md)。首次接真实 CLI 前先确认其当前版本的调用参数、权限与费用。演示配置是可直接运行的契约示例，不假设你已安装任何模型 CLI。
 
 ## 可靠性边界

@@ -2,7 +2,7 @@
 
 ## 边界与部署方式
 
-`relay` 是不透明队列库与 CLI。`relay-app` 是独立 workspace package，复用同一 SQLite 状态转换，包含 HTTP/UI、MCP、开发 job 校验和可信 Linux 宿主。Axum/Tokio 仅用于应用 HTTP；libc 用于独立 supervisor 的 Linux 子进程管理。没有动态插件系统或远端 worker 协议。
+`relay` 是不透明队列库与 CLI。`relay-app` 是独立 workspace package，复用同一 SQLite 状态转换，包含 HTTP/UI、MCP、开发 job 校验、有界审查修复工作流和可信 Linux 宿主。Axum/Tokio 仅用于应用 HTTP；libc 用于独立 supervisor 的 Linux 子进程管理。没有动态插件系统或远端 worker 协议。
 
 应用目前针对单个可信本机账户。数据库、配置文件、工作区根和外部 CLI 凭据必须由该账户控制；不要授予不可信用户写权限。HTTP token 是所有已配置仓库的单一操作能力，没有多用户权限划分。服务拒绝非回环监听地址，默认 `127.0.0.1:8787`。需要远程访问时由运维人员提供 TLS 和受控网络入口；程序不会自动配置。
 
@@ -32,21 +32,61 @@
 }
 ```
 
-`requirements` 必须是 1–32768 UTF-8 字节。repository / agent / test 只接受配置名字；未知字段、未知配置、空需求或超限输入被拒绝。`test` 可省略或为 null。提交 HTTP 请求的外层是 `{ "key": "client-chosen-stable-key", "job": ... }`。key 由客户端保存，提交结果未知时复用；成功后下一项需求换新 key。
+`requirements` 必须是 1–32768 UTF-8 字节。repository / agent / test / workflow 只接受配置名字；未知字段、未知配置、空需求或超限输入被拒绝。`test` 可省略或为 null。提交 HTTP 请求的外层是 `{ "key": "client-chosen-stable-key", "job": ... }`。key 由客户端保存，提交结果未知时复用；成功后下一项需求换新 key。
 
 参数中只有独立的完整 token 被替换：`{requirements}`、`{requirements_file}`、`{workspace}`、`{repository}`、`{task_id}`、`{generation}`。例如 `"--prompt={requirements}"` 不会展开；请使用两个参数 `"--prompt", "{requirements}"`。需求也通过 stdin、`RELAY_REQUIREMENTS` 和 `RELAY_REQUIREMENTS_FILE` 提供。各阶段工作目录为任务的 `repository/` 快照，其他环境包含 `RELAY_WORKSPACE`、`RELAY_REPOSITORY`、`RELAY_TASK_ID`、`RELAY_GENERATION`。HTTP 的 `RELAY_TOKEN` 不传给任务进程。
 
 外部 CLI 可以使用其已有的账户与模型配置。Relay 不安装模型 CLI、不创建 OAuth/API key、不猜测各版本的付费模型参数。配置者需确认 CLI 在非交互模式下可运行，并负责授予其访问范围和费用预算。即使参数不经过 shell，配置的 Agent 依然可以执行代码；这不是防恶意代码沙箱。
 
-## 可选 draft PR 适配器
+## 有界开发、测试、审查与修复
 
-不提交 `publish=true` 时绝不调用 PR 阶段。启用时必须同时指定配置中存在的 `draft_pr_adapter`，并且 Agent 与所有已配置测试阶段都成功。网页默认只运行开发/测试；PR 阶段通过 HTTP 或 MCP 明确选择。
+配置 `workflows` 可启用精确候选提交工作流；未选择工作流的旧演示继续使用无 Git 快照与通用命令阶段。工作流配置只由可信部署者修改，例如：
 
-`examples/github-draft-pr.py` 提供真实 Git/gh 命令适配器，默认仅输出 dry-run 计划。配置者需要显式设置 `RELAY_GITHUB_REPOSITORY=owner/repo`，可选 `RELAY_GITHUB_BASE=main`；Git/gh 路径默认 `/usr/bin/git`、`/usr/bin/gh`，可用 `RELAY_GIT_PROGRAM` / `RELAY_GH_PROGRAM` 指向已安装程序。只有可信配置设置 `RELAY_GITHUB_EXECUTE=1` 才实际发布，要求 Git/gh 已登录且 Git 已配置提交身份。
+```json
+{
+  "workflows": {
+    "reviewed": {
+      "repository":"project",
+      "developer":"codex",
+      "reviewer":"claude-reviewer",
+      "test":"check",
+      "git_program":"/usr/bin/git",
+      "max_repairs":1,
+      "draft_pr_adapter":"github",
+      "github_repository":"owner/repository",
+      "base_branch":"main"
+    }
+  }
+}
+```
 
-真实模式会在快照初始化 Git，拉取目标 base、保留快照文件并建立基线、提交、推送 `relay/task-<id>-g<generation>`，最后 `gh pr create --draft`。它不会 merge、deploy 或 force-push。注意：目标 base 应对应复制的源仓库；源快照与远端基线不一致时会产生额外差异。首次使用先看 dry-run，并使用测试仓库核对差异。实际发布也会调用 git 网络操作，必须事先授权该目标仓库。
+这是完整 host 配置的片段；所有名字必须引用现有允许项。`test` 必须配置，`max_repairs` 默认 0、最大 3，表示初次开发之后最多自动修复几次。若不需要发布，同时省略 `draft_pr_adapter` 与 `github_repository`。当前 reviewer 必须是支持受限只读工具的 Claude 原生 profile；通用命令和 Codex reviewer 在执行开发前被拒绝。版本/能力不足也直接失败，不降级权限。
 
-如工作区已有 `.git` 或任何命令失败，适配器停止，不自动清理、覆盖或重复推送。网络失败不能证明 PR/分支没有创建，必须人工检查远端；Relay 不承诺跨 GitHub 副作用恰好一次。`examples/fake-draft-pr.py` 和标准库 mock 测试不产生任何真实远端副作用。
+```json
+{"repository":"project","requirements":"实现需求并补测试","agent":"codex","workflow":"reviewed","publish":false}
+```
+
+工作流固定 repository、developer、reviewer 和 test；job 的 `agent` 必须等于该 developer，若给出 `test` 则必须匹配配置。网页可选工作流并自动锁定这些字段；网页仍不请求 GitHub 发布。HTTP/MCP 可显式选择 `publish=true` 和匹配的 `draft_pr_adapter`，不能用 job 改模型、命令、修复次数或目标仓库。
+
+执行顺序：
+
+1. 检查 reviewer 能力、干净的本地 Git 源仓库，并固定源 HEAD 为 `base_sha`。工作区通过本机 Git 浅导入该精确提交，不复制源 `.git` 配置或未跟踪文件；不访问远端。拒绝子模块、符号链接和特殊文件
+2. developer 修改独立工作区，宿主创建 `candidate_sha`。禁止 developer 自行改变 HEAD；宿主负责提交
+3. 对已提交候选运行配置测试，随后验证 HEAD、索引和工作树仍对应同一候选。测试产生的被忽略构建输出可保留，交付内容发生变化则失败
+4. reviewer 使用受限只读工具检查完整有界 diff 与候选文件，必须返回包含精确 `candidate_sha` 的 JSON verdict、摘要和 findings。错误 SHA、缺字段、截断回答、权限拒绝、非法终态或修改工作区都不通过
+5. 只有普通测试非零退出，或有效 `changes_requested`，才能在剩余预算内触发修复。每次修复生成新候选，重新测试与审查；旧审查结论失效。所有轮次共享总期限，最多保存 4 轮有界证据
+
+工作流 prompt 在保留原始需求上加入宿主指令，使用单独的有界内部输入预算；用户需求仍限 32 KiB。完整 diff 最大 256 KiB，跟踪文件清单最大 64 KiB；超限失败而不让 reviewer 审查截断版本。完整性检查比较实际文件字节和 owner 可执行位与 Git blob，不通过 clean filter 判断；使 checkout 字节不同于提交的 CRLF/encoding/filter 转换暂不支持。拒绝新添加的 gitlink/嵌套仓库，以及私有 Git 元数据的 commondir/alternates 重定向。工作区运行预算涵盖 Git 元数据与证据，仍是尽力检查而非文件系统硬配额。结果增加 `workflow`，含 base/candidate/reviewed SHA、每轮摘要及外部结果核对标志，不增加内核状态，也不提供中途恢复的模型会话。
+
+## 可选精确 SHA draft PR 适配器
+
+`examples/github-draft-pr.py` 只接受已经测试并审查通过的 Git 工作流候选。旧通用演示可继续用 `examples/fake-draft-pr.py`，但真实 GitHub 示例不再在发布阶段初始化 Git、覆盖基线或重做提交。
+
+适配器默认仅输出 dry-run 计划，不启动 Git/gh。可信配置设置 `RELAY_GITHUB_EXECUTE=1` 才实际发布；Git/gh 必须已安装和登录，Relay 不处理凭据。Git 路径由工作流固定；gh 默认 `/usr/bin/gh`，可通过适配器配置的 `RELAY_GH_PROGRAM` 设置。工作流覆盖并传入目标 `RELAY_GITHUB_REPOSITORY` / `RELAY_GITHUB_BASE`、`RELAY_BASE_SHA` / `RELAY_CANDIDATE_SHA` / `RELAY_REVIEWED_SHA` 及测试/审查结果；job 不能覆盖它们。
+
+实际发布前再次检查本地 HEAD、索引、工作树，以及目标远端 base 当前指向已固定的 base SHA；远端发生变化时停止。拒绝 Git URL 重写和命名 remote 映射，保留已有凭据 helper 并固定 gh 的 github.com 主机；禁用 Git HTTP 重定向和自动附带 tag 推送。该检查不是远端锁，之后仍可能有其他人推进 base。推送 refspec 使用精确 candidate SHA，创建 `relay/task-<id>-g<generation>`，并且仅 `gh pr create --draft`。PR 正文记录 base/candidate SHA 和测试/审查结论。适配器不 force-push、merge 或 deploy。
+
+一旦推送或建 PR 已尝试，网络错误、异常退出或无法验证结果都可能已经产生远端副作用。结果标记 `reconciliation_required=true`，不自动重试、不重新开发或创建第二个 PR。确认进程树结束时可保存失败结果；只有进程生命周期无法确认才沿用 claimed/unknown 恢复规则。操作员必须核对目标分支和 PR 后决定下一步。跨 GitHub 副作用不承诺恰好一次。
 
 ## HTTP 与 MCP
 

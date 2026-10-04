@@ -79,3 +79,7 @@ HTTP worker 遇到 host Unknown 或落库失败仍保留 claimed，不按时间�
 ## 原生 CLI 协议边界
 
 `app/src/providers.rs` 负责可信原生 profile、固定 CLI 参数与有界 JSONL 终态归一化；supervisor 在排空输出时解析，不从截断日志反推成功。退出码和供应商终态共同决定应用结果。版本/帮助探测不证明账户认证或模型访问可用。供应商、模型与会话信息仍只是核心不透明结果的一部分，不增加核心业务状态或自动重试。
+
+## 精确候选工作流
+
+`app/src/workflow.rs` 在宿主边界内固定干净 Git 基线，按候选提交串联开发、测试、受限只读审查和至多三次修复。测试与审查绑定精确 SHA，任何候选变化都重新验证；发布只推送已批准提交。GitHub 不确定效果作为有界应用诊断保留，不自动重试，也不扩展核心 queued/claimed/finished 状态。共同期限、轮次数、diff、工作区与持久结果预算都由应用/宿主执行。设计理由见 [ADR 0002](adr/0002-reviewed-candidate-workflow.md)。
