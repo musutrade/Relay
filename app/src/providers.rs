@@ -15,6 +15,7 @@ const MAX_SUMMARY: usize = 4096;
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     CodexCli,
+    CodexAppServer,
     ClaudeCli,
 }
 
@@ -33,6 +34,9 @@ pub struct NativeProfile {
     pub max_turns: Option<u32>,
     #[serde(default)]
     pub max_budget_usd: Option<f64>,
+    /// Retain an explicit, task/role-scoped Claude session. Codex app-server always retains its thread.
+    #[serde(default)]
+    pub session_continuity: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,7 +68,9 @@ impl NativeProfile {
         }
         if let Some(effort) = &self.effort {
             let allowed = match self.provider {
-                ProviderKind::CodexCli => &["minimal", "low", "medium", "high", "xhigh"][..],
+                ProviderKind::CodexCli | ProviderKind::CodexAppServer => {
+                    &["minimal", "low", "medium", "high", "xhigh"][..]
+                }
                 ProviderKind::ClaudeCli => &["low", "medium", "high", "xhigh", "max"][..],
             };
             if !allowed.contains(&effort.as_str()) {
@@ -85,6 +91,9 @@ impl NativeProfile {
         {
             return Err("max_turns and max_budget_usd are Claude-only settings".into());
         }
+        if self.session_continuity && self.provider == ProviderKind::CodexCli {
+            return Err("Codex session continuity requires provider codex_app_server".into());
+        }
         if serde_json::to_vec(self)
             .map_err(|error| error.to_string())?
             .len()
@@ -99,10 +108,18 @@ impl NativeProfile {
     /// Callers must verify version/help capabilities before executing these arguments.
     pub fn compile(&self, read_only: bool) -> Result<CommandProfile, String> {
         self.validate()?;
-        if read_only && self.provider == ProviderKind::CodexCli {
+        if read_only && self.provider != ProviderKind::ClaudeCli {
             return Err("review_profile_unsupported: Codex project MCP/hooks cannot be disabled by the supported CLI contract".into());
         }
+        if self.provider == ProviderKind::CodexAppServer {
+            return Ok(CommandProfile {
+                program: self.program.clone(),
+                args: vec!["app-server".into()],
+                env: self.env.clone(),
+            });
+        }
         let mut args: Vec<String> = match self.provider {
+            ProviderKind::CodexAppServer => unreachable!(),
             ProviderKind::CodexCli => vec![
                 "exec".into(),
                 "--json".into(),
@@ -131,7 +148,7 @@ impl NativeProfile {
         }
         if let Some(effort) = &self.effort {
             match self.provider {
-                ProviderKind::CodexCli => {
+                ProviderKind::CodexCli | ProviderKind::CodexAppServer => {
                     args.extend(["-c".into(), format!("model_reasoning_effort=\"{effort}\"")])
                 }
                 ProviderKind::ClaudeCli => args.extend(["--effort".into(), effort.clone()]),
@@ -160,6 +177,9 @@ impl NativeProfile {
                 "{\"mcpServers\":{}}".into(),
             ]);
         }
+        if self.session_continuity {
+            args.retain(|arg| arg != "--no-session-persistence");
+        }
         if self.provider == ProviderKind::CodexCli {
             args.push("-".into());
         }
@@ -173,6 +193,7 @@ impl NativeProfile {
     pub fn help_args(&self) -> Vec<String> {
         match self.provider {
             ProviderKind::CodexCli => vec!["exec".into(), "--help".into()],
+            ProviderKind::CodexAppServer => vec!["app-server".into(), "--help".into()],
             ProviderKind::ClaudeCli => vec!["--help".into()],
         }
     }
@@ -200,7 +221,7 @@ impl NativeProfile {
         read_only: bool,
         hidden_max_turns_verified: bool,
     ) -> Result<String, String> {
-        if read_only && self.provider == ProviderKind::CodexCli {
+        if read_only && self.provider != ProviderKind::ClaudeCli {
             return Err("review_profile_unsupported: Codex project MCP/hooks cannot be disabled by the supported CLI contract".into());
         }
         let version = parse_version(version).ok_or("CLI version was not recognizable")?;
@@ -209,7 +230,14 @@ impl NativeProfile {
                 "Claude CLI 2.1.259 or later is required for --permission-prompts none".into(),
             );
         }
+        if self.provider == ProviderKind::CodexAppServer {
+            if version.0 < (0, 160, 0) || !help.contains("app-server") {
+                return Err("Codex app-server 0.160.0 or later is required".into());
+            }
+            return Ok(version.1);
+        }
         let mut required = match self.provider {
+            ProviderKind::CodexAppServer => unreachable!(),
             ProviderKind::CodexCli => vec![
                 "--json",
                 "--sandbox",
@@ -223,6 +251,10 @@ impl NativeProfile {
                 "--no-session-persistence",
             ],
         };
+        if self.session_continuity {
+            required.retain(|flag| *flag != "--no-session-persistence");
+            required.extend(["--resume", "--session-id"]);
+        }
         if self.model.is_some() {
             required.push("--model");
         }
@@ -377,6 +409,7 @@ pub struct ProtocolParser {
     discarding_line: bool,
     read_only: bool,
     answer_seen: bool,
+    app_server: Option<crate::app_server::Driver>,
 }
 impl ProtocolParser {
     pub fn new(mut result: ProviderResult) -> Self {
@@ -389,13 +422,37 @@ impl ProtocolParser {
             discarding_line: false,
             read_only: false,
             answer_seen: false,
+            app_server: None,
         }
+    }
+    pub(crate) fn app_server(result: ProviderResult, start: crate::app_server::Start) -> Self {
+        let mut parser = Self::new(result.clone());
+        parser.app_server = Some(crate::app_server::Driver::new(result, start));
+        parser
+    }
+    pub(crate) fn pending(&mut self) -> Vec<u8> {
+        self.app_server
+            .as_mut()
+            .map(|driver| driver.take_pending())
+            .unwrap_or_default()
+    }
+    pub(crate) fn stopped(&self) -> bool {
+        self.app_server
+            .as_ref()
+            .is_some_and(|driver| driver.stopped())
+    }
+    pub(crate) fn failure(&self) -> Option<&str> {
+        self.app_server.as_ref().and_then(|driver| driver.failure())
     }
     pub fn read_only(mut self, enabled: bool) -> Self {
         self.read_only = enabled;
         self
     }
     pub fn feed(&mut self, bytes: &[u8]) {
+        if let Some(driver) = &mut self.app_server {
+            driver.feed(bytes);
+            return;
+        }
         for &byte in bytes {
             if byte == b'\n' {
                 if !self.discarding_line {
@@ -472,6 +529,9 @@ impl ProtocolParser {
             return Err("provider reported an error or denied permission".into());
         }
         match self.result.provider {
+            ProviderKind::CodexAppServer => {
+                return Err("app-server requires bidirectional protocol driver".into());
+            }
             ProviderKind::CodexCli => match kind {
                 "thread.started" => {
                     self.active()?;
@@ -640,6 +700,9 @@ impl ProtocolParser {
         Ok(())
     }
     pub fn finish(mut self) -> (ProviderResult, Option<String>) {
+        if let Some(driver) = self.app_server.take() {
+            return driver.finish();
+        }
         if !self.discarding_line && !self.line.is_empty() {
             self.parse_line();
         }

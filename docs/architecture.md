@@ -89,3 +89,7 @@ HTTP worker 遇到 host Unknown 或落库失败仍保留 claimed，不按时间�
 ## 单用户浏览器认证
 
 `app/src/auth.rs` 管理显式 bearer/session/hybrid 模式、Argon2id 凭据验证、有界进程内会话和登录限流。Cookie 的 HTTPS 与 Origin 边界由可信主机配置，不采信转发头。密码由操作员在本机隐藏输入；服务重启、退出或密码轮换撤销会话。认证状态不进入队列库或任务 payload，MCP 仍保持可信本机 stdio 边界。迁移与回退见 [密码登录说明](password-login.md)。
+
+## 会话适配器
+
+`app/src/app_server.rs` 负责 Codex 双向请求/响应、线程与 turn 关联、拒绝服务端权限/输入请求和有界终态校验。`app/src/sessions.rs` 只保存宿主创建的 task/workspace/role/profile 绑定与显式 ID；执行前持久化 in-flight，成功且完整回收后才可续接。Claude 使用显式 `--session-id` / `--resume`。启用续接的 reviewer 使用固定独立 checkout，继续校验精确候选和只读约束。队列内核、人工确认停止后重排以及未知副作用处理均不改变。详见 [会话续接](session-continuity.md)。

@@ -136,7 +136,7 @@ UI 的依赖免费 Node 状态测试覆盖重复提交、保留幂等 key 重试
 
 ## 原生 Codex / Claude CLI profile
 
-旧 `agents` 命令 profile 保持兼容。`native_agents` 提供封闭的 `codex_cli` / `claude_cli` 协议适配；两类 profile 名称不能重复。job 的 `agent` 仍只引用可信配置中的名字，不接受用户指定程序、参数、环境变量或模型 ID。
+旧 `agents` 命令 profile 保持兼容。`native_agents` 提供封闭的 `codex_cli` / `codex_app_server` / `claude_cli` 协议适配；两类 profile 名称不能重复。job 的 `agent` 仍只引用可信配置中的名字，不接受用户指定程序、参数、环境变量或模型 ID。
 
 ```json
 {
@@ -157,7 +157,7 @@ cargo run -p relay-app -- doctor /absolute/path/config.json
 
 只读能力单独探测：当前 Claude 需要 restricted 模式、仅 Read/Glob/Grep 工具、禁用 MCP/自定义命令的完整能力。Codex 开发调用可用，但只读审查返回 `review_profile_unsupported`，因为其 read-only sandbox 不等于禁用项目 MCP/hooks。机器上的托管设置仍属于可信部署边界，不承诺对恶意 CLI 或托管 hooks 隔离。
 
-原生调用使用 stdin 传需求、JSONL 输出以及显式权限参数。供应商事件在排空 stdout 时增量解析，独立于用户可见的截断日志；限制单事件、摘要、标识符与 usage 的保留大小。成功需要进程正常退出以及有效成功终态。Codex 的非致命 error item 和失败的工具 item 可由 Agent 后续恢复，不单独视为协议损坏；以最后一条已完成 agent_message 为摘要，仍须有成功 turn.completed 终态。缺失或非法终态、turn.failed、顶层供应商 error、权限拒绝、预算耗尽、非零退出都不能成为成功。格式错误保持失败，但继续有界解析后续行以保留摘要和 usage；超过 64 KiB 的行丢弃至下一换行后恢复解析，后续成功事件不会消除之前的致命错误。结果的 provider 信息保留实际报告的模型与会话标识；未报告的字段不猜测，也不表示 Relay 实现了可恢复会话。
+原生调用使用 stdin 传需求、JSONL 输出以及显式权限参数。供应商事件在排空 stdout 时增量解析，独立于用户可见的截断日志；限制单事件、摘要、标识符与 usage 的保留大小。成功需要进程正常退出以及有效成功终态。Codex 的非致命 error item 和失败的工具 item 可由 Agent 后续恢复，不单独视为协议损坏；以最后一条已完成 agent_message 为摘要，仍须有成功 turn.completed 终态。缺失或非法终态、turn.failed、顶层供应商 error、权限拒绝、预算耗尽、非零退出都不能成为成功。格式错误保持失败，但继续有界解析后续行以保留摘要和 usage；超过 64 KiB 的行丢弃至下一换行后恢复解析，后续成功事件不会消除之前的致命错误。结果的 provider 信息保留实际报告的模型与会话标识；未报告的字段不猜测，旧无会话 profile 不会仅凭此字段恢复会话。显式续接配置与 app-server 生命周期见 [原生会话续接](session-continuity.md)。
 
 `GET /api/config` 与 MCP 配置结果仅公开 profile 名称、供应商、配置模型/effort 和未知认证状态，不公开程序路径、完整命令或环境。原生适配是 CLI 子进程集成，不是 SDK 或托管模型服务；现阶段离线验收使用假 CLI，真实账户、模型费用与供应商端行为仍需在明确授权的环境单独验收。
 
