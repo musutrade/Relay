@@ -48,6 +48,7 @@ impl Fixture {
     }
     fn job(&self) -> Job {
         Job {
+            continuation: None,
             workflow: None,
             repository: "fixture".into(),
             requirements: "Implement the fixture change".into(),
@@ -60,7 +61,7 @@ impl Fixture {
     fn workspace(&self, id: i64) -> PathBuf {
         self.config
             .workspace_root
-            .join(format!("task-{id}-generation-1/repository"))
+            .join(format!("task-{id}/repository"))
     }
     fn run(&self, task: &Task) -> RunResult {
         Host::new(self.config.clone())

@@ -8,6 +8,7 @@ pub mod mcp;
 pub mod providers;
 mod sessions;
 pub mod workflow;
+mod workspaces;
 
 use host::{Host, HostConfig, Job};
 use relay::{Store, Task};
@@ -47,6 +48,13 @@ pub struct Submission {
     pub job: Job,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryRequest {
+    pub key: String,
+    pub confirm_stopped_and_reconciled: bool,
+}
+
 struct StateData {
     store: Store,
     control: Connection,
@@ -65,7 +73,7 @@ impl Application {
         let control = Connection::open(&db)?;
         control.busy_timeout(Duration::from_secs(5))?;
         // Adapter-owned metadata. It does not change the core queue state machine.
-        control.execute_batch("CREATE TABLE IF NOT EXISTS app_cancellations(task_id INTEGER PRIMARY KEY REFERENCES tasks(id)); CREATE TABLE IF NOT EXISTS app_diagnostics(task_id INTEGER PRIMARY KEY, generation INTEGER NOT NULL, result TEXT NOT NULL);")?;
+        control.execute_batch("CREATE TABLE IF NOT EXISTS app_continuations(predecessor_id INTEGER PRIMARY KEY, key TEXT NOT NULL, payload TEXT NOT NULL, task_id INTEGER); CREATE TABLE IF NOT EXISTS app_cancellations(task_id INTEGER PRIMARY KEY REFERENCES tasks(id)); CREATE TABLE IF NOT EXISTS app_diagnostics(task_id INTEGER PRIMARY KEY, generation INTEGER NOT NULL, result TEXT NOT NULL);")?;
         Ok(Arc::new(Self {
             state: Mutex::new(StateData {
                 store,
@@ -78,6 +86,11 @@ impl Application {
         }))
     }
     pub fn submit(&self, input: Submission) -> Result<Task> {
+        if input.job.continuation.is_some() {
+            return Err(Error::Invalid(
+                "use the explicit retry endpoint to continue preserved work".into(),
+            ));
+        }
         input
             .job
             .validate(&self.config)
@@ -90,6 +103,91 @@ impl Application {
             .store
             .submit(&input.key, &payload)
             .map_err(Into::into)
+    }
+    /// One explicit successor per predecessor. Reservation precedes core submission,
+    /// and its stable key/payload make a crash between the two operations retryable.
+    pub fn retry(&self, id: i64, input: RetryRequest) -> Result<Task> {
+        if !input.confirm_stopped_and_reconciled {
+            return Err(Error::Invalid("confirm inspection of the stopped run and its possible side effects before continuing".into()));
+        }
+        if input.key.is_empty() || input.key.len() > 128 {
+            return Err(Error::Invalid("retry key must contain 1-128 bytes".into()));
+        }
+        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let StateData { store, control, .. } = &mut *state;
+        let predecessor = store.get(id)?;
+        let tx = control.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reservation: Option<(String, String)> = tx
+            .query_row(
+                "SELECT key,payload FROM app_continuations WHERE predecessor_id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (key, payload) = if let Some(reservation) = reservation {
+            reservation
+        } else {
+            if predecessor.state != relay::State::Finished {
+                return Err(Error::RecoveryRequired);
+            }
+            let result: host::RunResult =
+                serde_json::from_str(predecessor.result.as_deref().unwrap_or("")).map_err(
+                    |_| Error::Invalid("predecessor has no verified stopped host result".into()),
+                )?;
+            if !matches!(
+                result.outcome,
+                host::Outcome::Failure | host::Outcome::TimedOut | host::Outcome::Cancelled
+            ) {
+                return Err(Error::Invalid(
+                    "only stopped unsuccessful tasks can continue".into(),
+                ));
+            }
+            if result.draft_pr.is_some() {
+                return Err(Error::Invalid(
+                    "publication was attempted; local reconciliation is required".into(),
+                ));
+            }
+            let mut job = Job::from_payload(&predecessor.payload, self.host.config())
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+            job.continuation = Some(
+                workspaces::continuation(self.host.config(), &predecessor, &job)
+                    .map_err(|e| Error::Invalid(e.to_string()))?,
+            );
+            let payload = serde_json::to_string(&job).map_err(|e| Error::Invalid(e.to_string()))?;
+            let conflicting: Option<String> = tx
+                .query_row(
+                    "SELECT payload FROM tasks WHERE key=?1",
+                    [&input.key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if conflicting.is_some_and(|old| old != payload) {
+                return Err(relay::Error::IdempotencyConflict.into());
+            }
+            tx.execute(
+                "INSERT INTO app_continuations(predecessor_id,key,payload) VALUES (?1,?2,?3)",
+                params![id, input.key, payload],
+            )?;
+            (input.key, payload)
+        };
+        tx.commit()?;
+        let task = match store.submit(&key, &payload) {
+            Ok(task) => task,
+            Err(error) => {
+                if matches!(
+                    error,
+                    relay::Error::IdempotencyConflict | relay::Error::Invalid(_)
+                ) {
+                    control.execute("DELETE FROM app_continuations WHERE predecessor_id=?1 AND key=?2 AND task_id IS NULL",params![id,key])?;
+                }
+                return Err(error.into());
+            }
+        };
+        control.execute(
+            "UPDATE app_continuations SET task_id=?2 WHERE predecessor_id=?1",
+            params![id, task.id],
+        )?;
+        Ok(task)
     }
     pub fn get(&self, id: i64) -> Result<Task> {
         Ok(self
@@ -245,14 +343,34 @@ impl Application {
             state.running = None;
         }
         finished?;
+        if execution.outcome == host::Outcome::Success
+            && let Some(workspace) = &execution.workspace
+            && let Err(error) = workspaces::mark_finished(workspace, &task)
+        {
+            eprintln!(
+                "successful workspace retained because completion marker could not be saved: {error}"
+            );
+        }
         state.control.execute(
             "DELETE FROM app_cancellations WHERE task_id=?1",
             params![task.id],
         )?;
         Ok(true)
     }
+    pub fn cleanup_completed(&self) -> Result<usize> {
+        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        workspaces::cleanup(self.host.config(), &state.store)
+            .map_err(|e| Error::Invalid(e.to_string()))
+    }
     pub fn worker(&self) {
+        let mut next_cleanup = std::time::Instant::now();
         while !self.shutdown.load(Ordering::SeqCst) {
+            if std::time::Instant::now() >= next_cleanup {
+                if let Err(error) = self.cleanup_completed() {
+                    eprintln!("workspace cleanup: {error}");
+                }
+                next_cleanup = std::time::Instant::now() + Duration::from_secs(60);
+            }
             match self.work_once() {
                 Ok(true) => (),
                 Ok(false) => std::thread::sleep(Duration::from_millis(100)),

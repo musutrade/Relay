@@ -93,3 +93,7 @@ HTTP worker 遇到 host Unknown 或落库失败仍保留 claimed，不按时间�
 ## 会话适配器
 
 `app/src/app_server.rs` 负责 Codex 双向请求/响应、线程与 turn 关联、拒绝服务端权限/输入请求和有界终态校验。`app/src/sessions.rs` 只保存宿主创建的 task/workspace/role/profile 绑定与显式 ID；执行前持久化 in-flight，成功且完整回收后才可续接。Claude 使用显式 `--session-id` / `--resume`。启用续接的 reviewer 使用固定独立 checkout，继续校验精确候选和只读约束。队列内核、人工确认停止后重排以及未知副作用处理均不改变。详见 [会话续接](session-continuity.md)。
+
+## 固定工作区与续接链
+
+`app/src/workspaces.rs` 管理固定根、带 task/generation/owner 的绑定、跨父进程寿命的 supervisor 独占锁及可选成功 TTL。应用在自己的 SQLite 表预留每个失败前置任务的唯一后继，复用核心 submit 幂等性，不增加核心状态。HTTP/MCP 的显式继续校验已结束失败及现场，直接提交不能注入续接元数据。未知 claim 仍走原人工确认停止流程；发布尝试标记阻止盲目重放。所有代码、未提交工作和旧代目录都不因恢复而重新复制或清空。详见 [固定工作区与继续](workspace-continuation.md)。

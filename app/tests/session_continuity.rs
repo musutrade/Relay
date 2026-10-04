@@ -35,14 +35,14 @@ if mode=='sleep':
 if mode=='oversize': print('x'*65537,flush=True); time.sleep(60)
 if mode=='malformed': print('bad',flush=True); time.sleep(60)
 if mode=='wrong': turn='wrong-turn'
-if n: assert 'Fix the fixture issue' in p['input'][0]['text']
+if n and os.environ.get('RELAY_WORKFLOW_ROUND')=='1': assert 'Fix the fixture issue' in p['input'][0]['text']
 pathlib.Path('changed.txt').write_text('round '+str(n))
 count.write_text(str(n+1))
 for method in ['turn/diff/updated','turn/plan/updated','turn/moderationMetadata']:
     send({'method':method,'params':{'threadId':'developer-thread','turnId':turn}})
 send({'method':'item/completed','params':{'threadId':'developer-thread','turnId':turn,'item':{'type':'agentMessage','phase':'final_answer','text':'done'}}})
 if mode=='missing': sys.exit(0)
-send({'method':'turn/completed','params':{'threadId':'developer-thread','turn':{'id':turn,'status':'failed' if mode=='failed' else 'completed','error':None}}})
+send({'method':'turn/completed','params':{'threadId':'developer-thread','turn':{'id':turn,'status':'failed' if mode=='failed' or (mode=='fail_once' and n==0) else 'completed','error':None}}})
 # Real app-server stays alive after its turn. Relay must stop and reap it.
 time.sleep(60)
 "#;
@@ -218,7 +218,7 @@ fn app_server_timeout_and_cancellation_stop_process_before_returning() {
         let host = Host::new(f.config.clone()).unwrap();
         let cancellation = Arc::new(AtomicBool::new(false));
         let stop = cancellation.clone();
-        let root = f.config.workspace_root.join("task-1-generation-1");
+        let root = f.config.workspace_root.join("task-1");
         let run = std::thread::spawn(move || host.execute(&task, cancellation));
         let marker = root.join("repository/.git/started");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -247,4 +247,49 @@ fn app_server_timeout_and_cancellation_stop_process_before_returning() {
                 .unwrap();
         assert_eq!(state["ready"], false);
     }
+}
+
+#[test]
+fn explicitly_retried_failed_app_server_turn_resumes_checkpointed_id_and_files() {
+    let mut f = Fixture::new("codex_app_server", false);
+    f.config
+        .native_agents
+        .get_mut("developer")
+        .unwrap()
+        .env
+        .insert("MODE".into(), "fail_once".into());
+    let app =
+        relay_app::Application::open(f._temp.path().join("retry.db"), f.config.clone()).unwrap();
+    let job = serde_json::from_str(&f.task(1).payload).unwrap();
+    app.submit(relay_app::Submission {
+        key: "first".into(),
+        job,
+    })
+    .unwrap();
+    app.work_once().unwrap();
+    let first: relay_app::host::RunResult =
+        serde_json::from_str(app.get(1).unwrap().result.as_ref().unwrap()).unwrap();
+    assert_eq!(first.outcome, Outcome::Failure);
+    let root = first.workspace.unwrap();
+    let before: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("sessions/developer.json")).unwrap()).unwrap();
+    assert_eq!(before["session_id"], "developer-thread");
+    assert_eq!(before["ready"], false);
+    app.retry(
+        1,
+        relay_app::RetryRequest {
+            key: "continue".into(),
+            confirm_stopped_and_reconciled: true,
+        },
+    )
+    .unwrap();
+    app.work_once().unwrap();
+    let next: relay_app::host::RunResult =
+        serde_json::from_str(app.get(2).unwrap().result.as_ref().unwrap()).unwrap();
+    assert_eq!(next.outcome, Outcome::Success, "{next:?}");
+    assert_eq!(next.workspace.as_ref(), Some(&root));
+    assert_eq!(
+        fs::read_to_string(root.join("repository/.git/turn-count")).unwrap(),
+        "2"
+    );
 }

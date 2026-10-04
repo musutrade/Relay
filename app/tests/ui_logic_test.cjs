@@ -21,7 +21,7 @@ const document={getElementById:id=>{assert(nodes.has(id),'missing '+id);return n
 const $=id=>nodes.get(id),tick=()=>new Promise(r=>setTimeout(r,0));
 const task=(id,state='queued',outcome=null)=>({id,key:'key-'+id,payload:JSON.stringify({repository:'repo',agent:'agent',test:null,publish:false,requirements:'需求 '+id}),state,generation:state==='queued'?0:1,owner:state==='queued'?null:'host',result:outcome?JSON.stringify({outcome}):null});
 let config={repositories:['repo'],agents:['agent'],tests:['test']};
-let db=[task(3),task(2,'claimed'),task(1,'finished','success')],status={active:task(2,'claimed'),recovery_required:false,diagnostic:null},requests=[],submissions=[],mode='success',pendingFetch=[],failList=false,delayList=false,delayDetail=false,delayPost=false,delayConfig=false,ignoreAbort=false;
+let db=[task(3),task(2,'claimed'),task(1,'finished','success')],status={active:task(2,'claimed'),recovery_required:false,diagnostic:null},requests=[],submissions=[],retries=[],mode='success',pendingFetch=[],failList=false,delayList=false,delayDetail=false,delayPost=false,delayConfig=false,ignoreAbort=false;
 const authMode=process.argv.includes('--session')?'session':process.argv.includes('--hybrid')?'hybrid':'bearer';
 let cookieAuthenticated=process.argv.includes('--restore'),rejectLogin=false,failLogout=false;
 async function fetch(url,opts){assert.equal(opts.headers.Authorization,authMode==='bearer'&&url.startsWith('/api/')?'Bearer test-token':undefined);assert.equal(opts.redirect,'error');assert.equal(opts.credentials,authMode==='bearer'&&url.startsWith('/api/')?'omit':'same-origin');requests.push({url,opts});let code=200,data;
@@ -33,10 +33,19 @@ async function fetch(url,opts){assert.equal(opts.headers.Authorization,authMode=
  else if(url==='/api/status')data=status;
  else if(url==='/api/tasks'&&opts.method==='GET'){if(failList)throw new TypeError('offline');data=db;}
  else if(url==='/api/tasks'&&opts.method==='POST'){const body=JSON.parse(opts.body);submissions.push(body);assert.equal(body.job.publish,false);if(mode==='abort')throw new TypeError('offline');if(mode==='401'||mode==='422'){code=Number(mode);data={error:mode==='401'?'Unauthorized':'Unknown workflow'}}else{data=db.find(t=>t.key===body.key)||{...task(Math.max(...db.map(t=>t.id))+1),key:body.key,payload:JSON.stringify(body.job)};db=[data,...db.filter(t=>t.id!==data.id)];}}
+ else if(url.endsWith('/retry')) {
+  const id=Number(url.split('/').at(-2)),body=JSON.parse(opts.body);retries.push({id,...body});
+  if(mode==='abort')throw new TypeError('offline');
+  if(mode==='401'){code=401;data={error:'Unauthorized'}}else{
+   data=db.find(t=>JSON.parse(t.payload).continuation?.predecessor_task_id===id);
+   if(!data){const old=db.find(t=>t.id===id);data={...task(Math.max(...db.map(t=>t.id))+1),key:body.key,payload:JSON.stringify({...JSON.parse(old.payload),continuation:{workspace_task_id:id,predecessor_task_id:id,predecessor_generation:1}})};}
+   db=[data,...db.filter(t=>t.id!==data.id)];
+  }
+ }
  else if(url.endsWith('/cancel'))data={requested:true};
  else data=db.find(t=>t.id===Number(url.split('/').at(-1)));
  const response={ok:code===200,status:code,json:async()=>JSON.parse(JSON.stringify(data))};
- if((delayConfig&&url==='/api/config')||(delayDetail&&/\/tasks\/\d+$/.test(url))||(delayPost&&opts.method==='POST'&&url==='/api/tasks')||(delayList&&opts.method==='GET'&&url==='/api/tasks'))return await new Promise((resolve,reject)=>{pendingFetch.push({url,resolve:()=>resolve(response)});if(!ignoreAbort)opts.signal.addEventListener('abort',()=>{const err=new Error('abort');err.name='AbortError';reject(err)})});
+ if((delayConfig&&url==='/api/config')||(delayDetail&&/\/tasks\/\d+$/.test(url))||(delayPost&&opts.method==='POST'&&(url==='/api/tasks'||url.endsWith('/retry')))||(delayList&&opts.method==='GET'&&url==='/api/tasks'))return await new Promise((resolve,reject)=>{pendingFetch.push({url,resolve:()=>resolve(response)});if(!ignoreAbort)opts.signal.addEventListener('abort',()=>{const err=new Error('abort');err.name='AbortError';reject(err)})});
  return response;
 }
 const window={matchMedia:()=>({matches:false,addEventListener(){}}),addEventListener:(name,fn)=>windowEvents.set(name,fn)};
@@ -93,6 +102,12 @@ vm.runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1],ctx);
  status={active:null,recovery_required:false,diagnostic:null};await $('refresh').emit('click');await tick();delayDetail=true;const oldSelection=select(109);await tick();const newSelection=select(110);await tick();const responses=pendingFetch;pendingFetch=[];responses.find(x=>x.url.endsWith('/110')).resolve();await tick();responses.find(x=>x.url.endsWith('/109')).resolve();await tick();await Promise.all([oldSelection,newSelection]);assert.equal($('detail-title').textContent,'任务 #110');delayDetail=false;
  // Network failure retains prior task list and recovers on successful sync.
  failList=true;await $('refresh').emit('click');await tick();assert(!$('network-banner').hidden);assert.equal(buttons().length,3);failList=false;await $('refresh-error').emit('click');await tick();assert($('network-banner').hidden);
+ // Preserved-work continuation is explicit, idempotent after ambiguous network completion, and double-click guarded.
+ const failed={...task(120,'finished','failure'),result:JSON.stringify({outcome:'failure',workspace:'/private/task-120',draft_pr:null})};db=[failed,...db];await $('refresh').emit('click');await select(120);assert(!$('retry-task').hidden);assert(!$('retry-task').disabled);
+ await $('retry-task').emit('click');assert($('retry-dialog').open);await $('retry-dismiss').emit('click');assert.equal(retries.length,0);
+ mode='abort';await $('retry-task').emit('click');await $('retry-confirm').emit('click');assert.equal(retries.length,1);const originalRetry=retries[0];assert.match($('detail-error').textContent,/续接未确认/);
+ mode='success';delayPost=true;await $('retry-task').emit('click');const continuing=$('retry-confirm').emit('click');await tick();await $('retry-confirm').emit('click');assert.equal(retries.length,2);assert.deepEqual(retries[1],originalRetry);assert($('retry-task').disabled);delayPost=false;pendingFetch.find(x=>x.url.endsWith('/retry')).resolve();pendingFetch=[];await continuing;await tick();assert.equal($('detail-title').textContent,'任务 #121');assert.match($('detail-meta').textContent,/续接自#120/);
+ failed.result=JSON.stringify({outcome:'failure',workspace:'/private/task-120',draft_pr:{outcome:'failure'}});await select(120);assert($('retry-task').disabled);assert.match($('cancel-note').textContent,/发布已尝试/);
  // Expired auth preserves unresolved workflow submission even if the new config removes its profiles.
  await chooseWorkflow('reviewed');$('requirements').value='令牌中断测试';mode='401';await $('task-form').emit('submit');assert(!$('auth-panel').hidden);assert.equal($('token').value,'');const authPending=submissions.at(-1);assert.equal(authPending.job.workflow,'reviewed');assert($('workflow-field').hidden);assert.equal($('workflow').value,'');assert.equal($('workflow-hint').textContent,'');config={repositories:['repo'],agents:['agent'],tests:['test'],workflows:[]};mode='success';$('token').value='test-token';await $('auth-form').emit('submit');assert.equal($('requirements').value,authPending.job.requirements);assert.equal($('workflow').value,'reviewed');assert.equal($('agent').value,'native-dev');assert(!$('workflow-field').hidden);assert($('workflow').disabled);assert.match($('workflow-hint').textContent,/相同工作流与参数/);await $('task-form').emit('submit');await tick();assert.deepEqual(submissions.at(-1),authPending);assert.equal($('workflow').value,'');assert($('workflow-field').hidden);assert.equal($('agent').value,'agent');assert(!$('agent').disabled);
  // Logout cancels outstanding reads, clears data, and prevents stale updates.

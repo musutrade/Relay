@@ -50,19 +50,20 @@
       </section>
       <section class="panel queue" aria-labelledby="queue-title"><div class="queue-header"><div class="panel-head"><h2 id="queue-title" class="section-label"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="1.7"/><path d="M9 4v16" stroke="currentColor" stroke-width="1.7"/></svg>任务队列</h2><button id="refresh" type="button" class="text-button" disabled aria-label="刷新任务队列">刷新 ↻</button></div><div class="queue-tools"><div class="filters" role="group" aria-label="筛选任务状态"><button class="filter" data-filter="all" type="button" aria-pressed="true">全部</button><button class="filter" data-filter="queued" type="button" aria-pressed="false">排队中</button><button class="filter" data-filter="claimed" type="button" aria-pressed="false">已领取</button><button class="filter" data-filter="finished" type="button" aria-pressed="false">已结束</button></div><span id="sync-time" class="sync-time">连接后每 2 秒同步</span></div></div>
         <div id="queue-empty" class="empty"><div class="empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7h16v13H4V7Zm3-4h10v4H7V3Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M9 12h6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></div><h3 id="empty-title">等待你的第一份交接</h3><p id="empty-description">连接工作台后，提交需求并查看任务进展</p></div>
-        <div id="queue-body" class="queue-body" hidden><ul id="task-list" class="task-list" aria-label="任务列表"></ul><div id="detail-empty" class="empty" hidden><h3>选择一个任务</h3><p>在左侧列表查看需求、状态和结果</p></div><article id="task-detail" class="detail" aria-labelledby="detail-title" hidden><div class="detail-head"><div><h3 id="detail-title" class="detail-title"></h3><p id="detail-key" class="detail-subtitle"></p></div><span id="detail-badge" class="badge"></span></div><p id="detail-warning" class="detail-warning" role="status" hidden></p><section id="detail-diagnostic" class="detail-section" hidden><div class="detail-section-head"><h3>宿主诊断 · 尚未确认结束</h3></div><pre id="detail-diagnostic-text" class="result" tabindex="0" aria-label="当前任务宿主诊断"></pre></section><dl id="detail-meta" class="detail-meta"></dl><section class="detail-section"><div class="detail-section-head"><h3>任务需求</h3></div><div id="detail-requirements" class="content-text" tabindex="0" aria-label="完整任务需求"></div></section><section class="detail-section"><div class="detail-section-head"><h3>执行结果</h3><button id="copy-result" type="button" class="text-button" hidden>复制结果</button></div><pre id="detail-result" class="result" tabindex="0" aria-label="完整执行结果" hidden></pre><p id="result-placeholder" class="result-placeholder"></p></section><p id="detail-error" class="detail-error" role="alert" hidden></p><div class="detail-actions"><button id="cancel-task" type="button" class="button small danger">请求取消</button><span id="cancel-note" class="cancel-note"></span></div></article></div>
+        <div id="queue-body" class="queue-body" hidden><ul id="task-list" class="task-list" aria-label="任务列表"></ul><div id="detail-empty" class="empty" hidden><h3>选择一个任务</h3><p>在左侧列表查看需求、状态和结果</p></div><article id="task-detail" class="detail" aria-labelledby="detail-title" hidden><div class="detail-head"><div><h3 id="detail-title" class="detail-title"></h3><p id="detail-key" class="detail-subtitle"></p></div><span id="detail-badge" class="badge"></span></div><p id="detail-warning" class="detail-warning" role="status" hidden></p><section id="detail-diagnostic" class="detail-section" hidden><div class="detail-section-head"><h3>宿主诊断 · 尚未确认结束</h3></div><pre id="detail-diagnostic-text" class="result" tabindex="0" aria-label="当前任务宿主诊断"></pre></section><dl id="detail-meta" class="detail-meta"></dl><section class="detail-section"><div class="detail-section-head"><h3>任务需求</h3></div><div id="detail-requirements" class="content-text" tabindex="0" aria-label="完整任务需求"></div></section><section class="detail-section"><div class="detail-section-head"><h3>执行结果</h3><button id="copy-result" type="button" class="text-button" hidden>复制结果</button></div><pre id="detail-result" class="result" tabindex="0" aria-label="完整执行结果" hidden></pre><p id="result-placeholder" class="result-placeholder"></p></section><p id="detail-error" class="detail-error" role="alert" hidden></p><div class="detail-actions"><button id="cancel-task" type="button" class="button small danger">请求取消</button><button id="retry-task" type="button" class="button small" hidden>继续保留的工作</button><span id="cancel-note" class="cancel-note"></span></div></article></div>
       </section>
     </div>
     <details class="help"><summary>使用说明与安全边界</summary><ol><li>使用当前服务配置的 Bearer 令牌连接。令牌只存于页面内存；刷新页面或断开连接后需重新输入</li><li>只能选择服务端允许的仓库、Agent 与测试配置。需求及结果按纯文本显示，不执行其中的 HTML 或命令</li><li>列表显示服务端返回的最近任务，并始终包含当前已领取任务；概况数字仅统计当前列表。任务按队列串行领取。“已结束”表示结果已落库，具体成功、失败或未知状态请查看执行结果</li><li>提交遇到网络故障时，请使用“重试原提交”。页面会复用同一幂等键，不会因为重试生成新任务；确认前不要刷新或关闭页面</li><li>取消是请求，不代表进程已经停止。遇到需要恢复或结果未知的任务，请由可信宿主检查后处理</li><li>可用 Tab 在控件间移动，Enter 或空格激活按钮，Escape 关闭取消确认框。配色默认跟随系统，右上角可切换</li></ol></details><footer class="help-footer"><span>Relay · 可靠交接，清晰边界</span><span>任务状态持久化于本地 · 页面不自动发布</span></footer>
     <p id="announcement" class="sr-only" role="status" aria-live="polite"></p>
   </main>
+  <dialog id="retry-dialog" aria-labelledby="retry-dialog-title"><h2 id="retry-dialog-title">继续保留的工作？</h2><p>将创建新的任务编号，沿用原需求、配置和工作目录，不从源仓库重新复制。请先检查失败结果，确认旧执行已停止，并已核对可能发生的外部操作。发布或未知执行须由可信宿主先行核对。若要从头开始，请使用提交新任务表单</p><div class="dialog-actions"><button id="retry-dismiss" class="button" type="button" autofocus>暂不继续</button><button id="retry-confirm" class="button" type="button">已核对，继续保留的工作</button></div></dialog>
   <dialog id="cancel-dialog" aria-labelledby="cancel-dialog-title" aria-describedby="cancel-dialog-description"><h2 id="cancel-dialog-title">请求取消任务？</h2><p id="cancel-dialog-description">取消请求会交给宿主处理。发送成功不代表执行进程已经停止；请继续查看任务状态与结果</p><div class="dialog-actions"><button id="cancel-dismiss" class="button" type="button" autofocus>继续保留</button><button id="cancel-confirm" class="button danger" type="button">发送取消请求</button></div></dialog>
   <script>
   (() => {
     'use strict';
     const $ = id => document.getElementById(id);
     const fields = ['workflow', 'repository', 'requirements', 'agent', 'test'];
-    const state = { authMode: null, loggingOut: false, token: '', session: 0, authenticated: false, connecting: false, controllers: new Set(), timer: null, syncing: false, refreshAgain: false, revision: 0, tasks: [], config: null, ordinarySelection: null, status: null, selectedId: null, selection: 0, detailController: null, filter: 'all', pending: null, submitting: false, submitVersion: 0, canceling: new Set(), cancelRequested: new Set(), cancelTarget: null, online: false };
+    const state = { authMode: null, loggingOut: false, token: '', session: 0, authenticated: false, connecting: false, controllers: new Set(), timer: null, syncing: false, refreshAgain: false, revision: 0, tasks: [], config: null, ordinarySelection: null, status: null, selectedId: null, selection: 0, detailController: null, filter: 'all', pending: null, submitting: false, submitVersion: 0, canceling: new Set(), cancelRequested: new Set(), cancelTarget: null, retryTarget: null, retrying: new Set(), retryKeys: new Map(), online: false };
     class ApiError extends Error { constructor(message, status = 0) { super(message); this.status = status; } }
     function announce(message) { $('announcement').textContent = message; }
     function showMessage(id, message, kind = '') { const node = $(id); node.textContent = message; node.hidden = !message; if (id === 'form-message') node.className = 'form-message ' + kind; }
@@ -164,11 +165,13 @@
       clearTimeout(state.timer); state.timer = null;
       for (const controller of state.controllers) controller.abort(); state.controllers.clear();
       if (state.detailController) state.detailController.abort(); state.detailController = null;
-      state.tasks = []; state.status = null; state.config = null; state.ordinarySelection = null; state.selectedId = null; state.submitting = false; state.canceling.clear(); state.cancelRequested.clear(); state.cancelTarget = null;
+      state.tasks = []; state.status = null; state.config = null; state.ordinarySelection = null; state.selectedId = null; state.submitting = false; state.canceling.clear(); state.cancelRequested.clear(); state.cancelTarget = null; state.retryTarget = null; state.retrying.clear();
       if (!preservePending) { state.pending = null; $('requirements').value = ''; showMessage('form-message', ''); }
       $('token').value = ''; $('password').value = ''; $('auth-panel').hidden = false; updateAuthForm();
       $('network-banner').hidden = true; $('recovery-banner').hidden = true; $('sync-time').textContent = '连接后每 2 秒同步';
       if ($('cancel-dialog').open) $('cancel-dialog').close();
+      if ($('retry-dialog').open) $('retry-dialog').close();
+      if (!preservePending) state.retryKeys.clear();
       populateSelect('workflow', [], '普通任务（不使用工作流）'); populateSelect('repository', [], '连接后选择仓库'); populateSelect('agent', [], '连接后选择'); populateSelect('test', [], '不指定');
       updateConnection(); updateForm(); render();
     }
@@ -245,7 +248,7 @@
       $('task-detail').hidden = !task; $('detail-empty').hidden = Boolean(task); if (!task) { ['detail-title', 'detail-key', 'detail-badge', 'detail-meta', 'detail-requirements', 'detail-result', 'detail-diagnostic-text', 'detail-error', 'detail-warning', 'result-placeholder', 'cancel-note'].forEach(id => { $(id).textContent = ''; }); return; }
       const job = jobFor(task), result = resultFor(task), unknown = badgeFor(task).kind === 'unknown';
       $('detail-title').textContent = '任务 #' + task.id; $('detail-key').textContent = task.key; setBadge($('detail-badge'), task);
-      $('detail-meta').replaceChildren(); addMeta('仓库', job.repository); if (typeof job.workflow === 'string' && job.workflow) addMeta('审查工作流', job.workflow); addMeta('Agent', job.agent); addMeta('测试配置', job.test || '未指定'); addMeta('领取代次', task.generation); addMeta('执行持有者', task.owner); addMeta('自动发布', job.publish === true ? '已请求（检查结果）' : '关闭');
+      $('detail-meta').replaceChildren(); addMeta('仓库', job.repository); if (typeof job.workflow === 'string' && job.workflow) addMeta('审查工作流', job.workflow); addMeta('Agent', job.agent); addMeta('测试配置', job.test || '未指定'); if (job.continuation) addMeta('续接自', '#' + job.continuation.predecessor_task_id); addMeta('领取代次', task.generation); addMeta('执行持有者', task.owner); addMeta('自动发布', job.publish === true ? '已请求（检查结果）' : '关闭');
       const diagnostic = diagnosticFor(task), parsedDiagnostic = diagnostic ? parseJson(diagnostic) : null;
       $('detail-diagnostic').hidden = !diagnostic; $('detail-diagnostic-text').textContent = diagnostic ? (parsedDiagnostic === null ? diagnostic : JSON.stringify(parsedDiagnostic, null, 2)) : '';
       $('detail-requirements').textContent = requirementsFor(task);
@@ -257,6 +260,12 @@
       $('cancel-task').disabled = finished || requested || canceling || recovery || !state.authenticated || unknown;
       $('cancel-task').textContent = canceling ? '正在请求…' : requested ? '已请求取消' : '请求取消';
       $('cancel-note').textContent = finished ? '已结束的任务不可取消' : requested ? '等待宿主确认停止，请继续查看结果' : recovery ? '需先由可信宿主核对执行状态' : '取消请求不等于执行已停止';
+      const stoppedFailure = finished && ['failure', 'timed_out', 'cancelled'].includes(resultState(task));
+      const parsedResult = parseJson(result || '{}') || {}, retrying = state.retrying.has(task.id);
+      $('retry-task').hidden = !stoppedFailure;
+      $('retry-task').disabled = !state.authenticated || recovery || retrying || !parsedResult.workspace || Boolean(parsedResult.draft_pr);
+      $('retry-task').textContent = retrying ? '正在续接…' : '继续保留的工作';
+      if (stoppedFailure) $('cancel-note').textContent = parsedResult.draft_pr ? '发布已尝试，需先核对外部结果后本机恢复' : !parsedResult.workspace ? '没有可复用工作区，请提交新任务' : recovery ? '需先核对未知执行，暂不能续接' : '续接复用原工作区；从头开始请提交新任务';
     }
     async function selectTask(id) {
       if (!state.authenticated) return;
@@ -370,6 +379,24 @@
       try { const response = await api('/api/tasks/' + encodeURIComponent(id) + '/cancel', { method: 'POST' }); if (!response || response.requested !== true) throw new ApiError('服务端未确认取消请求'); if (session !== state.session) return; state.cancelRequested.add(id); state.revision++; announce('已请求取消任务 ' + id + '，等待宿主确认停止'); }
       catch (error) { if (session !== state.session || isAborted(error)) return; if (error.status === 401 || error.status === 403) handleReadError(error, session); else if (state.selectedId === id) showMessage('detail-error', '取消请求未确认：' + formatError(error) + '。请先刷新状态，再决定是否重试'); }
       finally { if (session === state.session) { state.canceling.delete(id); renderDetail(); refresh(); } }
+    });
+    $('retry-task').addEventListener('click', () => { const task = state.tasks.find(task => task.id === state.selectedId); if (!task || $('retry-task').disabled) return; state.retryTarget = task.id; $('retry-dialog-title').textContent = '继续任务 #' + task.id + ' 保留的工作？'; $('retry-dialog').showModal(); });
+    $('retry-dismiss').addEventListener('click', () => $('retry-dialog').close());
+    $('retry-dialog').addEventListener('close', () => { state.retryTarget = null; });
+    $('retry-confirm').addEventListener('click', async () => {
+      const id = state.retryTarget, session = state.session; $('retry-dialog').close();
+      if (!state.authenticated || id === null || state.retrying.has(id) || (state.status && state.status.recovery_required)) return;
+      const task = state.tasks.find(task => task.id === id); if (!task || task.state !== 'finished' || !['failure', 'timed_out', 'cancelled'].includes(resultState(task))) return;
+      if (!state.retryKeys.has(id)) state.retryKeys.set(id, crypto.randomUUID());
+      const key = state.retryKeys.get(id); state.retrying.add(id); renderDetail(); showMessage('detail-error', '');
+      try {
+        const response = await api('/api/tasks/' + encodeURIComponent(id) + '/retry', { method: 'POST', body: { key, confirm_stopped_and_reconciled: true } });
+        if (session !== state.session) return;
+        if (!validTask(response)) throw new ApiError('服务端续接任务格式不符合预期'); const next = response; if (jobFor(next).continuation?.predecessor_task_id !== id) throw new ApiError('服务端续接任务不匹配');
+        state.retryKeys.delete(id); state.tasks = [next, ...state.tasks.filter(task => task.id !== next.id)]; state.revision++;
+        announce('已创建续接任务 ' + next.id + '，沿用原工作区'); await selectTask(next.id);
+      } catch (error) { if (session === state.session) { handleReadError(error, session); if (state.authenticated && id === state.selectedId) showMessage('detail-error', '续接未确认：' + formatError(error) + '。再次操作会查询同一次续接，不创建副本'); } }
+      finally { if (session === state.session) { state.retrying.delete(id); renderDetail(); refresh(); } }
     });
     $('copy-result').addEventListener('click', async () => { const id = state.selectedId, session = state.session; try { if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error('unavailable'); await navigator.clipboard.writeText($('detail-result').textContent); if (session === state.session && id === state.selectedId) { $('copy-result').textContent = '已复制'; announce('执行结果已复制'); } } catch (_) { if (session === state.session && id === state.selectedId) { showMessage('detail-error', '浏览器未允许复制，请选中结果文本后手动复制'); $('detail-result').focus(); } } });
     const darkPreference = window.matchMedia('(prefers-color-scheme: dark)');

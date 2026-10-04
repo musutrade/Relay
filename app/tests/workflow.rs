@@ -154,9 +154,7 @@ impl Fixture {
             .execute(&self.task(publish), Arc::new(AtomicBool::new(false)))
     }
     fn repository(&self) -> PathBuf {
-        self.config
-            .workspace_root
-            .join("task-1-generation-1/repository")
+        self.config.workspace_root.join("task-1/repository")
     }
     fn review(&mut self, mode: &str) {
         self.config
@@ -708,4 +706,56 @@ fn developer_cannot_replace_repository_root_with_source_symlink() {
     assert!(result.error.unwrap().contains("redirected"));
     assert_eq!(git(&f.source, &["rev-parse", "HEAD"]), base);
     assert!(!f.source.join("changed.txt").exists());
+}
+
+#[test]
+fn preserved_workflow_recovery_never_resets_missing_or_changed_baselines() {
+    for change in ["missing-base", "source-head", "candidate-head"] {
+        let mut fixture = Fixture::new();
+        fixture.test("fail");
+        let first = fixture.run(false);
+        assert_eq!(first.outcome, Outcome::Failure);
+        let root = first.workspace.unwrap();
+        fs::write(
+            fixture.repository().join("salvage.txt"),
+            "unfinished user work",
+        )
+        .unwrap();
+        match change {
+            "missing-base" => {
+                fs::remove_file(root.join("workflow-base.txt")).unwrap();
+            }
+            "source-head" => {
+                git(
+                    &fixture.source,
+                    &["commit", "--allow-empty", "-m", "new source base"],
+                );
+            }
+            "candidate-head" => {
+                git(
+                    &fixture.repository(),
+                    &["commit", "--allow-empty", "-m", "unexpected candidate"],
+                );
+            }
+            _ => unreachable!(),
+        }
+        let mut task = fixture.task(false);
+        task.generation = 2;
+        task.owner = Some("recovered-owner".into());
+        let result = Host::new(fixture.config.clone())
+            .unwrap()
+            .execute(&task, Arc::new(AtomicBool::new(false)));
+        assert_eq!(result.outcome, Outcome::Failure, "{change}: {result:?}");
+        assert!(result.agent.is_none());
+        assert_eq!(
+            fs::read_to_string(fixture.repository().join("salvage.txt")).unwrap(),
+            "unfinished user work"
+        );
+        assert_eq!(
+            fs::read_dir(fixture.config.workspace_root.clone())
+                .unwrap()
+                .count(),
+            1
+        );
+    }
 }

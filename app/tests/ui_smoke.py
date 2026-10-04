@@ -41,6 +41,15 @@ with sync_playwright() as p:
             if data['post']=='401': r.fulfill(status=401,content_type='application/json',body=json.dumps({'error':'Unauthorized'}));return
             result={'id':max(t['id'] for t in data['tasks'])+1,'key':body['key'],'payload':json.dumps(body['job'],ensure_ascii=False),'state':'queued','generation':0,'owner':None,'result':None}
             data['tasks'].append(result)
+        elif path.endswith('/retry'):
+            old_id=int(path.split('/')[-2]);body=req.post_data_json
+            assert body['confirm_stopped_and_reconciled'] is True
+            old=next(t for t in data['tasks'] if t['id']==old_id)
+            result=next((t for t in data['tasks'] if json.loads(t['payload']).get('continuation',{}).get('predecessor_task_id')==old_id),None)
+            if result is None:
+                job=json.loads(old['payload']);job['continuation']={'workspace_task_id':old_id,'predecessor_task_id':old_id,'predecessor_generation':1}
+                result=task(max(t['id'] for t in data['tasks'])+1);result['key']=body['key'];result['payload']=json.dumps(job)
+                data['tasks'].append(result)
         elif path.endswith('/cancel'): result={'requested':True}
         elif path.startswith('/api/tasks/'): result=next(t for t in data['tasks'] if t['id']==int(path.rsplit('/',1)[-1]))
         else: raise Exception(path)
@@ -183,6 +192,19 @@ with sync_playwright() as p:
     assert page.locator('#workflow-hint').inner_text()==''
     page.locator('#token').fill('test-token');page.locator('#connect').click();page.locator('#auth-panel').wait_for(state='hidden')
     page.locator('#workflow').select_option('reviewed')
+    # Explicit preserved-work continuation and confirmation fit desktop/mobile layouts.
+    failed=task(120,'finished',outcome='failure');failed['result']=json.dumps({'outcome':'failure','workspace':'/fixture/task-120','draft_pr':None})
+    data['tasks'].append(failed);data['status']={'active':None,'recovery_required':False,'diagnostic':None}
+    page.locator('#refresh').click();page.wait_for_timeout(200);page.locator('[data-task-id="120"]').click();page.wait_for_timeout(100)
+    assert page.locator('#retry-task').is_enabled()
+    page.locator('#retry-task').click();assert page.locator('#retry-dialog').is_visible()
+    assert '不从源仓库重新复制' in page.locator('#retry-dialog').inner_text()
+    page.screenshot(path=str(SCREENSHOTS / 'relay-continue-mobile.png'),full_page=True)
+    page.locator('#retry-dismiss').click();assert not page.locator('#retry-dialog').is_visible()
+    page.locator('#retry-task').click();page.locator('#retry-confirm').click();page.wait_for_timeout(200)
+    assert page.locator('#detail-title').inner_text()=='任务 #121'
+    assert '续接自' in page.locator('#detail-meta').inner_text()
+    assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
     # Logout clears sensitive task content and stops polling.
     page.locator('#logout').click();after_logout=len(requests);page.wait_for_timeout(2400)
     assert len(requests)==after_logout

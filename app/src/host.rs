@@ -18,8 +18,8 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -84,6 +84,9 @@ pub struct HostConfig {
     pub max_snapshot_entries: usize,
     #[serde(default = "default_retained_workspaces")]
     pub max_retained_workspaces: usize,
+    /// Opt-in TTL applies only to durably finished successful workspaces.
+    #[serde(default)]
+    pub successful_workspace_retention_seconds: Option<u64>,
     /// Override only for packaging/tests; must implement `__relay_host_supervisor`.
     #[serde(default)]
     pub supervisor_program: Option<PathBuf>,
@@ -92,6 +95,8 @@ pub struct HostConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<crate::workspaces::Continuation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<String>,
     pub repository: String,
@@ -141,6 +146,13 @@ impl Job {
     }
 
     pub fn validate(&self, config: &HostConfig) -> Result<(), HostError> {
+        if self.continuation.as_ref().is_some_and(|c| {
+            c.workspace_task_id <= 0
+                || c.predecessor_task_id < c.workspace_task_id
+                || c.predecessor_generation <= 0
+        }) {
+            return Err(HostError::Job("invalid continuation reference".into()));
+        }
         if self.requirements.trim().is_empty() || self.requirements.len() > MAX_REQUIREMENTS {
             return Err(HostError::Job(
                 "requirements must contain 1–32768 UTF-8 bytes".into(),
@@ -315,7 +327,20 @@ impl RunResult {
 pub struct Host {
     config: HostConfig,
     supervisor: PathBuf,
+    leases: Mutex<BTreeMap<PathBuf, Arc<File>>>,
 }
+struct ExecutionLease<'a> {
+    leases: &'a Mutex<BTreeMap<PathBuf, Arc<File>>>,
+    path: PathBuf,
+}
+impl Drop for ExecutionLease<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut leases) = self.leases.lock() {
+            leases.remove(&self.path);
+        }
+    }
+}
+const SUPERVISOR_LEASE_FD: i32 = 198;
 impl Host {
     pub fn new(mut config: HostConfig) -> Result<Self, HostError> {
         if !cfg!(target_os = "linux") {
@@ -340,6 +365,14 @@ impl Host {
         {
             return Err(HostError::Config(
                 "snapshot limit is outside supported bounds".into(),
+            ));
+        }
+        if config
+            .successful_workspace_retention_seconds
+            .is_some_and(|seconds| !(60..=31_536_000).contains(&seconds))
+        {
+            return Err(HostError::Config(
+                "successful_workspace_retention_seconds must be 60–31536000, or omitted".into(),
             ));
         }
         if config.max_retained_workspaces == 0 || config.max_retained_workspaces > 10_000 {
@@ -439,7 +472,11 @@ impl Host {
                 "supervisor must be an existing absolute executable path".into(),
             ));
         }
-        Ok(Self { config, supervisor })
+        Ok(Self {
+            config,
+            supervisor,
+            leases: Mutex::new(BTreeMap::new()),
+        })
     }
 
     pub fn config(&self) -> &HostConfig {
@@ -463,56 +500,65 @@ impl Host {
             Ok(job) => job,
             Err(error) => return RunResult::new(Outcome::Failure, Some(error.to_string())),
         };
-        let prior_workspace = self
-            .config
-            .workspace_root
-            .join(format!("task-{}-generation-{}", task.id, task.generation));
-        if fs::symlink_metadata(&prior_workspace).is_ok() {
-            let mut result = RunResult::new(
-                Outcome::Unknown,
-                Some(
-                    "generation workspace already exists; inspect old execution before recovery"
-                        .into(),
-                ),
-            );
-            result.workspace = Some(prior_workspace);
-            return result;
-        }
-        if cancellation.load(Ordering::Acquire) {
+        if cancellation.load(Ordering::Acquire)
+            && !crate::workspaces::exists_for(&self.config, task, &job)
+        {
             return RunResult::new(Outcome::Cancelled, None);
         }
-        let started = Instant::now();
-        let deadline = started + Duration::from_secs(self.config.timeout_seconds);
-        match fs::read_dir(&self.config.workspace_root) {
-            Ok(entries) => {
-                if entries.take(self.config.max_retained_workspaces).count()
-                    >= self.config.max_retained_workspaces
-                {
-                    return RunResult::new(Outcome::Failure, Some("workspace retention limit reached; trusted operator cleanup is required".into()));
-                }
-            }
-            Err(error) => return RunResult::new(Outcome::Failure, Some(error.to_string())),
+        let workspace_state = match crate::workspaces::prepare(&self.config, task, &job) {
+            Ok(value) => value,
+            Err(result) => return *result,
+        };
+        let workspace = workspace_state.path.clone();
+        if let Ok(mut leases) = self.leases.lock() {
+            leases.insert(workspace.clone(), workspace_state.file.clone());
+        } else {
+            return RunResult::new(
+                Outcome::Unknown,
+                Some("workspace ownership registry unavailable".into()),
+            );
         }
-        let workspace = self
-            .config
-            .workspace_root
-            .join(format!("task-{}-generation-{}", task.id, task.generation));
+        let _lease = ExecutionLease {
+            leases: &self.leases,
+            path: workspace.clone(),
+        };
+        let mut result =
+            self.execute_in(task, &job, &workspace, workspace_state.reused, cancellation);
+        if result.outcome != Outcome::Unknown
+            && let Err(error) = crate::sessions::atomic_write(
+                &workspace.join("last-result.json"),
+                &serde_json::from_str::<serde_json::Value>(&result.to_json())
+                    .expect("bounded result"),
+            )
+        {
+            result.outcome = Outcome::Unknown;
+            result.error = Some(format!("cannot persist stopped execution result: {error}"));
+        }
+        result
+    }
+    fn execute_in(
+        &self,
+        task: &Task,
+        job: &Job,
+        workspace: &Path,
+        reused: bool,
+        cancellation: Arc<AtomicBool>,
+    ) -> RunResult {
+        let deadline = Instant::now() + Duration::from_secs(self.config.timeout_seconds);
         let mut result = RunResult::new(Outcome::Failure, None);
-        result.workspace = Some(workspace.clone());
-        if let Err(error) = fs::DirBuilder::new().mode(0o700).create(&workspace) {
-            result.outcome = if error.kind() == io::ErrorKind::AlreadyExists {
-                Outcome::Unknown
-            } else {
-                Outcome::Failure
-            };
-            result.error = Some(format!(
-                "cannot create generation workspace; an existing workspace must be inspected before recovery: {error}"
-            ));
-            return result;
-        }
+        result.workspace = Some(workspace.to_owned());
         let repository = workspace.join("repository");
         let requirements_file = workspace.join("requirements.txt");
         let setup = (|| -> Result<(), HostError> {
+            if reused {
+                check_workspace_budget(workspace, &self.config)?;
+                if repository.canonicalize()? != repository
+                    || !fs::symlink_metadata(&repository)?.is_dir()
+                {
+                    return Err(HostError::Job("preserved repository was redirected".into()));
+                }
+                return Ok(());
+            }
             fs::DirBuilder::new().mode(0o700).create(&repository)?;
             let mut budget = SnapshotBudget {
                 bytes: 0,
@@ -543,8 +589,8 @@ impl Host {
                 workflow::Execution {
                     host: self,
                     task,
-                    job: &job,
-                    workspace: &workspace,
+                    job,
+                    workspace,
                     repository: &repository,
                     requirements_file: &requirements_file,
                     deadline,
@@ -560,57 +606,64 @@ impl Host {
             result.outcome = outcome;
             return result;
         }
-        let git = self.run_supervised(
-            CommandSpec {
-                program: PathBuf::from("/usr/bin/git"),
-                args: vec![
-                    "init".into(),
-                    "--quiet".into(),
-                    "--template=".into(),
-                    "--initial-branch=relay-snapshot".into(),
-                ],
-                env: [
-                    ("PATH", "/usr/bin:/bin"),
-                    ("LC_ALL", "C"),
-                    ("GIT_CONFIG_NOSYSTEM", "1"),
-                    ("GIT_CONFIG_GLOBAL", "/dev/null"),
-                    ("GIT_CONFIG_SYSTEM", "/dev/null"),
-                    ("GIT_TERMINAL_PROMPT", "0"),
-                ]
-                .into_iter()
-                .map(|(key, value)| (key.into(), value.into()))
-                .collect(),
-                cwd: repository.clone(),
-                input: String::new(),
-                timeout_ms: remaining_ms(deadline),
-                output_limit_bytes: MAX_CAPTURE,
-                app_server: None,
-                provider: None,
-                read_only: false,
-                clear_env: true,
-            },
-            &cancellation,
-            &workspace,
-            "snapshot-git",
-        );
-        if git.outcome != Outcome::Success {
-            result.outcome = git.outcome;
-            result.error = Some(format!(
-                "cannot initialize private snapshot Git repository: {}",
-                git.error.unwrap_or_else(|| "Git init failed".into())
-            ));
-            return result;
-        }
-        if let Err(error) = OpenOptions::new()
-            .append(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(repository.join(".git/config"))
-            .and_then(|mut config| {
-                config.write_all(b"\n[core]\n\thooksPath = /dev/null\n\tfsmonitor = false\n")
-            })
-        {
-            result.error = Some(format!("cannot configure private snapshot Git: {error}"));
-            return result;
+        if !reused {
+            let git = self.run_supervised(
+                CommandSpec {
+                    workspace_lease: false,
+                    program: PathBuf::from("/usr/bin/git"),
+                    args: vec![
+                        "init".into(),
+                        "--quiet".into(),
+                        "--template=".into(),
+                        "--initial-branch=relay-snapshot".into(),
+                    ],
+                    env: [
+                        ("PATH", "/usr/bin:/bin"),
+                        ("LC_ALL", "C"),
+                        ("GIT_CONFIG_NOSYSTEM", "1"),
+                        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+                        ("GIT_CONFIG_SYSTEM", "/dev/null"),
+                        ("GIT_TERMINAL_PROMPT", "0"),
+                    ]
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect(),
+                    cwd: repository.clone(),
+                    input: String::new(),
+                    timeout_ms: remaining_ms(deadline),
+                    output_limit_bytes: MAX_CAPTURE,
+                    app_server: None,
+                    provider: None,
+                    read_only: false,
+                    clear_env: true,
+                },
+                &cancellation,
+                workspace,
+                "snapshot-git",
+            );
+            if git.outcome != Outcome::Success {
+                result.outcome = git.outcome;
+                result.error = Some(format!(
+                    "cannot initialize private snapshot Git repository: {}",
+                    git.error.unwrap_or_else(|| "Git init failed".into())
+                ));
+                return result;
+            }
+            if let Err(error) = OpenOptions::new()
+                .append(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(repository.join(".git/config"))
+                .and_then(|mut config| {
+                    config.write_all(b"\n[core]\n\thooksPath = /dev/null\n\tfsmonitor = false\n")
+                })
+            {
+                result.error = Some(format!("cannot configure private snapshot Git: {error}"));
+                return result;
+            }
+            if let Err(error) = crate::workspaces::mark_ready(workspace) {
+                result.error = Some(error.to_string());
+                return result;
+            }
         }
         if let Some(profile) = self.config.native_agents.get(&job.agent) {
             let command = self.run_native(
@@ -618,7 +671,7 @@ impl Host {
                 &job.requirements,
                 false,
                 &cancellation,
-                (&workspace, &repository),
+                (workspace, &repository),
                 deadline,
             );
             result.outcome = command.outcome;
@@ -640,6 +693,12 @@ impl Host {
             ));
         }
         for (phase, profile) in phases {
+            if phase == "draft_pr"
+                && let Err(error) = crate::workspaces::mark_publication(workspace, task)
+            {
+                result.error = Some(error.to_string());
+                return result;
+            }
             if let Some(outcome) = interrupted(&cancellation, deadline) {
                 result.outcome = outcome;
                 return result;
@@ -674,6 +733,7 @@ impl Host {
                 env.insert(key.into(), value);
             }
             let spec = CommandSpec {
+                workspace_lease: false,
                 app_server: None,
                 provider: None,
                 read_only: false,
@@ -689,7 +749,7 @@ impl Host {
                     .max(1) as u64,
                 output_limit_bytes: self.config.output_limit_bytes,
             };
-            let command = self.run_supervised(spec, &cancellation, &workspace, phase);
+            let command = self.run_supervised(spec, &cancellation, workspace, phase);
             let outcome = command.outcome;
             match phase {
                 "agent" => result.agent = Some(command),
@@ -763,6 +823,7 @@ impl Host {
                 )));
             }
             let spec = CommandSpec {
+                workspace_lease: false,
                 app_server: None,
                 provider: None,
                 read_only: false,
@@ -909,7 +970,9 @@ impl Host {
             return failure;
         }
         let session = if crate::sessions::enabled(profile) {
-            match crate::sessions::Session::begin(workspace, repository, profile, read_only) {
+            match crate::workspaces::attempt(workspace).and_then(|attempt| {
+                crate::sessions::Session::begin(workspace, repository, profile, read_only, attempt)
+            }) {
                 Ok(session) => Some(session),
                 Err(error) => {
                     return CommandResult::error(
@@ -931,6 +994,7 @@ impl Host {
             }
         }
         let spec = CommandSpec {
+            workspace_lease: false,
             app_server: if profile.provider == ProviderKind::CodexAppServer {
                 Some(crate::app_server::Start {
                     cwd: repository.to_owned(),
@@ -938,6 +1002,7 @@ impl Host {
                     model: profile.model.clone(),
                     effort: profile.effort.clone(),
                     resume: session.as_ref().and_then(|s| s.resume.clone()),
+                    checkpoint: session.as_ref().map(|s| s.checkpoint()),
                 })
             } else {
                 None
@@ -980,11 +1045,21 @@ impl Host {
 
     pub(crate) fn run_supervised(
         &self,
-        spec: CommandSpec,
+        mut spec: CommandSpec,
         cancellation: &AtomicBool,
         workspace: &Path,
         phase: &str,
     ) -> CommandResult {
+        let lease = match self.leases.lock() {
+            Ok(leases) => leases.get(workspace).cloned(),
+            Err(_) => {
+                return CommandResult::error(
+                    Outcome::Unknown,
+                    "workspace ownership registry unavailable",
+                );
+            }
+        };
+        spec.workspace_lease = lease.is_some();
         let mut serialized = serde_json::to_vec(&spec).expect("serializable command spec");
         if serialized.len() > MAX_CONFIG_BYTES {
             return CommandResult::error(
@@ -993,7 +1068,24 @@ impl Host {
             );
         }
         serialized.push(b'\n');
-        let mut child = match Command::new(&self.supervisor)
+        let mut supervisor = Command::new(&self.supervisor);
+        if let Some(lease) = &lease {
+            let fd = lease.as_raw_fd();
+            // SAFETY: only async-signal-safe descriptor operations run in the forked
+            // child. This shared open-file description retains flock across parent death.
+            unsafe {
+                supervisor.pre_exec(move || {
+                    if libc::dup2(fd, SUPERVISOR_LEASE_FD) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::fcntl(SUPERVISOR_LEASE_FD, libc::F_SETFD, 0) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut child = match supervisor
             .env_remove("RELAY_TOKEN")
             .arg("__relay_host_supervisor")
             .stdin(Stdio::piped())
@@ -1331,6 +1423,8 @@ fn check_workspace_budget(root: &Path, config: &HostConfig) -> io::Result<()> {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CommandSpec {
     #[serde(default)]
+    pub(crate) workspace_lease: bool,
+    #[serde(default)]
     pub(crate) provider: Option<ProviderResult>,
     #[serde(default)]
     pub(crate) app_server: Option<crate::app_server::Start>,
@@ -1377,6 +1471,14 @@ pub fn supervisor_main() -> i32 {
             || spec.input.len() > MAX_PHASE_INPUT
         {
             return Err(io::Error::other("invalid supervisor limits"));
+        }
+        if spec.workspace_lease {
+            // Retain the inherited lock for this supervisor's entire lifetime, but
+            // never let model/test grandchildren keep it after verified cleanup.
+            // SAFETY: the host supplied this private descriptor via pre_exec.
+            if unsafe { libc::fcntl(SUPERVISOR_LEASE_FD, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
         // SAFETY: This dedicated single-threaded subprocess has no other jobs.
         if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {

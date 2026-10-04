@@ -43,6 +43,7 @@ pub fn handle(app: &Application, request: Value) -> Option<Value> {
         Some("ping") => json!({}),
         Some("tools/list") => json!({"tools":[
             {"name":"relay_submit","description":"Submit a requirement to the durable development queue; use the same key for retries.","inputSchema":{"type":"object","required":["key","job"],"properties":{"key":{"type":"string","minLength":1,"maxLength":128},"job":{"type":"object","required":["repository","requirements","agent"],"properties":{"repository":{"type":"string"},"requirements":{"type":"string"},"agent":{"type":"string"},"test":{"type":["string","null"]},"publish":{"type":"boolean","default":false},"draft_pr_adapter":{"type":["string","null"]},"workflow":{"type":["string","null"]}},"additionalProperties":false}},"additionalProperties":false}},
+            {"name":"relay_retry","description":"Explicitly continue a stopped unsuccessful task in its preserved workspace. Inspect side effects first; repeated calls return the same successor.","inputSchema":{"type":"object","required":["id","key","confirm_stopped_and_reconciled"],"properties":{"id":{"type":"integer","minimum":1},"key":{"type":"string","minLength":1,"maxLength":128},"confirm_stopped_and_reconciled":{"type":"boolean","const":true}},"additionalProperties":false}},
             {"name":"relay_get","description":"Read one task and its durable result.","inputSchema":{"type":"object","required":["id"],"properties":{"id":{"type":"integer","minimum":1}},"additionalProperties":false}},
             {"name":"relay_list","description":"List the newest 100 tasks, optionally before a task ID.","inputSchema":{"type":"object","properties":{"before":{"type":"integer","minimum":1}},"additionalProperties":false}},
             {"name":"relay_config","description":"Read configured repository, agent and test profile identifiers.","inputSchema":{"type":"object","additionalProperties":false}}
@@ -61,6 +62,23 @@ pub fn handle(app: &Application, request: Value) -> Option<Value> {
                             .map(|task| json!(task))
                             .map_err(|e| e.to_string())
                     }),
+                Some("relay_retry") => {
+                    let mut arguments = arguments;
+                    let id = arguments
+                        .as_object_mut()
+                        .and_then(|object| object.remove("id"))
+                        .and_then(|id| id.as_i64());
+                    match id.filter(|id| *id > 0) {
+                        Some(id) => serde_json::from_value::<crate::RetryRequest>(arguments)
+                            .map_err(|e| e.to_string())
+                            .and_then(|input| {
+                                app.retry(id, input)
+                                    .map(|task| json!(task))
+                                    .map_err(|e| e.to_string())
+                            }),
+                        None => Err("positive task id required".into()),
+                    }
+                }
                 Some("relay_get") => arguments["id"]
                     .as_i64()
                     .filter(|id| *id > 0)
