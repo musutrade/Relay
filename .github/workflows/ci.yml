@@ -26,6 +26,10 @@ jobs:
         run: python3 -m pip install -r app/tests/browser-requirements.txt
       - name: Install official Playwright Chromium
         run: python3 -m playwright install --with-deps chromium
+      - name: Build real authentication fixture server
+        run: cargo build -p relay-app --locked
+      - name: Check real browser password sessions
+        run: python3 app/tests/auth_browser_smoke.py
       - name: Check desktop and mobile UI flows
         env:
           RELAY_UI_SCREENSHOTS: .relay/ui-smoke

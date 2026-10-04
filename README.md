@@ -27,7 +27,7 @@ cargo run -p relay-app -- serve .relay/config.json .relay/relay.db
 - **MCP stdio**：`relay-app mcp <config.json> <db-path>`；提供提交、查询、列表和配置工具，另起上述服务负责执行。MCP 是可信本机进程接口，stdout 只输出协议消息
 - **内核 CLI**：`cargo run -p relay -- <db-path> <command>`；保留不透明任务的 submit / claim / finish / get / active / confirm-stopped-and-requeue，可用于本机诊断和受控恢复
 
-HTTP `/api/*` 均要求 `Authorization: Bearer …`。主要接口：
+默认 HTTP `/api/*` 要求 `Authorization: Bearer …`；可选 [单用户密码与浏览器会话](docs/password-login.md)，支持刷新后保持登录、退出和本机密码轮换。迁移时先保留原 token 的 hybrid 模式。主要接口：
 
 ```text
 GET  /api/config

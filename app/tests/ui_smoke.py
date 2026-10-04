@@ -45,6 +45,7 @@ with sync_playwright() as p:
         elif path.startswith('/api/tasks/'): result=next(t for t in data['tasks'] if t['id']==int(path.rsplit('/',1)[-1]))
         else: raise Exception(path)
         r.fulfill(status=200,content_type='application/json',body=json.dumps(result,ensure_ascii=False))
+    page.route('**/auth/status', lambda r: r.fulfill(status=200,content_type='application/json',body=json.dumps({'mode':'bearer','authenticated':False})))
     page.route('**/api/**',route)
     page.goto(base); page.wait_for_timeout(2200)
     assert not requests, 'Requests before authentication'

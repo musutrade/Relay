@@ -13,6 +13,21 @@ fn main() {
 }
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
+    if matches!(
+        args.get(1).map(String::as_str),
+        Some("auth-init" | "auth-password")
+    ) {
+        let initialize = args[1] == "auth-init";
+        if args.len() != if initialize { 4 } else { 3 } {
+            return Err("usage: relay-app auth-init <credentials.json> <username>\n       relay-app auth-password <credentials.json>".into());
+        }
+        relay_app::auth::initialize(
+            std::path::Path::new(&args[2]),
+            if initialize { Some(&args[3]) } else { None },
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
     if args.get(1).map(String::as_str) == Some("doctor") {
         if args.len() != 3 {
             return Err("usage: relay-app doctor <config.json>".into());
@@ -53,17 +68,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
-    let router = relay_app::http::router(
-        Arc::clone(&app),
-        std::env::var("RELAY_TOKEN").map_err(|_| "RELAY_TOKEN is required")?,
-    )?;
+    let token = std::env::var("RELAY_TOKEN").ok();
+    let auth = match std::env::var_os("RELAY_AUTH_CONFIG") {
+        Some(path) => relay_app::auth::Auth::load(std::path::Path::new(&path), token),
+        None => relay_app::auth::Auth::new(None, token),
+    }
+    .map_err(|e| e.to_string())?;
+    let router = relay_app::http::router_with_auth(Arc::clone(&app), auth);
     // Install both handlers before starting the worker. If registration fails,
     // no execution has begun and there is no claim to abandon.
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let listener = tokio::net::TcpListener::bind(address).await?;
     eprintln!(
-        "Relay listening at http://{} (token required for /api)",
+        "Relay listening at http://{} (authentication required for /api)",
         listener.local_addr()?
     );
     let worker_app = Arc::clone(&app);
