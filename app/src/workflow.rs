@@ -436,6 +436,7 @@ impl Execution<'_> {
                 } else {
                     self.host.config().output_limit_bytes
                 },
+                app_server: None,
                 provider: None,
                 read_only: false,
                 clear_env: false,
@@ -465,7 +466,7 @@ impl Execution<'_> {
                 prompt,
                 read_only,
                 self.cancellation,
-                self.workspace,
+                (self.workspace, self.repository),
                 self.deadline,
             )
         } else if !read_only {
@@ -583,6 +584,7 @@ impl Execution<'_> {
                     .as_millis()
                     .max(1) as u64,
                 output_limit_bytes: GIT_CAPTURE_BYTES,
+                app_server: None,
                 provider: None,
                 read_only: false,
                 clear_env: true,
@@ -713,6 +715,69 @@ impl Execution<'_> {
             ));
         }
         Ok(())
+    }
+    fn prepare_reviewer(&self, config: &WorkflowConfig, candidate: &str) -> Result<PathBuf, Stop> {
+        let repository = self.workspace.join("reviewer-repository");
+        let marker = self.workspace.join("reviewer-candidate.txt");
+        let review = Execution {
+            host: self.host,
+            task: self.task,
+            job: self.job,
+            workspace: self.workspace,
+            repository: &repository,
+            requirements_file: self.requirements_file,
+            deadline: self.deadline,
+            cancellation: self.cancellation,
+        };
+        if repository.exists() {
+            let previous =
+                fs::read_to_string(&marker).map_err(|error| Stop::failure(error.to_string()))?;
+            if !valid_sha(&previous) {
+                return Err(Stop::failure("invalid prior reviewer candidate"));
+            }
+            review.verify(config, &previous)?;
+        } else {
+            fs::create_dir(&repository).map_err(|error| Stop::failure(error.to_string()))?;
+            let format = self.git(
+                config,
+                self.repository,
+                &["rev-parse", "--show-object-format"],
+            )?;
+            review.git(
+                config,
+                &repository,
+                &[
+                    "init",
+                    "--template=",
+                    "--initial-branch=relay-review",
+                    &format!("--object-format={}", format.trim()),
+                ],
+            )?;
+        }
+        let source = self
+            .repository
+            .to_str()
+            .ok_or_else(|| Stop::failure("review source path must be UTF-8"))?;
+        review.git(
+            config,
+            &repository,
+            &[
+                "fetch",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--depth=1",
+                source,
+                candidate,
+            ],
+        )?;
+        review.git(
+            config,
+            &repository,
+            &["checkout", "--detach", candidate, "--"],
+        )?;
+        review.verify(config, candidate)?;
+        fs::write(marker, candidate).map_err(|error| Stop::failure(error.to_string()))?;
+        Ok(repository)
     }
     fn prepare(&self, config: &WorkflowConfig) -> Result<String, Stop> {
         let source = &self.host.config().repositories[&config.repository];
@@ -1034,12 +1099,38 @@ fn run(
             continue;
         }
         let patch = context.patch(config, &base, &candidate, round)?;
+        // One fixed review checkout, separate from developer files and conversation.
+        // Legacy stateless reviewers keep their established guarded cwd contract.
+        let isolated =
+            crate::sessions::enabled(&context.host.config().native_agents[&config.reviewer]);
+        let reviewer_repository = if isolated {
+            context.prepare_reviewer(config, &candidate)?
+        } else {
+            context.repository.to_owned()
+        };
+        let review_context = Execution {
+            host: context.host,
+            task: context.task,
+            job: context.job,
+            workspace: context.workspace,
+            repository: &reviewer_repository,
+            requirements_file: context.requirements_file,
+            deadline: context.deadline,
+            cancellation: context.cancellation,
+        };
+        let patch = if isolated {
+            let destination = reviewer_repository.join(".git/relay-review.patch");
+            fs::copy(&patch, &destination).map_err(|error| Stop::failure(error.to_string()))?;
+            destination
+        } else {
+            patch
+        };
         let prompt = format!(
             "Review this exact committed candidate read-only against the requirements. Base SHA: {base}. Candidate SHA: {candidate}. The configured tests passed for that SHA. Read the complete diff at {} and relevant candidate files. Report changes_requested for unresolved defects or content you cannot meaningfully review. Do not edit files, run tests, publish, or delegate. Return only JSON with exactly candidate_sha, verdict (approved or changes_requested), summary (1-512 UTF-8 bytes), and findings (at most 8 strings of 1-384 UTF-8 bytes each). Approved requires an empty findings array; changes_requested requires at least one finding. Echo the full candidate SHA.\n\nRequirements:\n{}",
             patch.display(),
             context.job.requirements
         );
-        let reviewer = context.agent(
+        let reviewer = review_context.agent(
             &config.reviewer,
             true,
             &format!("reviewer-{round}"),
@@ -1052,6 +1143,7 @@ fn run(
             return Err(Stop::command(&reviewer, "reviewer"));
         }
         context.verify(config, &candidate)?;
+        review_context.verify(config, &candidate)?;
         let provider = reviewer
             .provider
             .as_ref()

@@ -4,7 +4,9 @@
 //! lifecycle management and private snapshot isolation, not an adversarial sandbox.
 //! A separate subreaper process owns every command tree; the application process
 //! never changes its process-wide child-reaping behavior.
-use crate::providers::{NativeProfile, ProtocolParser, ProviderProbe, ProviderResult};
+use crate::providers::{
+    NativeProfile, ProtocolParser, ProviderKind, ProviderProbe, ProviderResult,
+};
 use crate::workflow::{self, WorkflowConfig, WorkflowResult};
 use relay::{MAX_PAYLOAD_BYTES, MAX_RESULT_BYTES, State, Task};
 use serde::{Deserialize, Serialize};
@@ -582,6 +584,7 @@ impl Host {
                 input: String::new(),
                 timeout_ms: remaining_ms(deadline),
                 output_limit_bytes: MAX_CAPTURE,
+                app_server: None,
                 provider: None,
                 read_only: false,
                 clear_env: true,
@@ -615,7 +618,7 @@ impl Host {
                 &job.requirements,
                 false,
                 &cancellation,
-                &workspace,
+                (&workspace, &repository),
                 deadline,
             );
             result.outcome = command.outcome;
@@ -671,6 +674,7 @@ impl Host {
                 env.insert(key.into(), value);
             }
             let spec = CommandSpec {
+                app_server: None,
                 provider: None,
                 read_only: false,
                 clear_env: false,
@@ -759,6 +763,7 @@ impl Host {
                 )));
             }
             let spec = CommandSpec {
+                app_server: None,
                 provider: None,
                 read_only: false,
                 clear_env: false,
@@ -876,10 +881,11 @@ impl Host {
         input: &str,
         read_only: bool,
         cancellation: &AtomicBool,
-        workspace: &Path,
+        paths: (&Path, &Path),
         deadline: Instant,
     ) -> CommandResult {
-        let compiled = match profile.compile(read_only) {
+        let (workspace, repository) = paths;
+        let mut compiled = match profile.compile(read_only) {
             Ok(compiled) => compiled,
             Err(error) => {
                 let mut result = CommandResult::error(Outcome::Failure, error);
@@ -902,14 +908,47 @@ impl Host {
             failure.provider = Some(ProviderResult::new(profile, Some(probe.cli_version)));
             return failure;
         }
+        let session = if crate::sessions::enabled(profile) {
+            match crate::sessions::Session::begin(workspace, repository, profile, read_only) {
+                Ok(session) => Some(session),
+                Err(error) => {
+                    return CommandResult::error(
+                        Outcome::Failure,
+                        format!("cannot start bound session: {error}"),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        if profile.provider == ProviderKind::ClaudeCli
+            && let Some(session) = &session
+        {
+            if let Some(id) = &session.resume {
+                compiled.args.extend(["--resume".into(), id.clone()]);
+            } else if let Some(id) = &session.fresh_claude {
+                compiled.args.extend(["--session-id".into(), id.clone()]);
+            }
+        }
         let spec = CommandSpec {
+            app_server: if profile.provider == ProviderKind::CodexAppServer {
+                Some(crate::app_server::Start {
+                    cwd: repository.to_owned(),
+                    prompt: input.to_owned(),
+                    model: profile.model.clone(),
+                    effort: profile.effort.clone(),
+                    resume: session.as_ref().and_then(|s| s.resume.clone()),
+                })
+            } else {
+                None
+            },
             provider: Some(ProviderResult::new(profile, Some(probe.cli_version))),
             read_only,
             clear_env: false,
             program: compiled.program,
             args: compiled.args,
             env: compiled.env,
-            cwd: workspace.join("repository"),
+            cwd: repository.to_owned(),
             input: input.to_owned(),
             timeout_ms: remaining_ms(deadline),
             output_limit_bytes: self.config.output_limit_bytes,
@@ -923,6 +962,18 @@ impl Host {
         );
         if result.provider.is_none() {
             result.provider = metadata;
+        }
+        if result.outcome == Outcome::Success
+            && let Some(session) = session
+            && let Err(error) = session.complete(
+                result
+                    .provider
+                    .as_ref()
+                    .and_then(|p| p.session_id.as_deref()),
+            )
+        {
+            result.outcome = Outcome::Failure;
+            result.error = Some(format!("cannot persist completed session: {error}"));
         }
         result
     }
@@ -1282,6 +1333,8 @@ pub(crate) struct CommandSpec {
     #[serde(default)]
     pub(crate) provider: Option<ProviderResult>,
     #[serde(default)]
+    pub(crate) app_server: Option<crate::app_server::Start>,
+    #[serde(default)]
     pub(crate) read_only: bool,
     #[serde(default)]
     pub(crate) clear_env: bool,
@@ -1415,9 +1468,19 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
     let mut input = Some(input);
     let mut input_offset = 0;
     let mut output = Capture::new(spec.output_limit_bytes);
-    let mut protocol = spec
-        .provider
-        .map(|result| ProtocolParser::new(result).read_only(spec.read_only));
+    let bidirectional = spec.app_server.is_some();
+    let mut protocol = spec.provider.map(|result| {
+        if let Some(start) = spec.app_server {
+            ProtocolParser::app_server(result, start)
+        } else {
+            ProtocolParser::new(result).read_only(spec.read_only)
+        }
+    });
+    let mut input_bytes = if bidirectional {
+        protocol.as_mut().expect("native protocol").pending()
+    } else {
+        spec.input.into_bytes()
+    };
     let mut errors = Capture::new(spec.output_limit_bytes);
     let mut error = setup.err().map(|error| error.to_string());
     let mut outcome = Outcome::Failure;
@@ -1465,11 +1528,27 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
             error = Some(failure.to_string());
             break;
         }
+        if bidirectional && input_offset == input_bytes.len() {
+            input_bytes = protocol.as_mut().expect("native protocol").pending();
+            input_offset = 0;
+            if input_bytes.is_empty() && protocol.as_ref().is_some_and(ProtocolParser::stopped) {
+                error = protocol
+                    .as_ref()
+                    .and_then(ProtocolParser::failure)
+                    .map(str::to_owned);
+                outcome = if error.is_some() {
+                    Outcome::Failure
+                } else {
+                    Outcome::Success
+                };
+                break;
+            }
+        }
         if let Some(writer) = &mut input {
-            match writer.write(&spec.input.as_bytes()[input_offset..]) {
+            match writer.write(&input_bytes[input_offset..]) {
                 Ok(written) => {
                     input_offset += written;
-                    if input_offset == spec.input.len() {
+                    if !bidirectional && input_offset == input_bytes.len() {
                         input.take();
                     }
                 }
@@ -1478,6 +1557,10 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
                         || failure.kind() == io::ErrorKind::Interrupted => {}
                 Err(failure) if failure.kind() == io::ErrorKind::BrokenPipe => {
                     input.take();
+                    if bidirectional {
+                        error = Some("app-server closed protocol stdin".into());
+                        break;
+                    }
                 }
                 Err(failure) => {
                     error = Some(failure.to_string());
