@@ -20,6 +20,8 @@
 
 app-server 每轮有一个受监管进程。收到成功终态后，宿主结束并回收进程树，下一轮重新启动进程并恢复同一线程；测试期间不保留空闲进程。收到 approval、用户输入或动态工具请求时返回不支持并停止，不自动授权。每个 thread/turn 都设置原有 workspace-write 边界，网络保持关闭；不修改用户配置或凭据。自定义端点、认证、模型接受参数及服务端缓存收益，必须经单独授权的真实烟测确认，离线 fixture 不证明这些能力。
 
+Codex 冷恢复可在 `thread/resume` 响应后回放旧 turn 的 `thread/tokenUsage/updated`，即使设置了 `excludeTurns:true`。仅在恢复已确认且新 turn ID 尚未确定的窗口，适配器保留最新的一条有界用量快照；随后只将与新 turn ID 匹配的用量计入本轮，旧用量直接丢弃。用量通知不能确定 turn ID 或证明成功；跨线程通知、已确定 turn 后的错误 ID，以及旧 turn 的正文或终态仍失败关闭。对应上游测试见 [冷恢复用量回放](https://github.com/openai/codex/blob/main/codex-rs/app-server/tests/suite/v2/thread_resume.rs)。
+
 ## 工作区与绑定
 
 同一任务链的修复与显式继续沿用开发 checkout。启用续接的审查使用同一任务内固定 `reviewer-repository/`，只导入精确候选提交和本轮 diff，不复制开发者的 Git 元数据、未提交文件或会话。审查前后同时校验候选；任何候选改变都须重新测试和审查。仍然是可信本机进程管理，不是对恶意程序的 OS 沙箱。
