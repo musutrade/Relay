@@ -69,6 +69,23 @@ with sync_playwright() as p:
     assert page.locator('.task-button').count()==3
     assert not page.locator('#workflow-field').is_visible(), 'Legacy configuration keeps the ordinary form'
     page.screenshot(path=str(SCREENSHOTS / 'relay-connected-desktop.png'),full_page=True)
+    # Token details distinguish current-turn totals from the final snapshot.
+    data['tasks'][2]['result']=json.dumps({'outcome':'success','agent':{'provider':{
+        'provider':'codex_app_server','usage':{'usage_scope':'last_snapshot',
+        'input_tokens':7,'output_tokens':2,'turn_total':{'input_tokens':90,
+        'output_tokens':11,'cached_input_tokens':50,'reasoning_output_tokens':0}}}}})
+    page.locator('[data-task-id="1"]').click()
+    page.locator('#detail-usage').wait_for(state='visible')
+    assert page.locator('.usage-heading').inner_text()=='本轮累计'
+    assert page.locator('.usage-counts').first.locator('dd').all_inner_texts()==['90','11','50','0']
+    assert page.locator('.usage-snapshot dd').all_inner_texts()==['7','2','未知','未知']
+    page.screenshot(path=str(SCREENSHOTS / 'relay-token-desktop.png'),full_page=True)
+    page.set_viewport_size({'width':390,'height':844})
+    assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+    page.screenshot(path=str(SCREENSHOTS / 'relay-token-mobile.png'),full_page=True)
+    page.set_viewport_size({'width':1440,'height':1150})
+    page.locator('[data-task-id="3"]').click()
+    assert not page.locator('#detail-usage').is_visible()
     # Optional named workflows lock configured fields, then restore ordinary choices.
     page.locator('#logout').click()
     reviewed={'name':'reviewed','repository':'api-service','developer':'native-codex','reviewer':'reviewer <img src=x onerror=alert(1)>','test':'full','max_repairs':2}

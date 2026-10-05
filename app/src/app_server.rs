@@ -1,6 +1,6 @@
 //! Bounded Codex app-server stdio client. The supervisor owns the process tree;
 //! this driver owns only request correlation and one explicitly identified turn.
-use crate::providers::{MAX_PROTOCOL_LINE, ProviderResult, ProviderUsage};
+use crate::providers::{MAX_PROTOCOL_LINE, ProviderResult, ProviderUsage, TokenCounts};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -24,7 +24,10 @@ pub(crate) struct Driver {
     pending: Vec<u8>,
     request: u64,
     turn: Option<String>,
-    resume_usage: Option<(String, ProviderUsage)>,
+    resume_usage: Vec<(String, UsageSnapshot)>,
+    baseline: Option<TokenCounts>,
+    latest_total: Option<TokenCounts>,
+    totals_invalid: bool,
     terminal: bool,
     answer_seen: bool,
     error: Option<String>,
@@ -38,11 +41,23 @@ impl Driver {
             pending: Vec::new(),
             request: 1,
             turn: None,
-            resume_usage: None,
+            resume_usage: Vec::new(),
+            baseline: None,
+            latest_total: None,
+            totals_invalid: false,
             terminal: false,
             answer_seen: false,
             error: None,
         };
+        driver.result.usage.usage_scope = Some("last_snapshot".into());
+        if driver.start.resume.is_none() {
+            driver.baseline = Some(TokenCounts {
+                input_tokens: Some(0),
+                cached_input_tokens: Some(0),
+                output_tokens: Some(0),
+                reasoning_output_tokens: Some(0),
+            });
+        }
         driver.send(json!({"id":1,"method":"initialize","params":{
             "clientInfo":{"name":"relay","version":env!("CARGO_PKG_VERSION")},
             "capabilities":{"experimentalApi":false}
@@ -73,12 +88,61 @@ impl Driver {
         }
     }
     fn bind_turn(&mut self, id: String) {
-        if let Some((usage_turn, usage)) = self.resume_usage.take()
-            && usage_turn == id
-        {
-            self.result.usage = usage;
+        if self.turn.is_some() {
+            return;
         }
-        self.turn = Some(id);
+        let pending = std::mem::take(&mut self.resume_usage);
+        // Only historical snapshots observed in the cold-resume window can
+        // establish the pre-turn baseline. A live snapshot is never a baseline.
+        let mut historical_high_water = TokenCounts::default();
+        for (_, snapshot) in pending.iter().filter(|(turn, _)| turn != &id) {
+            if let Some(total) = &snapshot.total {
+                if total.decreased_from(&historical_high_water) {
+                    self.totals_invalid = true;
+                }
+                historical_high_water = total.with_missing_from(&historical_high_water);
+                self.baseline = Some(total.clone());
+            } else {
+                // A newer historical update without totals cannot certify a baseline.
+                self.baseline = None;
+            }
+        }
+        if self.start.resume.is_some() {
+            self.latest_total = Some(historical_high_water);
+        }
+        self.turn = Some(id.clone());
+        for (_, snapshot) in pending.into_iter().filter(|(turn, _)| turn == &id) {
+            self.apply_usage(snapshot);
+        }
+    }
+    fn apply_usage(&mut self, snapshot: UsageSnapshot) {
+        if let Some(total) = &snapshot.total {
+            if self
+                .latest_total
+                .as_ref()
+                .or(self.baseline.as_ref())
+                .is_some_and(|old| total.decreased_from(old))
+            {
+                // Counter resets and reordered older snapshots cannot be
+                // distinguished reliably. Keep totals unknown for this run.
+                self.totals_invalid = true;
+            }
+            let previous = self
+                .latest_total
+                .take()
+                .or_else(|| self.baseline.clone())
+                .unwrap_or_default();
+            self.latest_total = Some(total.with_missing_from(&previous));
+        }
+        self.result.usage = snapshot.last;
+        self.result.usage.usage_scope = Some("last_snapshot".into());
+        if !self.totals_invalid {
+            self.result.usage.turn_total = snapshot
+                .total
+                .as_ref()
+                .zip(self.baseline.as_ref())
+                .map(|(total, base)| total.delta(base));
+        }
     }
     pub fn feed(&mut self, bytes: &[u8]) {
         for &byte in bytes {
@@ -221,11 +285,12 @@ impl Driver {
                 && self.request == 3
                 && self.turn.is_none()
             {
-                // Cold resume replays historical usage after its response, even
-                // with excludeTurns. Keep only the latest bounded snapshot until
-                // turn/start or turn/started identifies our turn. Historical
-                // usage must neither bind that turn nor count as this run's usage.
-                self.resume_usage = Some((turn, token_usage(params)?));
+                // Buffer bounded snapshots until the active turn is identified.
+                // Historical totals establish a baseline, never this run's usage.
+                if self.resume_usage.len() >= 32 {
+                    return Err("app-server pending usage budget exceeded".into());
+                }
+                self.resume_usage.push((turn, token_usage(params)?));
                 return Ok(());
             }
             if self.turn.is_none() && method == "turn/started" && self.request == 3 {
@@ -275,7 +340,7 @@ impl Driver {
                 }
             }
             "thread/tokenUsage/updated" => {
-                self.result.usage = token_usage(params)?;
+                self.apply_usage(token_usage(params)?);
             }
             "turn/started"
             | "turn/diff/updated"
@@ -330,14 +395,79 @@ fn number(value: &Value, key: &str) -> Result<Option<u64>, String> {
             .ok_or_else(|| "invalid app-server usage count".into()),
     }
 }
-fn token_usage(params: &Value) -> Result<ProviderUsage, String> {
-    let usage = &params["tokenUsage"]["last"];
-    Ok(ProviderUsage {
-        input_tokens: number(usage, "inputTokens")?,
-        cached_input_tokens: number(usage, "cachedInputTokens")?,
-        output_tokens: number(usage, "outputTokens")?,
-        reasoning_output_tokens: number(usage, "reasoningOutputTokens")?,
-        ..ProviderUsage::default()
+struct UsageSnapshot {
+    last: ProviderUsage,
+    total: Option<TokenCounts>,
+}
+impl TokenCounts {
+    fn values(&self) -> [Option<u64>; 4] {
+        [
+            self.input_tokens,
+            self.cached_input_tokens,
+            self.output_tokens,
+            self.reasoning_output_tokens,
+        ]
+    }
+    fn with_missing_from(&self, previous: &Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.or(previous.input_tokens),
+            cached_input_tokens: self.cached_input_tokens.or(previous.cached_input_tokens),
+            output_tokens: self.output_tokens.or(previous.output_tokens),
+            reasoning_output_tokens: self
+                .reasoning_output_tokens
+                .or(previous.reasoning_output_tokens),
+        }
+    }
+    fn decreased_from(&self, previous: &Self) -> bool {
+        self.values()
+            .into_iter()
+            .zip(previous.values())
+            .any(|(now, old)| now.zip(old).is_some_and(|(now, old)| now < old))
+    }
+    fn delta(&self, baseline: &Self) -> Self {
+        let subtract =
+            |now: Option<u64>, old: Option<u64>| now.zip(old).and_then(|(a, b)| a.checked_sub(b));
+        Self {
+            input_tokens: subtract(self.input_tokens, baseline.input_tokens),
+            cached_input_tokens: subtract(self.cached_input_tokens, baseline.cached_input_tokens),
+            output_tokens: subtract(self.output_tokens, baseline.output_tokens),
+            reasoning_output_tokens: subtract(
+                self.reasoning_output_tokens,
+                baseline.reasoning_output_tokens,
+            ),
+        }
+    }
+}
+fn counts(value: &Value) -> Result<TokenCounts, String> {
+    if !value.is_object() {
+        return Err("invalid app-server usage object".into());
+    }
+    Ok(TokenCounts {
+        input_tokens: number(value, "inputTokens")?,
+        cached_input_tokens: number(value, "cachedInputTokens")?,
+        output_tokens: number(value, "outputTokens")?,
+        reasoning_output_tokens: number(value, "reasoningOutputTokens")?,
+    })
+}
+fn token_usage(params: &Value) -> Result<UsageSnapshot, String> {
+    let usage = &params["tokenUsage"];
+    let last = match usage.get("last").filter(|v| !v.is_null()) {
+        Some(value) => counts(value)?,
+        None => TokenCounts::default(),
+    };
+    Ok(UsageSnapshot {
+        last: ProviderUsage {
+            input_tokens: last.input_tokens,
+            cached_input_tokens: last.cached_input_tokens,
+            output_tokens: last.output_tokens,
+            reasoning_output_tokens: last.reasoning_output_tokens,
+            ..ProviderUsage::default()
+        },
+        total: usage
+            .get("total")
+            .filter(|v| !v.is_null())
+            .map(counts)
+            .transpose()?,
     })
 }
 
@@ -528,6 +658,167 @@ mod tests {
             json!({"id":3,"result":{"turn":{"id":"other-turn"}}}),
         );
         assert!(changed.failure().is_some());
+    }
+    fn cumulative(turn: &str, input: u64, cached: u64, output: u64, reasoning: u64) -> Value {
+        json!({"method":"thread/tokenUsage/updated","params":{
+            "threadId":"thread-1","turnId":turn,"tokenUsage":{
+                "last":{"inputTokens":7,"outputTokens":2},
+                "total":{"inputTokens":input,"cachedInputTokens":cached,
+                    "outputTokens":output,"reasoningOutputTokens":reasoning}
+            }
+        }})
+    }
+    #[test]
+    fn cumulative_turn_delta_excludes_history_and_deduplicates_snapshots() {
+        for started_first in [false, true] {
+            let mut d = driver(Some("thread-1"));
+            start_pending(&mut d);
+            feed(&mut d, cumulative("old-turn", 100, 80, 20, 3));
+            if started_first {
+                feed(
+                    &mut d,
+                    json!({"method":"turn/started","params":{
+                    "threadId":"thread-1","turn":{"id":"turn-1"}}}),
+                );
+            }
+            feed(&mut d, cumulative("turn-1", 150, 110, 25, 3));
+            feed(&mut d, json!({"id":3,"result":{"turn":{"id":"turn-1"}}}));
+            let final_usage = cumulative("turn-1", 190, 130, 31, 5);
+            feed(&mut d, final_usage.clone());
+            feed(&mut d, final_usage);
+            answer(&mut d);
+            complete(&mut d, "completed");
+            let (result, error) = d.finish();
+            assert!(error.is_none(), "{error:?}");
+            assert_eq!(result.usage.input_tokens, Some(7));
+            assert_eq!(
+                result.usage.turn_total,
+                Some(TokenCounts {
+                    input_tokens: Some(90),
+                    cached_input_tokens: Some(50),
+                    output_tokens: Some(11),
+                    reasoning_output_tokens: Some(2),
+                })
+            );
+            assert!(result.usage.total_cost_usd.is_none());
+            assert!(result.usage.num_turns.is_none());
+        }
+    }
+    #[test]
+    fn absent_baselines_and_fields_remain_unknown_and_zero_is_known() {
+        let mut resumed = driver(Some("thread-1"));
+        start(&mut resumed);
+        feed(&mut resumed, cumulative("turn-1", 150, 110, 25, 3));
+        assert!(resumed.result.usage.turn_total.is_none());
+        let mut fresh = driver(None);
+        start(&mut fresh);
+        feed(&mut fresh, cumulative("turn-1", 30, 0, 8, 0));
+        assert_eq!(
+            fresh.result.usage.turn_total.as_ref().unwrap().input_tokens,
+            Some(30)
+        );
+        assert_eq!(
+            fresh
+                .result
+                .usage
+                .turn_total
+                .as_ref()
+                .unwrap()
+                .reasoning_output_tokens,
+            Some(0)
+        );
+        let mut partial = cumulative("turn-1", 35, 0, 9, 0);
+        partial["params"]["tokenUsage"]["total"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cachedInputTokens");
+        feed(&mut fresh, partial);
+        assert!(
+            fresh
+                .result
+                .usage
+                .turn_total
+                .as_ref()
+                .unwrap()
+                .cached_input_tokens
+                .is_none()
+        );
+        assert_eq!(
+            fresh.result.usage.turn_total.as_ref().unwrap().input_tokens,
+            Some(35)
+        );
+        feed(&mut fresh, usage("thread-1", "turn-1", 7));
+        assert!(fresh.result.usage.turn_total.is_none());
+    }
+    #[test]
+    fn reset_or_reordered_counters_invalidate_totals_without_negative_values() {
+        let mut d = driver(None);
+        start(&mut d);
+        feed(&mut d, cumulative("turn-1", 100, 60, 20, 5));
+        feed(&mut d, cumulative("turn-1", 90, 60, 20, 5));
+        assert!(d.result.usage.turn_total.is_none());
+        feed(&mut d, cumulative("turn-1", 200, 100, 30, 6));
+        assert!(d.result.usage.turn_total.is_none());
+        assert!(d.failure().is_none());
+    }
+    #[test]
+    fn missing_fields_do_not_hide_historical_or_current_counter_resets() {
+        for historical in [true, false] {
+            let mut d = driver(Some("thread-1"));
+            start_pending(&mut d);
+            feed(&mut d, cumulative("old-turn", 100, 80, 20, 3));
+            if !historical {
+                feed(&mut d, json!({"id":3,"result":{"turn":{"id":"turn-1"}}}));
+            }
+            let turn = if historical { "old-turn" } else { "turn-1" };
+            let mut partial = cumulative(turn, 100, 80, 20, 3);
+            partial["params"]["tokenUsage"]["total"] = json!({});
+            feed(&mut d, partial);
+            feed(&mut d, cumulative(turn, 90, 80, 20, 3));
+            if historical {
+                feed(&mut d, json!({"id":3,"result":{"turn":{"id":"turn-1"}}}));
+            }
+            feed(&mut d, cumulative("turn-1", 120, 80, 20, 3));
+            assert!(d.result.usage.turn_total.is_none());
+            assert!(d.failure().is_none());
+        }
+    }
+    #[test]
+    fn partial_baseline_keeps_historical_high_water_for_reset_detection() {
+        let mut d = driver(Some("thread-1"));
+        start_pending(&mut d);
+        feed(&mut d, cumulative("old-turn", 100, 80, 20, 3));
+        let mut partial = cumulative("old-turn", 100, 80, 20, 3);
+        partial["params"]["tokenUsage"]["total"]
+            .as_object_mut()
+            .unwrap()
+            .remove("inputTokens");
+        feed(&mut d, partial);
+        feed(&mut d, json!({"id":3,"result":{"turn":{"id":"turn-1"}}}));
+        feed(&mut d, cumulative("turn-1", 90, 80, 25, 3));
+        assert!(d.result.usage.turn_total.is_none());
+    }
+    #[test]
+    fn failed_turn_keeps_observed_usage_without_claiming_success() {
+        let mut d = driver(None);
+        start(&mut d);
+        feed(&mut d, cumulative("turn-1", 100, 60, 20, 5));
+        complete(&mut d, "failed");
+        let (result, error) = d.finish();
+        assert!(error.is_some());
+        assert_eq!(result.usage.turn_total.unwrap().input_tokens, Some(100));
+    }
+    #[test]
+    fn pending_usage_is_bounded_and_legacy_usage_deserializes() {
+        let legacy: ProviderUsage = serde_json::from_value(json!({"input_tokens":7})).unwrap();
+        assert!(legacy.turn_total.is_none());
+        assert!(legacy.usage_scope.is_none());
+        let mut d = driver(Some("thread-1"));
+        start_pending(&mut d);
+        for _ in 0..33 {
+            feed(&mut d, cumulative("old-turn", 100, 80, 20, 3));
+        }
+        assert!(d.failure().unwrap().contains("budget"));
     }
     fn answer(driver: &mut Driver) {
         feed(

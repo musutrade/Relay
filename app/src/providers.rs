@@ -317,8 +317,22 @@ fn parse_version(text: &str) -> Option<((u64, u64, u64), String)> {
     None
 }
 
+/// Provider token counters; cache and reasoning are subsets for Codex.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TokenCounts {
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_output_tokens: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProviderUsage {
+    /// Absent on legacy records and other providers: do not infer turn scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_total: Option<TokenCounts>,
     pub input_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
