@@ -32,11 +32,34 @@ def review_task(i, outcome='failure'):
         'developer':passed,'tests':passed,'review':None,
         'reviewer':{'outcome':'failure','exit_code':1,'summary':'审查连接中断'}}]}},ensure_ascii=False)
     return value
+def catalog_fixture():
+    def evidence(state, reason, source='fixture:read-only-discovery'):
+        return {'state':state,'reason':reason,'source':source}
+    attack='<img src=x onerror=alert(1)>'
+    return {'provider':'codex_app_server','checked_at_unix_ms':1700000000000,'cli_version':'fixture-cli 1.0',
+        'executable':evidence('supported','Configured executable is runnable'),
+        'compatibility':evidence('supported','Protocol verified'),
+        'authentication':evidence('unknown','Account authentication is not checked'),
+        'reviewer_isolation':evidence('unsupported','Read-only reviewer isolation is unavailable'),
+        'permission_control':evidence('supported','Approval requests are rejected'),
+        'session_continuity':evidence('supported','Explicit sessions are supported'),
+        'startup_context':evidence('unknown','Discovery context differs from execution'),
+        'process_cleanup':evidence('supported','Discovery process has stopped'),
+        'model_catalog':evidence('supported','All catalog pages returned'),
+        'models':[{'id':'fixture-model','model':'fixture-model','display_name':attack,
+            'description':'Model metadata is plain text '+attack,'default_effort':'high',
+            'supported_efforts':[{'effort':'low','description':'Fast'},{'effort':'high','description':attack}],
+            'is_default':True,'hidden':False,'source':'fixture:model/list'}],
+        'selection':{'requested_model':'manual-model','requested_effort':'high',
+            'effective_model':None,'effective_effort':None,
+            'status':evidence('unknown','Execution has not verified the requested configuration')}}
 with sync_playwright() as p:
     browser=p.chromium.launch(executable_path=os.environ.get('CHROMIUM_PATH'),headless=True,args=['--no-sandbox'])
     context=browser.new_context(viewport={'width':1440,'height':1150},locale='zh-CN')
     page=context.new_page(); errors=[]; requests=[]; submissions=[]
     data={'tasks':[task(3,'queued'),task(2,'claimed'),task(1,'finished',outcome='success')], 'status':{'active':task(2,'claimed'),'recovery_required':False,'diagnostic':None},'post':'success','list_error':False,'continuations':{},'continuation_payloads':{},'continuation_post':'success','hidden_task_ids':set(),'frozen_lists':{},'retry_requests':[],'review_requests':[],'config':{'repositories':['relay-demo','api-service'],'agents':['codex','reviewer'],'tests':['unit','full']}}
+    data['catalog']={'name':'codex','cache_epoch':'browser-fixture-process','generation':0,'stale':True,'refreshing':False,'catalog':None}
+    data['catalog_refreshes']=0
     # Model persisted reservations separately from visible task payloads. A child
     # outside the recent page must not make its predecessor appear retryable.
     def task_response(value):
@@ -48,6 +71,14 @@ with sync_playwright() as p:
         assert req.headers.get('authorization')=='Bearer test-token',req.headers
         if path=='/api/config': result=data['config']
         elif path=='/api/status': result=data['status']
+        elif path=='/api/capabilities':
+            assert req.method=='GET'
+            result={'profiles':[data['catalog']] if data['config'].get('native_agents') else []}
+        elif path=='/api/capabilities/codex/refresh':
+            assert req.method=='POST' and not req.post_data
+            data['catalog_refreshes']+=1
+            data['catalog'].update(generation=data['catalog']['generation']+1,stale=False,catalog=catalog_fixture())
+            result=data['catalog']
         elif path=='/api/tasks' and req.method=='GET':
             if data['list_error']: r.abort();return
             result=data['frozen_lists'].get(req.frame.page,visible_tasks())
@@ -148,8 +179,53 @@ with sync_playwright() as p:
     page.set_viewport_size({'width':1440,'height':1150})
     page.locator('[data-task-id="3"]').click()
     assert not page.locator('#detail-usage').is_visible()
-    # Optional named workflows lock configured fields, then restore ordinary choices.
+    # The catalog reads cached evidence on login/open, without automatic discovery.
     page.locator('#logout').click()
+    data['config']['native_agents']=[{'name':'codex','provider':'codex_app_server','model':'manual-model','effort':'high','authentication':'unknown'}]
+    with page.expect_response(lambda response: response.url==base+'/api/capabilities' and response.request.method=='GET'):
+        connect(page)
+    expect(page.locator('#capability-panel')).to_be_visible()
+    expect(page.locator('#capability-body')).to_be_hidden()
+    assert data['catalog_refreshes']==0
+    with page.expect_response(lambda response: response.url==base+'/api/capabilities' and response.request.method=='GET'):
+        page.locator('#capability-toggle').click()
+    expect(page.locator('#capability-toggle')).to_have_attribute('aria-expanded','true')
+    expect(page.locator('#capability-profiles')).to_contain_text('尚无缓存')
+    expect(page.locator('#capability-disclaimer')).to_contain_text('不代表账户已登录、可调用模型或获得调用授权')
+    page.wait_for_timeout(2200)
+    assert data['catalog_refreshes']==0, 'Task polling must never trigger discovery'
+    with page.expect_response(lambda response: response.url==base+'/api/capabilities/codex/refresh' and response.request.method=='POST'):
+        page.locator('[data-catalog-refresh="codex"]').click()
+    card=page.locator('[data-profile="codex"]')
+    expect(card).to_contain_text('fixture-cli 1.0')
+    expect(card).to_contain_text('上次读取时缓存有效')
+    expect(card).to_contain_text('manual-model')
+    expect(card).to_contain_text('未知（尚无执行证据）')
+    expect(card).to_contain_text('Account authentication is not checked')
+    expect(card).to_contain_text('Discovery context differs from execution')
+    expect(card).to_contain_text('Read-only reviewer isolation is unavailable')
+    card.locator('.catalog-models summary').click()
+    expect(card.locator('.catalog-model-list')).to_be_visible()
+    expect(card.locator('.catalog-model-list')).to_contain_text('<img src=x onerror=alert(1)>')
+    expect(card.locator('.catalog-model-list')).to_contain_text('支持的 effort：low（Fast）、high')
+    expect(card.locator('.catalog-model-list')).to_contain_text('来源：fixture:model/list')
+    assert page.locator('img').count()==0, 'Catalog metadata must remain inert text'
+    assert card.locator('select,input').count()==0, 'Phase-one catalog is read-only'
+    assert data['catalog_refreshes']==1 and not submissions
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':900})
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'catalog overflow at {width}'
+        page.screenshot(path=str(SCREENSHOTS / f'relay-catalog-{width}.png'),full_page=True)
+    page.wait_for_timeout(2200)
+    assert data['catalog_refreshes']==1, 'Open catalog must not repeat discovery'
+    page.locator('#logout').click()
+    expect(page.locator('#capability-panel')).to_be_hidden()
+    expect(page.locator('#capability-body')).to_be_hidden()
+    expect(page.locator('#capability-profiles')).to_be_empty()
+    expect(page.locator('#capability-toggle')).to_have_attribute('aria-expanded','false')
+    data['config'].pop('native_agents')
+    page.set_viewport_size({'width':1440,'height':1150})
+    # Optional named workflows lock configured fields, then restore ordinary choices.
     reviewed={'name':'reviewed','repository':'api-service','developer':'native-codex','reviewer':'reviewer <img src=x onerror=alert(1)>','test':'full','max_repairs':2}
     data['config']['agents'] += [reviewed['developer'],reviewed['reviewer']]
     data['config']['workflows']=[reviewed,dict(reviewed,name='review-only',max_repairs=0)]
@@ -518,6 +594,6 @@ with sync_playwright() as p:
     assert not page.locator('#workflow-field').is_visible()
     assert page.locator('#workflow-hint').inner_text()==''
     assert not errors, errors
-    print('PASS: optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, persisted continuation status, repeated successor navigation, stale two-tab confirmation, reload/new-context recovery, off-page successor detail/refresh, continuation chains, reserved-submit recovery, review-only eligibility and dismissal, review focus UTF-8 boundary, immutable unknown-request retry, duplicate review confirmation, bidirectional cross-mode stale confirmations, review successor reload, logout; no browser errors')
+    print('PASS: cached-only catalog login/open, explicit profile discovery, unknown auth/effective selection, startup context, safe model/effort metadata, catalog screenshots at 320/390/1440, no automatic discovery, catalog logout reset; optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, persisted continuation status, repeated successor navigation, stale two-tab confirmation, reload/new-context recovery, off-page successor detail/refresh, continuation chains, reserved-submit recovery, review-only eligibility and dismissal, review focus UTF-8 boundary, immutable unknown-request retry, duplicate review confirmation, bidirectional cross-mode stale confirmations, review successor reload, logout; no browser errors')
     browser.close()
 server.shutdown()

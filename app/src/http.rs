@@ -30,6 +30,8 @@ pub fn router_with_auth(app: Arc<Application>, auth: Auth) -> Router {
     };
     let api = Router::new()
         .route("/config", get(config))
+        .route("/capabilities", get(capabilities))
+        .route("/capabilities/{name}/refresh", post(refresh_capabilities))
         .route("/status", get(status))
         .route("/tasks", get(list).post(submit))
         .route("/tasks/{id}", get(detail))
@@ -136,6 +138,18 @@ async fn index() -> Response {
 async fn config(State(state): State<Web>) -> Json<Value> {
     Json(state.app.public_config())
 }
+async fn capabilities(State(state): State<Web>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({"profiles": state.app.capabilities()?})))
+}
+async fn refresh_capabilities(
+    State(state): State<Web>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || state.app.refresh_capabilities(&name))
+        .await
+        .map_err(|_| Error::Poisoned)??;
+    Ok(Json(json!(result)))
+}
 async fn status(State(state): State<Web>) -> Result<Json<Value>, ApiError> {
     Ok(Json(state.app.status()?))
 }
@@ -192,7 +206,8 @@ impl IntoResponse for ApiError {
         let status = match &self.0 {
             Error::Core(relay::Error::NotFound) => StatusCode::NOT_FOUND,
             Error::Core(relay::Error::IdempotencyConflict | relay::Error::StaleClaim)
-            | Error::RecoveryRequired => StatusCode::CONFLICT,
+            | Error::RecoveryRequired
+            | Error::DiscoveryUnavailable(_) => StatusCode::CONFLICT,
             Error::Core(relay::Error::Invalid(_)) | Error::Invalid(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
