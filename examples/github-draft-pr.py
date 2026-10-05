@@ -14,6 +14,11 @@ import subprocess
 from pathlib import Path
 
 MAX_CAPTURE = 64 * 1024
+MAX_INVENTORY_BYTES = 4 * 1024 * 1024
+MAX_INVENTORY_ENTRIES = 50_000
+MAX_INVENTORY_PATH_BYTES = 4096
+# The longest supported metadata prefix is "100755 blob <64-byte SHA>\t".
+MAX_INVENTORY_ENTRY_BYTES = 77 + MAX_INVENTORY_PATH_BYTES
 
 
 def sha(value):
@@ -87,6 +92,69 @@ def capture(command, env):
     return data.decode("utf-8", errors="strict").strip()
 
 
+def parse_inventory_entry(entry):
+    metadata, separator, path_bytes = entry.partition(b"\t")
+    if not separator:
+        raise ValueError("malformed Git tree inventory entry")
+    if len(path_bytes) > MAX_INVENTORY_PATH_BYTES:
+        raise ValueError("Git tree inventory path exceeds 4096 UTF-8 bytes")
+    fields = metadata.decode("utf-8", errors="strict").split(" ")
+    if len(fields) != 3 or fields[0] not in ("100644", "100755") or fields[1] != "blob":
+        raise ValueError("candidate tree requires regular Git blobs")
+    expected = sha(fields[2])
+    filename = path_bytes.decode("utf-8", errors="strict")
+    if ("\ufffd" in filename or any(part in ("", ".", "..") for part in filename.split("/"))
+            or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in filename)):
+        raise ValueError("candidate tree contains an unsupported path")
+    return fields[0], expected, filename
+
+
+def capture_inventory(command, env):
+    """Read an exact, bounded NUL-framed tree inventory without trimming paths.
+
+    Validate records incrementally and retain at most the inventory budgets.
+    After a protocol failure, discard all entries but keep draining the child;
+    the trusted Relay supervisor still owns deadlines and process lifecycle.
+    """
+    entries = []
+    pending = bytearray()
+    size = 0
+    failure = None
+    with subprocess.Popen(command, stdout=subprocess.PIPE, env=env) as process:
+        while True:
+            chunk = process.stdout.read(4096)
+            if not chunk:
+                break
+            if failure is not None:
+                continue
+            try:
+                size += len(chunk)
+                if size > MAX_INVENTORY_BYTES:
+                    raise ValueError("Git tree inventory exceeds the 4 MiB byte limit")
+                pending.extend(chunk)
+                while (end := pending.find(b"\0")) >= 0:
+                    if len(entries) >= MAX_INVENTORY_ENTRIES:
+                        raise ValueError("Git tree inventory exceeds the 50000 entry limit")
+                    if end > MAX_INVENTORY_ENTRY_BYTES:
+                        raise ValueError("Git tree inventory entry exceeds its bounded size")
+                    entries.append(parse_inventory_entry(bytes(pending[:end])))
+                    del pending[:end + 1]
+                if len(pending) > MAX_INVENTORY_ENTRY_BYTES:
+                    raise ValueError("Git tree inventory entry exceeds its bounded size")
+            except (ValueError, UnicodeError) as error:
+                failure = error
+                entries.clear()
+                pending.clear()
+        code = process.wait()
+    if code != 0:
+        raise RuntimeError(f"configured command exited with status {code}")
+    if failure is not None:
+        raise failure
+    if pending:
+        raise ValueError("Git tree inventory is truncated or missing its final NUL")
+    return entries
+
+
 def git_environment(env):
     # Do not let inherited Git control variables redirect validation or push.
     clean = {key: value for key, value in env.items() if not key.startswith("GIT_")}
@@ -124,16 +192,9 @@ def verify_candidate(plan_data, env):
     tree = run("rev-parse", "--verify", candidate + "^{tree}")
     if run("write-tree") != tree:
         raise ValueError("candidate index changed")
-    entries = run("ls-tree", "-r", "-z", "--full-tree", candidate)
-    for entry in entries.split("\0"):
-        if not entry:
-            continue
-        metadata, filename = entry.split("\t", 1)
-        mode, kind, expected = metadata.split(" ")
-        parts = filename.split("/")
-        if kind != "blob" or mode not in ("100644", "100755") or any(part in ("", ".", "..") for part in parts):
-            raise ValueError("unsupported candidate tree entry")
-        path = Path(*parts)
+    entries = capture_inventory([git, "ls-tree", "-r", "-z", "--full-tree", candidate], env)
+    for mode, expected, filename in entries:
+        path = Path(filename)
         # Never read through symlinked parents or a changed special file.
         for parent in [path, *path.parents]:
             if parent.is_symlink():

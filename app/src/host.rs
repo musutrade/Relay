@@ -610,6 +610,7 @@ impl Host {
             let git = self.run_supervised(
                 CommandSpec {
                     workspace_lease: false,
+                    git_inventory: false,
                     program: PathBuf::from("/usr/bin/git"),
                     args: vec![
                         "init".into(),
@@ -734,6 +735,7 @@ impl Host {
             }
             let spec = CommandSpec {
                 workspace_lease: false,
+                git_inventory: false,
                 app_server: None,
                 provider: None,
                 read_only: false,
@@ -824,6 +826,7 @@ impl Host {
             }
             let spec = CommandSpec {
                 workspace_lease: false,
+                git_inventory: false,
                 app_server: None,
                 provider: None,
                 read_only: false,
@@ -995,6 +998,7 @@ impl Host {
         }
         let spec = CommandSpec {
             workspace_lease: false,
+            git_inventory: false,
             app_server: if profile.provider == ProviderKind::CodexAppServer {
                 Some(crate::app_server::Start {
                     cwd: repository.to_owned(),
@@ -1129,7 +1133,11 @@ impl Host {
         let mut input_offset = 0;
         let mut resource_error = None;
         let mut next_workspace_check = Instant::now();
-        let mut output = Capture::new(if spec.output_limit_bytes > MAX_CAPTURE {
+        // JSON can escape each inventory byte to six bytes. stderr retains its
+        // ordinary control-output budget; no task log budget is increased.
+        let mut output = Capture::new(if spec.git_inventory {
+            6 * (crate::git_inventory::MAX_BYTES + MAX_PROBE_CAPTURE) + 128 * 1024
+        } else if spec.output_limit_bytes > MAX_CAPTURE {
             1024 * 1024
         } else {
             128 * 1024
@@ -1423,6 +1431,8 @@ fn check_workspace_budget(root: &Path, config: &HostConfig) -> io::Result<()> {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CommandSpec {
     #[serde(default)]
+    pub(crate) git_inventory: bool,
+    #[serde(default)]
     pub(crate) workspace_lease: bool,
     #[serde(default)]
     pub(crate) provider: Option<ProviderResult>,
@@ -1569,7 +1579,14 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
         .and_then(|_| nonblocking(&input));
     let mut input = Some(input);
     let mut input_offset = 0;
-    let mut output = Capture::new(spec.output_limit_bytes);
+    let mut output = Capture::new(if spec.git_inventory {
+        crate::git_inventory::MAX_BYTES
+    } else {
+        spec.output_limit_bytes
+    });
+    if spec.git_inventory {
+        output.inventory = Some(crate::git_inventory::Framing::default());
+    }
     let bidirectional = spec.app_server.is_some();
     let mut protocol = spec.provider.map(|result| {
         if let Some(start) = spec.app_server {
@@ -1858,6 +1875,7 @@ struct Capture {
     bytes: Vec<u8>,
     limit: usize,
     truncated: bool,
+    inventory: Option<crate::git_inventory::Framing>,
 }
 impl Capture {
     fn new(limit: usize) -> Self {
@@ -1866,6 +1884,7 @@ impl Capture {
             bytes: Vec::new(),
             limit,
             truncated: false,
+            inventory: None,
         }
     }
     fn drain(&mut self, reader: &mut impl Read) -> io::Result<()> {
@@ -1882,11 +1901,24 @@ impl Capture {
             match reader.read(&mut buffer) {
                 Ok(0) => {
                     self.eof = true;
+                    if let Some(inventory) = self.inventory.take()
+                        && let Err(error) = inventory.finish()
+                    {
+                        self.truncated = true;
+                        return Err(error);
+                    }
                     break;
                 }
                 Ok(read) => {
                     if let Some(parser) = &mut protocol {
                         parser.feed(&buffer[..read]);
+                    }
+                    if let Some(inventory) = &mut self.inventory
+                        && let Err(error) = inventory.feed(&buffer[..read])
+                    {
+                        self.inventory = None;
+                        self.truncated = true;
+                        return Err(error);
                     }
                     let keep = read.min(self.limit.saturating_sub(self.bytes.len()));
                     self.bytes.extend_from_slice(&buffer[..keep]);
@@ -1940,6 +1972,36 @@ fn truncate_utf8(text: &mut String, maximum: usize) {
 #[cfg(test)]
 mod capture_tests {
     use super::*;
+    #[test]
+    fn inventory_capture_and_json_envelope_remain_bounded() {
+        // The worst-case serializer expansion is six bytes per input byte.
+        let mut response = CommandResult::error(Outcome::Failure, "fixture");
+        response.stdout = "\0".repeat(crate::git_inventory::MAX_BYTES);
+        response.stderr = "\0".repeat(MAX_PROBE_CAPTURE);
+        let encoded = serde_json::to_vec(&response).unwrap();
+        let envelope_limit = 6 * (crate::git_inventory::MAX_BYTES + MAX_PROBE_CAPTURE) + 128 * 1024;
+        assert!(encoded.len() <= envelope_limit);
+        let mut capture = Capture::new(crate::git_inventory::MAX_BYTES);
+        capture.inventory = Some(crate::git_inventory::Framing::default());
+        let entry = format!("100644 blob {}\tname\0", "a".repeat(40));
+        let mut input = io::Cursor::new(entry.repeat(7000).into_bytes());
+        capture
+            .drain_to_eof(&mut input, None, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert!(!capture.is_truncated());
+        assert!(capture.bytes.len() > 367_835);
+        assert_eq!(capture.text(), entry.repeat(7000));
+        let mut generic = Capture::new(MAX_PROBE_CAPTURE);
+        generic
+            .drain_to_eof(
+                &mut io::Cursor::new(vec![b'x'; MAX_PROBE_CAPTURE + 1]),
+                None,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        assert!(generic.is_truncated());
+        assert_eq!(generic.bytes.len(), MAX_PROBE_CAPTURE);
+    }
     #[test]
     fn final_drain_observes_error_beyond_first_sixty_four_kib() {
         let profile: NativeProfile = serde_json::from_value(serde_json::json!({
