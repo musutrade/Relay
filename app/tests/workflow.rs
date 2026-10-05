@@ -83,6 +83,40 @@ assert os.environ['RELAY_GITHUB_REPOSITORY']=='example/project'
 pathlib.Path('.git/published').write_text(sha)
 print(json.dumps({'dry_run':True,'draft':True,'repository':'example/project','branch':'relay/task-'+os.environ['RELAY_TASK_ID']+'-g'+os.environ['RELAY_GENERATION'],'candidate_sha':sha,'reconciliation_required':False}))
 "#;
+const INVENTORY_WRAPPER: &str = r#"
+if 'ls-tree' in sys.argv and pathlib.Path('.git/test-0').is_file():
+    mode = __MODE__
+    header = b'100644 blob ' + b'a' * 40 + b'\t'
+    if mode == 'bytes':
+        size = 4 * 1024 * 1024 + 1
+        record = header + b'x' * 200 + b'\0'
+        count = (size - len(header) - 2) // len(record)
+        data = record * count + header + b'z' * (size - count * len(record) - len(header) - 1) + b'\0'
+        assert len(data) == size and count + 1 < 50000
+    elif mode == 'entries':
+        data = (header + b'x\0') * 50001
+        assert len(data) < 4 * 1024 * 1024
+    elif mode == 'path':
+        data = header + b'x' * 4097 + b'\0'
+    elif mode == 'unterminated':
+        data = header + b'original.txt'
+    elif mode == 'empty_record':
+        data = b'\0'
+    elif mode == 'invalid_utf8':
+        data = header + b'\xff\0'
+    elif mode == 'sleep':
+        pathlib.Path('.git/inventory-leader.pid').write_text(str(os.getpid()))
+        subprocess.Popen(['/usr/bin/python3', '-c', "import os,pathlib,subprocess,time; pathlib.Path('.git/inventory-child.pid').write_text(str(os.getpid())); child=subprocess.Popen(['/bin/sleep','60'],start_new_session=True); pathlib.Path('.git/inventory-grandchild.pid').write_text(str(child.pid)); time.sleep(60)"], start_new_session=True)
+        time.sleep(60)
+        sys.exit(0)
+    else:
+        raise AssertionError(mode)
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+    if mode in ('bytes', 'entries', 'path', 'empty_record'):
+        time.sleep(60)
+    sys.exit(0)
+"#;
 struct Fixture {
     _temp: TempDir,
     config: HostConfig,
@@ -179,6 +213,23 @@ impl Fixture {
             .unwrap()
             .max_repairs = count;
     }
+    fn git_wrapper(&mut self, body: &str) {
+        let script = self._temp.path().join("git-wrapper");
+        write_executable(
+            &script,
+            &format!(
+                "#!/usr/bin/python3\nimport os, pathlib, subprocess, sys, time\n{body}\nos.execv('/usr/bin/git', ['/usr/bin/git', *sys.argv[1:]])\n"
+            ),
+        );
+        self.config
+            .workflows
+            .get_mut("checked")
+            .unwrap()
+            .git_program = script;
+    }
+    fn inventory(&mut self, mode: &str) {
+        self.git_wrapper(&INVENTORY_WRAPPER.replace("__MODE__", &format!("{mode:?}")));
+    }
 }
 #[test]
 fn commits_then_tests_reviews_and_publishes_one_exact_candidate() {
@@ -203,6 +254,308 @@ fn commits_then_tests_reviews_and_publishes_one_exact_candidate() {
     assert!(!f.repository().join("ignored-secret.txt").exists());
     assert!(!f.source.join("changed.txt").exists());
     assert_eq!(git(&f.source, &["rev-parse", "HEAD"]), base);
+}
+#[test]
+fn large_git_inventory_reaches_exact_candidate_publication_with_tiny_task_logs() {
+    let mut f = Fixture::new();
+    f.config.output_limit_bytes = 1;
+    // Exercise every repeated candidate guard without thousands of hash processes.
+    f.config.timeout_seconds = 120;
+    let names: Vec<_> = (0..1500)
+        .map(|number| format!("inventory-{number:04}-{}.txt", "x".repeat(220)))
+        .collect();
+    for name in &names {
+        fs::write(f.source.join(name), "inventory fixture\n").unwrap();
+    }
+    git(&f.source, &["add", "."]);
+    git(&f.source, &["commit", "-m", "large inventory fixture"]);
+    let base = git(&f.source, &["rev-parse", "HEAD"]);
+    let manifest = git(&f.source, &["ls-tree", "-r", "-z", "HEAD", "--"]);
+    assert!(manifest.len() > 367_835);
+    assert!(manifest.len() < 4 * 1024 * 1024);
+
+    let result = f.run(true);
+    assert_eq!(result.outcome, Outcome::Success, "{}", result.to_json());
+    let workflow = result.workflow.as_ref().unwrap();
+    let candidate = workflow.candidate_sha.as_ref().unwrap();
+    assert_ne!(candidate, &base);
+    assert_eq!(workflow.base_sha.as_ref(), Some(&base));
+    assert_eq!(workflow.reviewed_sha.as_ref(), Some(candidate));
+    assert_eq!(workflow.rounds.len(), 1);
+    assert_eq!(&workflow.rounds[0].candidate_sha, candidate);
+    assert_eq!(
+        &workflow.publication.as_ref().unwrap().candidate_sha,
+        candidate
+    );
+    assert_eq!(git(&f.repository(), &["rev-parse", "HEAD"]), *candidate);
+    for phase in ["test-0", "review-0", "published"] {
+        assert_eq!(
+            fs::read_to_string(f.repository().join(".git").join(phase)).unwrap(),
+            *candidate
+        );
+    }
+    for command in [
+        result.agent.as_ref().unwrap(),
+        result.tests.as_ref().unwrap(),
+    ] {
+        assert!(command.stdout.len() <= 1);
+        assert!(command.stdout_truncated);
+    }
+    assert!(result.to_json().len() <= relay::MAX_RESULT_BYTES);
+    assert_eq!(git(&f.source, &["rev-parse", "HEAD"]), base);
+    assert_eq!(
+        git(&f.source, &["ls-tree", "-r", "-z", "HEAD", "--"]),
+        manifest
+    );
+    assert!(git(&f.source, &["status", "--porcelain=v1"]).is_empty());
+    assert!(!f.source.join("changed.txt").exists());
+    for name in names {
+        for repository in [&f.source, &f.repository()] {
+            assert_eq!(
+                fs::read_to_string(repository.join(&name)).unwrap(),
+                "inventory fixture\n"
+            );
+        }
+    }
+}
+
+fn assert_inventory_stopped_without_publication(f: &Fixture, result: &RunResult, base: &str) {
+    let workflow = result.workflow.as_ref().unwrap();
+    assert_eq!(workflow.rounds.len(), 1);
+    assert_eq!(workflow.reviewed_sha, None);
+    assert!(workflow.publication.is_none());
+    assert!(!workflow.reconciliation_required);
+    for phase in ["developer-1", "review-0", "published"] {
+        assert!(!f.repository().join(".git").join(phase).exists());
+    }
+    assert_inventory_candidate_preserved(f, result, base);
+}
+
+fn assert_inventory_candidate_preserved(f: &Fixture, result: &RunResult, base: &str) {
+    let candidate = result
+        .workflow
+        .as_ref()
+        .unwrap()
+        .candidate_sha
+        .as_ref()
+        .unwrap();
+    assert_eq!(git(&f.repository(), &["rev-parse", "HEAD"]), *candidate);
+    assert_eq!(
+        fs::read_to_string(f.repository().join(".git/test-0")).unwrap(),
+        *candidate
+    );
+    assert_eq!(
+        fs::read_to_string(f.repository().join("changed.txt")).unwrap(),
+        "candidate 0\n"
+    );
+    assert_eq!(git(&f.source, &["rev-parse", "HEAD"]), base);
+    assert!(git(&f.source, &["status", "--porcelain=v1"]).is_empty());
+    assert!(!f.source.join("changed.txt").exists());
+    for repository in [&f.source, &f.repository()] {
+        assert_eq!(
+            fs::read_to_string(repository.join("original.txt")).unwrap(),
+            "original\n"
+        );
+    }
+}
+
+#[test]
+fn invalid_git_inventory_stops_before_review_or_publication_and_preserves_files() {
+    for (mode, expected) in [
+        ("bytes", "4 MiB"),
+        ("entries", "50000"),
+        ("path", "4096"),
+        ("unterminated", "incomplete NUL-delimited"),
+        ("empty_record", "malformed Git inventory record"),
+        ("invalid_utf8", "supported UTF-8"),
+    ] {
+        let mut f = Fixture::new();
+        f.inventory(mode);
+        f.repairs(3);
+        let base = git(&f.source, &["rev-parse", "HEAD"]);
+        let result = f.run(true);
+        assert_eq!(
+            result.outcome,
+            Outcome::Failure,
+            "{mode}: {}",
+            result.to_json()
+        );
+        assert!(
+            result.error.as_deref().unwrap().contains(expected),
+            "{mode}: {}",
+            result.to_json()
+        );
+        assert_inventory_stopped_without_publication(&f, &result, &base);
+    }
+}
+
+#[test]
+fn ordinary_git_control_output_keeps_its_64_kib_limit() {
+    let mut f = Fixture::new();
+    f.git_wrapper(
+        "if 'status' in sys.argv:\n    sys.stdout.write('x' * (64 * 1024 + 1))\n    sys.exit(0)",
+    );
+    let base = git(&f.source, &["rev-parse", "HEAD"]);
+    let result = f.run(true);
+    assert_eq!(result.outcome, Outcome::Failure, "{}", result.to_json());
+    assert!(
+        result
+            .error
+            .unwrap()
+            .contains("Git control output exceeded its bound")
+    );
+    assert!(!f.repository().join(".git/developer-0").exists());
+    assert!(!f.repository().join(".git/published").exists());
+    assert_eq!(git(&f.source, &["rev-parse", "HEAD"]), base);
+    assert_eq!(
+        fs::read_to_string(f.source.join("original.txt")).unwrap(),
+        "original\n"
+    );
+}
+
+fn assert_inventory_process_tree_reaped(f: &Fixture) {
+    for process in ["leader", "child", "grandchild"] {
+        let pid: u32 =
+            fs::read_to_string(f.repository().join(format!(".git/inventory-{process}.pid")))
+                .unwrap()
+                .parse()
+                .unwrap();
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "inventory {process} process {pid} remains after command cleanup"
+        );
+    }
+}
+
+#[test]
+fn git_inventory_timeout_reaps_escaped_process_tree_before_return() {
+    let mut f = Fixture::new();
+    f.inventory("sleep");
+    f.repairs(3);
+    f.config.timeout_seconds = 6;
+    let base = git(&f.source, &["rev-parse", "HEAD"]);
+    let result = f.run(true);
+    assert_eq!(result.outcome, Outcome::TimedOut, "{}", result.to_json());
+    assert_inventory_process_tree_reaped(&f);
+    assert_inventory_stopped_without_publication(&f, &result, &base);
+}
+
+#[test]
+fn git_inventory_cancellation_reaps_escaped_process_tree_before_return() {
+    let mut f = Fixture::new();
+    f.inventory("sleep");
+    f.repairs(3);
+    let base = git(&f.source, &["rev-parse", "HEAD"]);
+    let host = Host::new(f.config.clone()).unwrap();
+    let task = f.task(true);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&cancellation);
+    let thread = std::thread::spawn(move || host.execute(&task, flag));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !f
+        .repository()
+        .join(".git/inventory-grandchild.pid")
+        .is_file()
+    {
+        if std::time::Instant::now() >= deadline {
+            cancellation.store(true, std::sync::atomic::Ordering::Release);
+            let result = thread.join().unwrap();
+            panic!("inventory process tree did not start: {}", result.to_json());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    cancellation.store(true, std::sync::atomic::Ordering::Release);
+    let result = thread.join().unwrap();
+    assert_eq!(result.outcome, Outcome::Cancelled, "{}", result.to_json());
+    assert_inventory_process_tree_reaped(&f);
+    assert_inventory_stopped_without_publication(&f, &result, &base);
+}
+
+#[test]
+fn python_publication_inventory_timeout_and_cancellation_reap_escaped_process_trees() {
+    for cancel in [false, true] {
+        let mut f = Fixture::new();
+        f.config.timeout_seconds = 6;
+        let inventory_program = f._temp.path().join("publication-inventory");
+        write_executable(
+            &inventory_program,
+            &format!(
+                "#!/usr/bin/python3\nimport os, pathlib, subprocess, sys, time\n{}",
+                INVENTORY_WRAPPER.replace("__MODE__", "'sleep'")
+            ),
+        );
+        let adapter_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples/github-draft-pr.py")
+            .canonicalize()
+            .unwrap();
+        let adapter = f.config.draft_pr_adapters.get_mut("publish").unwrap();
+        adapter.program = PathBuf::from("/usr/bin/python3");
+        adapter.args = vec!["-c".into(), r#"
+import importlib.util, os, pathlib
+spec = importlib.util.spec_from_file_location('github_draft_adapter', os.environ['FIXTURE_ADAPTER_SOURCE'])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+pathlib.Path('.git/adapter-leader.pid').write_text(str(os.getpid()))
+module.capture_inventory([os.environ['FIXTURE_INVENTORY_PROGRAM'], 'ls-tree'], dict(os.environ))
+pathlib.Path('.git/published').write_text(os.environ['RELAY_CANDIDATE_SHA'])
+"#.into()];
+        adapter.env.insert(
+            "FIXTURE_ADAPTER_SOURCE".into(),
+            adapter_source.to_string_lossy().into_owned(),
+        );
+        adapter.env.insert(
+            "FIXTURE_INVENTORY_PROGRAM".into(),
+            inventory_program.to_string_lossy().into_owned(),
+        );
+        let base = git(&f.source, &["rev-parse", "HEAD"]);
+        let host = Host::new(f.config.clone()).unwrap();
+        let task = f.task(true);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancellation);
+        let thread = std::thread::spawn(move || host.execute(&task, flag));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !f
+            .repository()
+            .join(".git/inventory-grandchild.pid")
+            .is_file()
+        {
+            if std::time::Instant::now() >= deadline {
+                cancellation.store(true, std::sync::atomic::Ordering::Release);
+                let result = thread.join().unwrap();
+                panic!("publication inventory did not start: {}", result.to_json());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if cancel {
+            cancellation.store(true, std::sync::atomic::Ordering::Release);
+        }
+        let result = thread.join().unwrap();
+        let expected = if cancel {
+            Outcome::Cancelled
+        } else {
+            Outcome::TimedOut
+        };
+        // Interrupted publication is conservatively a failed workflow requiring
+        // reconciliation, while the adapter retains its exact lifecycle outcome.
+        assert_eq!(result.outcome, Outcome::Failure, "{}", result.to_json());
+        assert_eq!(result.draft_pr.as_ref().unwrap().outcome, expected);
+        assert_inventory_process_tree_reaped(&f);
+        let adapter_pid: u32 = fs::read_to_string(f.repository().join(".git/adapter-leader.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(!Path::new(&format!("/proc/{adapter_pid}")).exists());
+        let workflow = result.workflow.as_ref().unwrap();
+        assert_eq!(workflow.reviewed_sha, workflow.candidate_sha);
+        assert!(workflow.reconciliation_required);
+        assert!(workflow.publication.is_none());
+        assert_eq!(
+            fs::read_to_string(f.repository().join(".git/review-0")).unwrap(),
+            *workflow.candidate_sha.as_ref().unwrap()
+        );
+        assert!(!f.repository().join(".git/published").exists());
+        assert_inventory_candidate_preserved(&f, &result, &base);
+    }
 }
 #[test]
 fn changes_requested_triggers_a_new_tested_and_reviewed_commit() {

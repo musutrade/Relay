@@ -2,6 +2,7 @@
 //! All direct database callers belong to the same trusted local OS account.
 mod app_server;
 pub mod auth;
+mod git_inventory;
 pub mod host;
 pub mod http;
 pub mod mcp;

@@ -422,6 +422,7 @@ impl Execution<'_> {
         self.host.run_supervised(
             CommandSpec {
                 workspace_lease: false,
+                git_inventory: false,
                 program: profile.program.clone(),
                 args: profile.args.iter().map(|arg| expand(arg)).collect(),
                 env,
@@ -575,6 +576,7 @@ impl Execution<'_> {
         let result = self.host.run_supervised(
             CommandSpec {
                 workspace_lease: false,
+                git_inventory: args.first() == Some(&"ls-tree"),
                 program: config.git_program.clone(),
                 args: fixed,
                 env,
@@ -653,15 +655,14 @@ impl Execution<'_> {
             &["ls-tree", "-r", "-z", candidate, "--"],
         )?;
         let tracked = parse_manifest(&manifest)?;
-        for batch in tracked.chunks(64) {
+        let mut remaining = tracked.as_slice();
+        while !remaining.is_empty() {
+            let count = hash_batch_len(remaining);
+            let (batch, rest) = remaining.split_at(count);
+            remaining = rest;
             let mut args = vec!["hash-object", "--no-filters", "--"];
-            let mut argument_bytes = 0usize;
             for file in batch {
                 self.active()?;
-                argument_bytes += file.path.len();
-                if argument_bytes > 32 * 1024 {
-                    return Err(Stop::failure("tracked path batch exceeds its bound"));
-                }
                 let metadata =
                     fs::symlink_metadata(self.repository.join(&file.path)).map_err(|error| {
                         Stop::failure(format!("candidate file is missing: {error}"))
@@ -969,7 +970,24 @@ struct TrackedFile {
     sha: String,
     executable: bool,
 }
+// Both argument count and bytes (including NULs) stay bounded for long paths.
+fn hash_batch_len(files: &[TrackedFile]) -> usize {
+    let mut bytes = 0;
+    files
+        .iter()
+        .take(64)
+        .take_while(|file| {
+            bytes += file.path.len() + 1;
+            bytes <= 32 * 1024
+        })
+        .count()
+}
 fn parse_manifest(text: &str) -> Result<Vec<TrackedFile>, Stop> {
+    let mut framing = crate::git_inventory::Framing::default();
+    framing
+        .feed(text.as_bytes())
+        .and_then(|_| framing.finish())
+        .map_err(|error| Stop::failure(error.to_string()))?;
     if text.contains('\u{fffd}') || (!text.is_empty() && !text.ends_with('\0')) {
         return Err(Stop::failure(
             "Git tree manifest is not complete supported UTF-8",
@@ -992,6 +1010,7 @@ fn parse_manifest(text: &str) -> Result<Vec<TrackedFile>, Stop> {
         }
         if path.is_empty()
             || path.chars().any(char::is_control)
+            || path.split('/').any(|part| matches!(part, "" | "." | ".."))
             || Path::new(path)
                 .components()
                 .any(|part| !matches!(part, Component::Normal(_)))
@@ -1396,6 +1415,47 @@ fn valid_pr_url(url: &str, repository: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inventory_paths_are_exact_and_fail_closed() {
+        let record = |path: &str| format!("100644 blob {}\t{path}\0", "a".repeat(40));
+        for path in [
+            " leading and trailing ",
+            "quote\"back\\slash",
+            "日本語",
+            "-option",
+        ] {
+            let manifest = parse_manifest(&record(path)).unwrap_or_else(|_| panic!("{path}"));
+            assert_eq!(manifest[0].path, path);
+        }
+        for path in [
+            "",
+            "/absolute",
+            "a//b",
+            "a/./b",
+            "a/../b",
+            "a/",
+            "tab\tname",
+            "line\nname",
+            "bad\u{fffd}",
+        ] {
+            assert!(parse_manifest(&record(path)).is_err(), "{path:?}");
+        }
+        let maximum = "x".repeat(crate::git_inventory::MAX_PATH_BYTES);
+        assert!(parse_manifest(&record(&maximum)).is_ok());
+        assert!(parse_manifest(&record(&(maximum.clone() + "x"))).is_err());
+        let files = (0..64)
+            .map(|_| TrackedFile {
+                path: maximum.clone(),
+                sha: "a".repeat(40),
+                executable: false,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(hash_batch_len(&files), 7);
+        assert!(parse_manifest(&format!("100755 blob {}\tsha256\0", "b".repeat(64))).is_ok());
+        assert!(parse_manifest("\0").is_err());
+        assert!(parse_manifest(record("file").trim_end_matches('\0')).is_err());
+        assert!(parse_manifest(&format!("100644 blob {}\tfile\0", "g".repeat(40))).is_err());
+    }
     #[test]
     fn review_is_exact_strict_and_bounded() {
         let sha = "a".repeat(40);
