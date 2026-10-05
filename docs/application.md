@@ -182,3 +182,9 @@ cargo run -p relay-app -- doctor /absolute/path/config.json
 `GET /api/config` 与 MCP 配置结果仅公开 profile 名称、供应商、配置模型/effort 和未知认证状态，不公开程序路径、完整命令或环境。原生适配是 CLI 子进程集成，不是 SDK 或托管模型服务；现阶段离线验收使用假 CLI，真实账户、模型费用与供应商端行为仍需在明确授权的环境单独验收。
 
 接口依据：[Codex 非交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)、[Claude 非交互模式](https://code.claude.com/docs/en/headless)、[Claude CLI 参数](https://code.claude.com/docs/en/cli-reference)。CLI 接口会演进，安装版本与能力探测结果优先。
+
+### 审查输入
+
+工作流可选 `review_focus`（1–8192 UTF-8 字节）提供可信宿主选择的验收条件，独立于开发需求中的执行、复制测试、发布和监控步骤。省略时仍以原需求作为参考数据，并明确禁止审查者执行其中的开发指令。该字段不改变只读工具、精确 SHA、JSON verdict 或发布门禁；更改已有工作区绑定的工作流配置仍会被拒绝。
+
+审查提示包含宿主记录的测试 profile、candidate SHA、退出状态、有界 stdout/stderr，以及测试后 HEAD/index/原始文件校验结论。不从 Agent 文字推断测试数量或外部文件哈希；没有独立验证的外部输入会明确标为未验证。审查只读取 candidate 内文件及本地 diff，不要求直接读取工作区外固定测试。
