@@ -18,6 +18,8 @@ pub struct Continuation {
     pub predecessor_generation: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_only: Option<crate::workflow::ReviewContinuation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_adoption: Option<crate::workflow::PinnedReviewAdoption>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -276,6 +278,7 @@ pub(crate) fn continuation(
         predecessor_task_id: task.id,
         predecessor_generation: task.generation,
         review_only: None,
+        operator_adoption: None,
     })
 }
 pub(crate) fn attempt(path: &Path) -> io::Result<u64> {

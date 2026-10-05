@@ -319,6 +319,12 @@ impl RunResult {
                 }
             }
             if !reduced {
+                reduced = value
+                    .workflow
+                    .as_mut()
+                    .is_some_and(WorkflowResult::shrink_review_evidence);
+            }
+            if !reduced {
                 value.workspace = None;
                 value.error = Some("result metadata exceeded the persistence budget".into());
                 for command in [&mut value.agent, &mut value.tests, &mut value.draft_pr]

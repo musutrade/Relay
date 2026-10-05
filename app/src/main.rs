@@ -13,6 +13,36 @@ fn main() {
 }
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("adopt-review") {
+        if args.len() != 6 {
+            return Err("usage: relay-app adopt-review <config.json> <db-path> <predecessor-id> <request.json>".into());
+        }
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&args[5])?;
+        if !file.metadata()?.is_file() {
+            return Err("adoption request must be a regular JSON file".into());
+        }
+        let mut bytes = Vec::new();
+        file.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 16 * 1024 {
+            return Err("adoption request exceeds 16 KiB".into());
+        }
+        let request = serde_json::from_slice::<relay_app::ReviewAdoptionRequest>(&bytes)?;
+        let id: i64 = args[4].parse()?;
+        if id <= 0 {
+            return Err("positive predecessor task id required".into());
+        }
+        let app = Application::open(&args[3], HostConfig::load(&args[2])?)?;
+        println!(
+            "{}",
+            serde_json::to_string(&app.adopt_review(id, request)?)?
+        );
+        return Ok(());
+    }
     if matches!(
         args.get(1).map(String::as_str),
         Some("auth-init" | "auth-password")

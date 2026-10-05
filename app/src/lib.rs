@@ -66,6 +66,16 @@ pub struct ReviewContinuationRequest {
     pub review_focus: Option<String>,
 }
 
+/// Local operator acceptance of one complete, previously inspected response.
+/// This is not a new model run or automatic reuse of test evidence.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewAdoptionRequest {
+    pub key: String,
+    pub confirm_stopped_and_reconciled: bool,
+    pub adoption: workflow::ReviewAdoption,
+}
+
 /// Adapter-owned continuation metadata; the core task and result stay immutable.
 #[derive(Serialize)]
 pub struct TaskView {
@@ -153,7 +163,7 @@ impl Application {
     /// One explicit successor per predecessor. Reservation precedes core submission,
     /// and its stable key/payload make a crash between the two operations retryable.
     pub fn retry(&self, id: i64, input: RetryRequest) -> Result<Task> {
-        self.continue_task(id, input, None)
+        self.continue_task(id, input, None, None)
     }
     /// Explicit operator action: preserve the candidate, revalidate host tests once,
     /// and resume only the compatible reviewer. No developer or repair phase runs.
@@ -169,6 +179,19 @@ impl Application {
                 confirm_stopped_and_reconciled: input.confirm_stopped_and_reconciled,
             },
             Some(input.review_focus),
+            None,
+        )
+    }
+    pub fn adopt_review(&self, id: i64, input: ReviewAdoptionRequest) -> Result<Task> {
+        input.adoption.validate().map_err(Error::Invalid)?;
+        self.continue_task(
+            id,
+            RetryRequest {
+                key: input.key,
+                confirm_stopped_and_reconciled: input.confirm_stopped_and_reconciled,
+            },
+            None,
+            Some(input.adoption),
         )
     }
     fn continue_task(
@@ -176,6 +199,7 @@ impl Application {
         id: i64,
         input: RetryRequest,
         review_focus: Option<Option<String>>,
+        adoption: Option<workflow::ReviewAdoption>,
     ) -> Result<Task> {
         if !input.confirm_stopped_and_reconciled {
             return Err(Error::Invalid("confirm inspection of the stopped run and its possible side effects before continuing".into()));
@@ -195,6 +219,23 @@ impl Application {
             )
             .optional()?;
         let (key, payload) = if let Some(reservation) = reservation {
+            // An adoption retry must not silently accept a different response,
+            // candidate, or an earlier reservation for a different action.
+            if let Some(request) = &adoption {
+                let reserved: Job = serde_json::from_str(&reservation.1)
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                if reserved
+                    .continuation
+                    .as_ref()
+                    .and_then(|c| c.operator_adoption.as_ref())
+                    .map(|pinned| &pinned.request)
+                    != Some(request)
+                {
+                    return Err(Error::Invalid(
+                        "predecessor already has a different continuation reservation".into(),
+                    ));
+                }
+            }
             reservation
         } else {
             if predecessor.state != relay::State::Finished {
@@ -240,6 +281,17 @@ impl Application {
                     .as_mut()
                     .expect("continuation recorded")
                     .review_only = Some(review);
+            }
+            if let Some(request) = adoption {
+                let pinned =
+                    workflow::pin_review_adoption(&result, request).map_err(Error::Invalid)?;
+                if job.workflow.is_none() {
+                    return Err(Error::Invalid("review adoption requires a workflow".into()));
+                }
+                job.continuation
+                    .as_mut()
+                    .expect("continuation recorded")
+                    .operator_adoption = Some(pinned);
             }
             let payload = serde_json::to_string(&job).map_err(|e| Error::Invalid(e.to_string()))?;
             let conflicting: Option<String> = tx
