@@ -836,6 +836,7 @@ with sync_playwright() as p:
     page.locator('#retry-replace').check();page.locator('#replacement-profile').select_option('codex')
     page.locator('#replacement-model-source').select_option('catalog');page.locator('#replacement-model').select_option('fixture-model');page.locator('#replacement-effort').select_option('high')
     expect(page.locator('#replacement-stage')).to_contain_text('保留原轮次 1 与剩余修复预算 1')
+    expect(page.locator('#retry-dialog-description')).to_contain_text('在已停止的开发阶段继续，保留原轮次和剩余修复预算')
     expect(page.locator('#replacement-session')).to_contain_text('旧原生历史不能跨供应商兼容恢复')
     page.locator('#replacement-permission').select_option('codex_full_access')
     expect(page.locator('#replacement-confirm-text')).to_contain_text('expanded filesystem AND network access')
@@ -847,6 +848,7 @@ with sync_playwright() as p:
         expect(page.locator('#replacement-confirm-text')).to_contain_text('<img src=x>')
         assert page.locator('#replacement-confirm-text img, #replacement-mode-reasons img').count()==0
         page.locator('#replacement-confirm').check()
+        expect(page.locator('#retry-dialog-error')).to_be_hidden()
     data['replacement_expiry_ms']=-1;page.locator('#replacement-challenge').click()
     expect(page.locator('#replacement-challenge-status')).to_contain_text('读取失败');expect(page.locator('#replacement-confirm')).to_be_disabled()
     data['replacement_expiry_ms']=300000;confirm_replacement()

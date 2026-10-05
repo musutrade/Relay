@@ -79,11 +79,12 @@
     const catalogState = { open: false, profiles: new Map(), refreshing: new Map(), errors: new Map(), epoch: null, epochVersion: 0, retiredEpochs: new Set(), requestVersion: 0, readVersion: 0, readController: null, reading: false, loaded: false };
     const resourceState = { estimate: null, estimateKey: '', estimateVersion: 0, estimateController: null, estimateLoading: false, estimateError: '', operator: null, operatorTask: null, operatorVersion: 0, operatorController: null, operatorLoading: false, operatorError: '' };
     const roleState = { developer: {}, reviewer: {} }, roleRenderKeys = new Map();
-    const replacementState = { enabled: false, choice: {}, challenge: null, expires: 0, key: '', version: 0, controller: null, loading: false, text: '', scope: null, error: '' };
+    const replacementConsentError = '请先读取本次替换的精确权限范围，再勾选明确风险确认；不能复用之前的权限同意';
+    const replacementState = { enabled: false, choice: {}, consentValidation: false, baseDescription: '', challenge: null, expires: 0, key: '', version: 0, controller: null, loading: false, text: '', scope: null, error: '' };
     const permissionState = { challenge: null, expires: 0, key: '', version: 0, controller: null, loading: false, text: '', scope: null, error: '' };
     class ApiError extends Error { constructor(message, status = 0) { super(message); this.status = status; } }
     function announce(message) { $('announcement').textContent = message; }
-    function showMessage(id, message, kind = '') { const node = $(id); node.textContent = message; node.hidden = !message; if (id === 'form-message') node.className = 'form-message ' + kind; }
+    function showMessage(id, message, kind = '') { if (id === 'retry-dialog-error') replacementState.consentValidation = false; const node = $(id); node.textContent = message; node.hidden = !message; if (id === 'form-message') node.className = 'form-message ' + kind; }
     function formatError(error) { return error instanceof ApiError ? error.message : '无法连接到服务。请检查网络与服务端是否正常运行'; }
     function isAborted(error) { return error && error.name === 'AbortError'; }
     async function api(path, options = {}) {
@@ -488,7 +489,7 @@
       $('replacement-challenge-scope').textContent = ''; $('replacement-challenge-status').textContent = error;
     }
     function resetReplacement() {
-      invalidateReplacementConsent(); replacementState.enabled = false; replacementState.choice = {}; $('retry-replace').checked = false; $('replacement-settings').hidden = true;
+      invalidateReplacementConsent(); replacementState.enabled = false; replacementState.choice = {}; replacementState.consentValidation = false; replacementState.baseDescription = ''; $('retry-replace').checked = false; $('replacement-settings').hidden = true;
       for (const suffix of ['profile', 'model-source', 'model', 'manual-model', 'effort', 'permission']) $('replacement-' + suffix).value = '';
       for (const suffix of ['stage', 'defaults', 'model-note', 'permission-note', 'mode-reasons', 'confirm-text', 'challenge-status', 'challenge-scope']) $('replacement-' + suffix).replaceChildren();
     }
@@ -511,8 +512,13 @@
       if (choice.effort && !replacementEfforts().some(item => item.effort === choice.effort)) return '替换 effort 必须来自当前目录模型已报告的支持列表';
       const mode = replacementMode();
       if (choice.native_permission && (!mode || !allowedNativeMode(role, profile, mode))) return '替换原生模式不受宿主允许、不可用或不符合只读角色';
-      if (requireConfirmation && mode?.requires_confirmation && (!validReplacementChallenge() || choice.confirm_permission_expansion !== true)) return '请先读取本次替换的精确权限范围，再勾选明确风险确认；不能复用之前的权限同意';
+      if (requireConfirmation && mode?.requires_confirmation && (!validReplacementChallenge() || choice.confirm_permission_expansion !== true)) return replacementConsentError;
       return '';
+    }
+    function clearResolvedReplacementConsentValidation() {
+      // Only this locally tagged validation can be cleared here. Server errors and
+      // frozen/unknown-outcome notices keep their own lifecycle.
+      if (replacementState.consentValidation && !replacementLocked() && validReplacementChallenge() && replacementState.choice.confirm_permission_expansion === true && !validateReplacement()) showMessage('retry-dialog-error', '');
     }
     function renderReplacement() {
       const task = replacementTask(), pending = replacementPending(), action = replacementAction(), capability = action?.replacement;
@@ -520,6 +526,9 @@
       if (!task) return;
       if (!pending && replacementState.challenge && !validReplacementChallenge()) invalidateReplacementConsent(replacementState.expires <= Date.now() ? '权限范围确认已过期，请重新读取并核对' : '任务、动作或选择已变化，请重新读取权限范围');
       const locked = replacementLocked(), enabled = pending ? Boolean(pending.body.replacement) : replacementState.enabled, role = replacementRole();
+      $('retry-dialog-description').textContent = enabled && role === 'developer'
+        ? '将在已停止的开发阶段继续，保留原轮次和剩余修复预算，沿用原需求与工作目录，不从源仓库重新复制；后续阶段仍按原任务配置执行。请先检查失败结果，确认旧执行已停止，并已核对可能发生的外部操作。每个原任务只有一个后继；已有预留时沿用服务端冻结的替换选择与执行模式'
+        : replacementState.baseDescription;
       $('retry-replace').checked = enabled; $('retry-replace').disabled = locked || capability?.allowed !== true;
       $('retry-replacement-status').textContent = pending ? '已冻结本次续接的实际请求；模式、替换选择、容量与原确认不能修改。其他页面首次预留获胜时显示服务端实际选择'
         : capability?.allowed ? '仅替换已停止的' + (role === 'reviewer' ? '审查' : '开发') + '阶段；默认保留原配置。' + (action.ordinary_allowed === false ? '原配置续接不可用，必须显式选择替换才可提交' : '普通同配置续接仍可直接使用')
@@ -571,6 +580,7 @@
       $('replacement-confirm-text').textContent = pending ? '服务端已预留的原权限确认；恢复同一次请求不重新授权或扩大范围' : permissionRisk(mode) + (replacementState.text ? ' 服务端确认：' + replacementState.text.slice(0, 1000) : '');
       $('replacement-challenge-status').textContent = pending ? '保留原 challenge 与确认；不因过期或重启而更换' : replacementState.loading ? '正在核对前置任务、动作与本次角色选择…' : replacementState.error || (validReplacementChallenge() ? '已读取精确范围；核对后勾选，有效至 ' + new Date(replacementState.expires).toLocaleTimeString('zh-CN', { hour12: false }) : '先读取本次替换的精确范围；过去任务和不执行的其他角色同意不能代替本次确认');
       $('replacement-challenge-scope').textContent = replacementState.scope ? '前置任务 #' + replacementState.scope.predecessor_task_id + '；动作 ' + replacementState.scope.action + '；执行角色 ' + replacementState.scope.role + '。' + permissionScopeText(replacementState.scope) : '';
+      clearResolvedReplacementConsentValidation();
     }
     async function readReplacementChallenge() {
       if (replacementLocked() || replacementState.loading || !replacementState.enabled || !replacementMode()?.requires_confirmation) return;
@@ -595,7 +605,7 @@
     $('replacement-manual-model').addEventListener('input', () => { if (replacementLocked()) return; replacementState.choice.model = { value: $('replacement-manual-model').value, source: 'manual' }; replacementState.choice.effort = ''; invalidateReplacementConsent(); renderReplacement(); });
     for (const [suffix, property] of [['effort', 'effort'], ['permission', 'native_permission']]) $('replacement-' + suffix).addEventListener('change', () => { if (replacementLocked()) return; replacementState.choice[property] = $('replacement-' + suffix).value; invalidateReplacementConsent(); renderReplacement(); });
     $('replacement-challenge').addEventListener('click', readReplacementChallenge);
-    $('replacement-confirm').addEventListener('change', () => { if (!replacementLocked() && validReplacementChallenge()) replacementState.choice.confirm_permission_expansion = $('replacement-confirm').checked === true; else $('replacement-confirm').checked = false; });
+    $('replacement-confirm').addEventListener('change', () => { if (!replacementLocked() && validReplacementChallenge()) replacementState.choice.confirm_permission_expansion = $('replacement-confirm').checked === true; else $('replacement-confirm').checked = false; clearResolvedReplacementConsentValidation(); });
     $('review-focus').addEventListener('input', () => { if (!replacementLocked()) { invalidateReplacementConsent(); renderReplacement(); } });
     function validOperator(data, task) {
       const r = data?.resources, recovery = data?.recovery, saved = recovery?.reserved_request;
@@ -1104,6 +1114,7 @@
         : reserved ? '将恢复服务端已预留的同一次续接，沿用已记录的执行模式、审查重点和工作区，不创建副本。请确认旧执行已停止，并已核对可能发生的外部操作'
         : '将创建新的任务编号，沿用原需求、配置和工作目录，不从源仓库重新复制；工作流会重新执行开发、测试与审查。请先检查失败结果，确认旧执行已停止，并已核对可能发生的外部操作。其他页面已预留时沿用其续接模式；若要从头开始，请使用提交新任务表单';
       if (review) $('retry-dialog-description').textContent += jobFor(task).publish === true ? '。原任务已请求自动发布：审查批准后仍按原设置发布；不会重放已尝试的发布' : '。原任务未请求自动发布';
+      replacementState.baseDescription = $('retry-dialog-description').textContent;
       $('review-focus-field').hidden = !review;
       $('review-focus').value = pending?.body.review_focus || '';
       $('review-focus').disabled = Boolean(pending);
@@ -1136,7 +1147,7 @@
       if (task && successorId(task)) { $('retry-dialog').close(); await selectTask(successorId(task)); return; }
       if (state.selectedId !== id || !task || !recoveryAction(task, mode)) { $('retry-dialog').close(); return; }
       if (!state.retryRequests.has(id)) {
-        const replacementError = validateReplacement(); if (replacementError) { showMessage('retry-dialog-error', replacementError); renderReplacement(); return; }
+        const replacementError = validateReplacement(); if (replacementError) { showMessage('retry-dialog-error', replacementError); replacementState.consentValidation = replacementError === replacementConsentError; renderReplacement(); return; }
         const focus = $('review-focus').value, quotaText = $('retry-quota').value.trim(), quota = Number(quotaText), action = recoveryAction(task, mode), resources = operatorFor(task).resources;
         if (quotaText && (!action.quota_increase_allowed || !byteValue(quota) || quota < (action.min_quota_bytes || 1) || quota > Math.min(action.max_quota_bytes, resources.host_policy_cap_bytes))) { showMessage('retry-dialog-error', '容量必须严格提高，且在宿主允许的字节范围内；请刷新此任务资源核对最新策略'); return; }
         if (!quotaText && action.quota_increase_required) { showMessage('retry-dialog-error', '宿主要求显式提高容量后才能恢复，请选择允许范围内的字节数；不能使用无覆盖续接'); return; }

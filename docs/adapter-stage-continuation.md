@@ -43,7 +43,7 @@ MCP 为 `relay_replacement_challenge`。返回 `challenge`、到期时间、确�
 
 同一 immediate transaction 和独占工作区 lease 内，验证不可变前置结果、claim 所有者、现场 checkpoint 与允许的唯一角色差异，再冻结后继。首个成功预留固定所有选择、动作与额度；其他标签页、不同 key、跨连接请求返回该后继。重启或预留/核心提交间隙也恢复同一冻结 payload，不依赖旧 challenge 或目录仍新鲜。不会重新复制现场。后继 payload 超过核心 64 KiB 上限时在预留前拒绝。
 
-新的 `job.role_epochs` 是服务器专用的持久角色身份；每个改变的角色获得随机 epoch 和 `sessions/<role>-<epoch>.json`。未改变角色沿用自己的 epoch；没有 epoch 的旧任务继续使用 `sessions/<role>.json`。旧文件不覆盖，旧绑定和历史保留。跨供应商始终新建 Codex thread 或 Claude session-id，不把旧供应商 ID 交给新适配器；同供应商改模型同样使用新 epoch。后续普通继续沿用这个新 epoch。第一次创建会话的允许标记在 provider 启动前被持久消费；损坏、缺失 ID、缺失已用 epoch 文件均拒绝，不静默新建。
+新的 `job.role_epochs` 是服务器专用的持久角色身份；每个改变的角色都获得随机 epoch。仅 Codex app-server 或设置 `session_continuity:true` 的原生 profile 创建 `sessions/<role>-<epoch>.json` 和由 Relay 管理的新 provider thread/session ID；通用命令与其他未启用续接的原生 profile 使用新的调用，不创建这些会话记录，也没有 Relay 管理的 resume 历史。未改变角色沿用自己的 epoch；没有 epoch 的旧有状态任务继续使用 `sessions/<role>.json`。旧文件不覆盖，旧绑定和历史保留。跨供应商不把旧 ID 交给新适配器；启用续接时新建 Codex thread 或 Claude session-id，同供应商改模型同样使用新 epoch。后续普通继续沿用这个新 epoch。有状态会话第一次创建的允许标记在 provider 启动前被持久消费；损坏、缺失 ID、缺失已用 epoch 文件均拒绝，不静默新建。
 
 执行前在 lease 下再次验证前置证明、当前策略和 candidate。普通 continuation 仍要求原 reviewer 会话可续接；显式 reviewer 替换可在旧 session ID 缺失时开始新 epoch，但仍要求原候选和 checkout 可证明。当前更换 reviewer 必须保留原 checkout 拓扑：有状态独立审查副本与无状态审查工作目录之间的转换返回 `reviewer_topology_change_unsupported`，不会重置/复制已有 checkout。Codex/astra reviewer 仍为 `review_profile_unsupported`，本阶段不宣称完成未验证的只读隔离。
 

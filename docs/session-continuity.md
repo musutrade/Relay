@@ -50,4 +50,4 @@ Codex app-server 的 `usage` 旧字段继续保留 `tokenUsage.last`（最后一
 
 ## 显式更换角色的独立 epoch
 
-[阶段替换](adapter-stage-continuation.md)给改变的角色创建服务器所有的 `role_epochs`，使用独立 `sessions/<role>-<epoch>.json`；未改变的角色保留原 epoch，旧记录继续使用原文件名。新 epoch 的记录本身也绑定 epoch，拒绝复制旧记录或另一个 epoch 的 ID。跨供应商与同供应商改模型都从新会话开始；后续普通 retry 只恢复已接受的新 epoch，不回退到 legacy 文件。旧 session 及任务结果原样保留。
+[阶段替换](adapter-stage-continuation.md)给每个改变的角色创建服务器所有的 `role_epochs`。仅 Codex app-server 或设置 `session_continuity:true` 的原生 profile 创建独立 `sessions/<role>-<epoch>.json` 与由 Relay 管理的新 provider thread/session ID；通用命令与其他无状态原生 profile 使用新的调用，没有 Relay 管理的 resume 历史。未改变的角色保留原 epoch，旧有状态记录继续使用原文件名。新 epoch 的会话记录本身也绑定 epoch，拒绝复制旧记录或另一个 epoch 的 ID。跨供应商与同供应商改模型都不复用旧会话 ID；有状态 profile 的后续普通 retry 只恢复已接受的新 epoch，不回退到 legacy 文件。旧 session 及任务结果原样保留。
