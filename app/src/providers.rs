@@ -424,6 +424,7 @@ pub struct ProtocolParser {
     read_only: bool,
     answer_seen: bool,
     app_server: Option<crate::app_server::Driver>,
+    catalog: Option<crate::capabilities::CatalogDriver>,
 }
 impl ProtocolParser {
     pub fn new(mut result: ProviderResult) -> Self {
@@ -437,6 +438,7 @@ impl ProtocolParser {
             read_only: false,
             answer_seen: false,
             app_server: None,
+            catalog: None,
         }
     }
     pub(crate) fn app_server(result: ProviderResult, start: crate::app_server::Start) -> Self {
@@ -444,18 +446,35 @@ impl ProtocolParser {
         parser.app_server = Some(crate::app_server::Driver::new(result, start));
         parser
     }
+    pub(crate) fn catalog(result: ProviderResult) -> Self {
+        let mut parser = Self::new(result);
+        parser.catalog = Some(crate::capabilities::CatalogDriver::new());
+        parser
+    }
+    pub(crate) fn catalog_result(&self) -> Option<Vec<crate::capabilities::ModelCapability>> {
+        self.catalog.as_ref().and_then(|driver| driver.models())
+    }
     pub(crate) fn pending(&mut self) -> Vec<u8> {
+        if let Some(driver) = &mut self.catalog {
+            return driver.take_pending();
+        }
         self.app_server
             .as_mut()
             .map(|driver| driver.take_pending())
             .unwrap_or_default()
     }
     pub(crate) fn stopped(&self) -> bool {
+        if let Some(driver) = &self.catalog {
+            return driver.stopped();
+        }
         self.app_server
             .as_ref()
             .is_some_and(|driver| driver.stopped())
     }
     pub(crate) fn failure(&self) -> Option<&str> {
+        if let Some(driver) = &self.catalog {
+            return driver.failure();
+        }
         self.app_server.as_ref().and_then(|driver| driver.failure())
     }
     pub fn read_only(mut self, enabled: bool) -> Self {
@@ -463,6 +482,10 @@ impl ProtocolParser {
         self
     }
     pub fn feed(&mut self, bytes: &[u8]) {
+        if let Some(driver) = &mut self.catalog {
+            driver.feed(bytes);
+            return;
+        }
         if let Some(driver) = &mut self.app_server {
             driver.feed(bytes);
             return;
@@ -714,6 +737,9 @@ impl ProtocolParser {
         Ok(())
     }
     pub fn finish(mut self) -> (ProviderResult, Option<String>) {
+        if let Some(driver) = self.catalog.take() {
+            return (self.result, driver.finish().err());
+        }
         if let Some(driver) = self.app_server.take() {
             return driver.finish();
         }

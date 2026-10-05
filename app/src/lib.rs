@@ -2,6 +2,8 @@
 //! All direct database callers belong to the same trusted local OS account.
 mod app_server;
 pub mod auth;
+pub mod capabilities;
+mod catalog_cache;
 mod git_inventory;
 pub mod host;
 pub mod http;
@@ -33,6 +35,8 @@ pub enum Error {
     Database(#[from] rusqlite::Error),
     #[error("{0}")]
     Invalid(String),
+    #[error("{0}")]
+    DiscoveryUnavailable(String),
     #[error(
         "task execution is unknown after restart; confirm the old process tree has stopped before local recovery"
     )]
@@ -107,6 +111,7 @@ struct StateData {
     running: Option<(relay::Claim, Arc<AtomicBool>)>,
 }
 pub struct Application {
+    catalogs: Mutex<catalog_cache::CatalogCache>,
     state: Mutex<StateData>,
     pub host: Host,
     pub config: HostConfig,
@@ -121,6 +126,7 @@ impl Application {
         // Adapter-owned metadata. It does not change the core queue state machine.
         control.execute_batch("CREATE TABLE IF NOT EXISTS app_continuations(predecessor_id INTEGER PRIMARY KEY, key TEXT NOT NULL, payload TEXT NOT NULL, task_id INTEGER); CREATE TABLE IF NOT EXISTS app_cancellations(task_id INTEGER PRIMARY KEY REFERENCES tasks(id)); CREATE TABLE IF NOT EXISTS app_diagnostics(task_id INTEGER PRIMARY KEY, generation INTEGER NOT NULL, result TEXT NOT NULL);")?;
         Ok(Arc::new(Self {
+            catalogs: Mutex::new(catalog_cache::CatalogCache::default()),
             state: Mutex::new(StateData {
                 store,
                 control,
@@ -327,6 +333,40 @@ impl Application {
             None => None,
         };
         Ok(json!({"active":active,"recovery_required":recovery_required,"diagnostic":diagnostic}))
+    }
+    /// Cached catalog reads never launch agents or authenticate with providers.
+    pub fn capabilities(&self) -> Result<Vec<catalog_cache::CatalogView>> {
+        let mut cache = self.catalogs.lock().map_err(|_| Error::Poisoned)?;
+        Ok(self
+            .config
+            .native_agents
+            .iter()
+            .map(|(name, profile)| cache.view(name, profile))
+            .collect())
+    }
+    /// Explicit operator request; does not start a user turn or submit work.
+    pub fn refresh_capabilities(&self, name: &str) -> Result<catalog_cache::CatalogView> {
+        let profile = self
+            .config
+            .native_agents
+            .get(name)
+            .ok_or_else(|| Error::Invalid("native profile is not allowlisted".into()))?;
+        let generation = {
+            let mut cache = self.catalogs.lock().map_err(|_| Error::Poisoned)?;
+            cache.reconciled_guard(capabilities::discovery_guard_present(&self.host));
+            match cache
+                .begin(name, profile)
+                .map_err(|error| Error::DiscoveryUnavailable(error.into()))?
+            {
+                Some(generation) => generation,
+                None => return Ok(cache.view(name, profile)),
+            }
+        };
+        let catalog = capabilities::discover(&self.host, profile);
+        let cleanup_confirmed =
+            catalog.process_cleanup.state == capabilities::CapabilityState::Supported;
+        let mut cache = self.catalogs.lock().map_err(|_| Error::Poisoned)?;
+        Ok(cache.finish(name, profile, generation, catalog, cleanup_confirmed))
     }
     pub fn public_config(&self) -> Value {
         let agents: Vec<_> = self

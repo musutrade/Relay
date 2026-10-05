@@ -224,6 +224,8 @@ pub enum Outcome {
 pub struct CommandResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<Vec<crate::capabilities::ModelCapability>>,
     pub outcome: Outcome,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
@@ -239,6 +241,7 @@ impl CommandResult {
     pub(crate) fn error(outcome: Outcome, error: impl Into<String>) -> Self {
         Self {
             provider: None,
+            catalog: None,
             outcome,
             exit_code: None,
             signal: None,
@@ -657,6 +660,7 @@ impl Host {
                     input: String::new(),
                     timeout_ms: remaining_ms(deadline),
                     output_limit_bytes: MAX_CAPTURE,
+                    catalog: false,
                     app_server: None,
                     provider: None,
                     read_only: false,
@@ -760,6 +764,7 @@ impl Host {
             let spec = CommandSpec {
                 workspace_lease: false,
                 git_inventory: false,
+                catalog: false,
                 app_server: None,
                 provider: None,
                 read_only: false,
@@ -851,6 +856,7 @@ impl Host {
             let spec = CommandSpec {
                 workspace_lease: false,
                 git_inventory: false,
+                catalog: false,
                 app_server: None,
                 provider: None,
                 read_only: false,
@@ -1030,6 +1036,7 @@ impl Host {
         let spec = CommandSpec {
             workspace_lease: false,
             git_inventory: false,
+            catalog: false,
             app_server: if profile.provider == ProviderKind::CodexAppServer {
                 Some(crate::app_server::Start {
                     cwd: repository.to_owned(),
@@ -1170,7 +1177,9 @@ impl Host {
         let mut next_workspace_check = Instant::now();
         // JSON can escape each inventory byte to six bytes. stderr retains its
         // ordinary control-output budget; no task log budget is increased.
-        let mut output = Capture::new(if spec.git_inventory {
+        let mut output = Capture::new(if spec.catalog {
+            2 * crate::capabilities::MAX_CATALOG_RESPONSE_BYTES
+        } else if spec.git_inventory {
             6 * (crate::git_inventory::MAX_BYTES + MAX_PROBE_CAPTURE) + 128 * 1024
         } else if spec.output_limit_bytes > MAX_CAPTURE {
             1024 * 1024
@@ -1537,6 +1546,8 @@ pub(crate) struct CommandSpec {
     #[serde(default)]
     pub(crate) app_server: Option<crate::app_server::Start>,
     #[serde(default)]
+    pub(crate) catalog: bool,
+    #[serde(default)]
     pub(crate) read_only: bool,
     #[serde(default)]
     pub(crate) clear_env: bool,
@@ -1577,6 +1588,11 @@ pub fn supervisor_main() -> i32 {
             || spec.output_limit_bytes == 0
             || spec.output_limit_bytes > MAX_PROBE_CAPTURE
             || spec.input.len() > MAX_PHASE_INPUT
+            || (spec.catalog
+                && (spec.provider.is_none()
+                    || spec.app_server.is_some()
+                    || spec.git_inventory
+                    || !spec.input.is_empty()))
         {
             return Err(io::Error::other("invalid supervisor limits"));
         }
@@ -1685,9 +1701,11 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
     if spec.git_inventory {
         output.inventory = Some(crate::git_inventory::Framing::default());
     }
-    let bidirectional = spec.app_server.is_some();
+    let bidirectional = spec.app_server.is_some() || spec.catalog;
     let mut protocol = spec.provider.map(|result| {
-        if let Some(start) = spec.app_server {
+        if spec.catalog {
+            ProtocolParser::catalog(result)
+        } else if let Some(start) = spec.app_server {
             ProtocolParser::app_server(result, start)
         } else {
             ProtocolParser::new(result).read_only(spec.read_only)
@@ -1854,6 +1872,7 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
             ));
         }
     }
+    let catalog = protocol.as_ref().and_then(ProtocolParser::catalog_result);
     let provider = protocol.map(|parser| {
         let (result, protocol_error) = parser.finish();
         if let Some(failure) = protocol_error {
@@ -1868,12 +1887,25 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
     });
     let (exit_code, signal) = status.unwrap_or((None, None));
     CommandResult {
-        provider,
+        provider: if spec.catalog { None } else { provider },
+        catalog: if outcome == Outcome::Success && error.is_none() {
+            catalog
+        } else {
+            None
+        },
         outcome,
         exit_code,
         signal,
-        stdout: output.text(),
-        stderr: errors.text(),
+        stdout: if spec.catalog {
+            String::new()
+        } else {
+            output.text()
+        },
+        stderr: if spec.catalog {
+            String::new()
+        } else {
+            errors.text()
+        },
         stdout_truncated: output.is_truncated(),
         stderr_truncated: errors.is_truncated(),
         duration_ms: started.elapsed().as_millis() as u64,

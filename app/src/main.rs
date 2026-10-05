@@ -29,10 +29,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if args.get(1).map(String::as_str) == Some("doctor") {
-        if args.len() != 3 {
-            return Err("usage: relay-app doctor <config.json>".into());
+        let reconcile = args.len() == 4 && args[3] == "--confirm-catalog-stopped";
+        if args.len() != 3 && !reconcile {
+            return Err("usage: relay-app doctor <config.json> [--confirm-catalog-stopped]\nUse the confirmation flag only after inspecting the retained discovery process tree and confirming it has stopped.".into());
         }
         let host = relay_app::host::Host::new(HostConfig::load(&args[2])?)?;
+        if reconcile {
+            let cleared = relay_app::capabilities::confirm_discovery_stopped(&host)?;
+            println!(
+                "{}",
+                serde_json::json!({"catalog_reconciled":true,"guard_cleared":cleared,"model_calls":false})
+            );
+            return Ok(());
+        }
         let profiles: Vec<_> = host.config().native_agents.keys().map(|name| {
             match host.probe_native(name, false) {
                 Ok(probe) => serde_json::json!({"name":name,"compatible":true,"probe":probe,"authentication":"unknown","model_access":"unknown"}),

@@ -508,6 +508,7 @@ impl Execution<'_> {
                 } else {
                     self.host.config().output_limit_bytes
                 },
+                catalog: false,
                 app_server: None,
                 provider: None,
                 read_only: false,
@@ -667,6 +668,7 @@ impl Execution<'_> {
                     .as_millis()
                     .max(1) as u64,
                 output_limit_bytes: GIT_CAPTURE_BYTES,
+                catalog: false,
                 app_server: None,
                 provider: None,
                 read_only: false,
