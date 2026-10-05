@@ -3,7 +3,7 @@ Requires Python Playwright and an installed Chromium (or CHROMIUM_PATH).
 Uses a local fixture, fake token, and no real repository execution.
 The application itself has no JavaScript/build dependencies.
 """
-import json, threading, tempfile, os
+import json, threading, tempfile, os, re
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from playwright.sync_api import sync_playwright, expect
@@ -32,6 +32,31 @@ def review_task(i, outcome='failure'):
         'developer':passed,'tests':passed,'review':None,
         'reviewer':{'outcome':'failure','exit_code':1,'summary':'审查连接中断'}}]}},ensure_ascii=False)
     return value
+def resource_fixture():
+    return {'host_policy_cap_bytes':104857600,'default_quota_bytes':104857600,'snapshot_cap_bytes':52428800,
+        'initial_estimate':{'source':'host_inventory','snapshot_bytes':1000,'git_metadata_reference_bytes':500,
+            'reviewer_copy_bytes':1000,'estimated_initial_bytes':2500,'complete':True,'notes':['初始清单估算，不保证后续构建完成']},
+        'build_growth':'unknown','enforcement':'logical_bytes_best_effort','os_hard_quota':False,'disk_reserved':False}
+def operator_fixture(value, reservation=None, saved=None):
+    result=json.loads(value['result']) if value['result'] else {};job=json.loads(value['payload'])
+    workflow=result.get('workflow') or {};rounds=workflow.get('rounds') or [];last=rounds[-1] if rounds else {}
+    sha=workflow.get('candidate_sha');tests=result.get('tests') or {};last_tests=last.get('tests') or {}
+    successor=(reservation or {}).get('successor_id')
+    retry=value['state']=='finished' and result.get('outcome') in ['failure','timed_out','cancelled'] and successor is None and (reservation is not None or (result.get('workspace') and result.get('draft_pr') is None))
+    review=retry and reservation is None and job.get('workflow') and job['workflow']==workflow.get('name') and all(isinstance(v,str) and re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})',v) for v in [sha,workflow.get('base_sha')]) and workflow.get('reviewed_sha') is None and workflow.get('publication') is None and workflow.get('reconciliation_required') is False and last.get('candidate_sha')==sha and last.get('review') is None and isinstance(last.get('reviewer'),dict) and last_tests.get('outcome')=='success' and last_tests.get('exit_code')==0 and tests.get('outcome')=='success' and tests.get('exit_code')==0 and tests.get('signal') is None and tests.get('error') is None
+    cap=104857600;quota=job.get('workspace_quota_bytes',cap)
+    def action(name):
+        return {'id':name,'quota_increase_allowed':quota<cap,'quota_increase_required':False,'min_quota_bytes':quota+1 if quota<cap else None,'max_quota_bytes':cap,'requires_test_revalidation':name=='continue_review'}
+    frozen=None
+    if saved:
+        body=saved['body'];frozen={'action_id':'continue_review' if saved['path'].endswith('/continue-review') else 'retry','key':body['key'],'workspace_quota_bytes':body.get('workspace_quota_bytes'),'revalidate_tests':body.get('revalidate_tests',False),'review_focus':body.get('review_focus')}
+    actions=[action('retry')] if retry else []
+    if review: actions.append(action('continue_review'))
+    if frozen and successor is None: actions=[action(frozen['action_id'])]
+    return {'task_id':value['id'],'generation':value['generation'],'failure':result.get('failure'),
+        'resources':{'usage':{'logical_bytes':4096,'complete':True,'measured_at':1700000000,'reason':None},'quota_bytes':quota,'host_policy_cap_bytes':cap,'snapshot_cap_bytes':52428800,'enforcement':'logical_bytes_best_effort','os_hard_quota':False,'disk_reserved':False},
+        'retained_result':{'available':value['result'] is not None,'immutable':True},'workspace_retained':bool(result.get('workspace')),
+        'recovery':{'inherited_quota_bytes':quota,'actions':actions,'blocked_reason':'发布已尝试，需先核对外部结果后本机恢复' if result.get('draft_pr') else None,'successor_id':successor,'reserved_request':frozen}}
 def catalog_fixture():
     def evidence(state, reason, source='fixture:read-only-discovery'):
         return {'state':state,'reason':reason,'source':source}
@@ -60,6 +85,7 @@ with sync_playwright() as p:
     data={'tasks':[task(3,'queued'),task(2,'claimed'),task(1,'finished',outcome='success')], 'status':{'active':task(2,'claimed'),'recovery_required':False,'diagnostic':None},'post':'success','list_error':False,'continuations':{},'continuation_payloads':{},'continuation_post':'success','hidden_task_ids':set(),'frozen_lists':{},'retry_requests':[],'review_requests':[],'config':{'repositories':['relay-demo','api-service'],'agents':['codex','reviewer'],'tests':['unit','full']}}
     data['catalog']={'name':'codex','cache_epoch':'browser-fixture-process','generation':0,'stale':True,'refreshing':False,'catalog':None}
     data['catalog_refreshes']=0
+    data['resources']=resource_fixture();data['operator_overrides']={}
     # Model persisted reservations separately from visible task payloads. A child
     # outside the recent page must not make its predecessor appear retryable.
     def task_response(value):
@@ -71,6 +97,10 @@ with sync_playwright() as p:
         assert req.headers.get('authorization')=='Bearer test-token',req.headers
         if path=='/api/config': result=data['config']
         elif path=='/api/status': result=data['status']
+        elif path.startswith('/api/resources?'): result=data['resources']
+        elif path.endswith('/operator'):
+            task_id=int(path.split('/')[-2]);value=next(t for t in data['tasks'] if t['id']==task_id)
+            result=data['operator_overrides'].get(task_id) or operator_fixture(value,data['continuations'].get(task_id),data['continuation_payloads'].get(task_id))
         elif path=='/api/capabilities':
             assert req.method=='GET'
             result={'profiles':[data['catalog']] if data['config'].get('native_agents') else []}
@@ -95,11 +125,11 @@ with sync_playwright() as p:
             assert req.method=='POST'
             review=path.endswith('/continue-review')
             if review:
-                assert set(body)=={'key','confirm_stopped_and_reconciled','revalidate_tests','review_focus'}
+                assert set(body)-{'workspace_quota_bytes'}=={'key','confirm_stopped_and_reconciled','revalidate_tests','review_focus'}
                 assert body['revalidate_tests'] is True
                 assert body['review_focus'] is None or 0<len(body['review_focus'].encode('utf-8'))<=8192
             else:
-                assert set(body)=={'key','confirm_stopped_and_reconciled'}
+                assert set(body)-{'workspace_quota_bytes'}=={'key','confirm_stopped_and_reconciled'}
             data['review_requests' if review else 'retry_requests'].append((old_id,body))
             if data['continuation_post']=='abort': r.abort();return
             old=next(t for t in data['tasks'] if t['id']==old_id)
@@ -112,6 +142,7 @@ with sync_playwright() as p:
                 workspace_id=job.get('continuation',{}).get('workspace_task_id',old_id)
                 job['continuation']={'workspace_task_id':workspace_id,'predecessor_task_id':old_id,'predecessor_generation':old['generation']}
                 original=data['continuation_payloads'][old_id]
+                if 'workspace_quota_bytes' in original['body']: job['workspace_quota_bytes']=original['body']['workspace_quota_bytes']
                 if original['path'].endswith('/continue-review'):
                     workflow=json.loads(old['result'])['workflow']
                     job['continuation']['review_only']={'base_sha':workflow['base_sha'],'candidate_sha':workflow['candidate_sha'],'round':workflow['rounds'][-1]['round']}
@@ -162,6 +193,27 @@ with sync_playwright() as p:
     assert page.locator('.task-button').count()==3
     assert not page.locator('#workflow-field').is_visible(), 'Legacy configuration keeps the ordinary form'
     page.screenshot(path=str(SCREENSHOTS / 'relay-connected-desktop.png'),full_page=True)
+    # Estimates are bounded, explicit, selected-repository reads; task polling does not scan resources.
+    expect(page.locator('#workspace-quota')).to_be_disabled()
+    with page.expect_response(lambda response: '/api/resources?repository=relay-demo' in response.url):
+        page.locator('#resource-read').click()
+    expect(page.locator('#workspace-quota')).to_be_enabled()
+    expect(page.locator('#resource-estimate')).to_contain_text('初始总量估算')
+    expect(page.locator('#submission-resources')).to_contain_text('构建增长未知')
+    expect(page.locator('#submission-resources')).to_contain_text('不预留主机磁盘')
+    reads_before=len([path for method,path,_ in requests if path.startswith('/api/resources') or path.endswith('/operator')])
+    page.wait_for_timeout(2200)
+    assert len([path for method,path,_ in requests if path.startswith('/api/resources') or path.endswith('/operator')])==reads_before
+    data['resources']['initial_estimate'].update(complete=False,estimated_initial_bytes=None,git_metadata_reference_bytes=None,notes=['<img src=x onerror=alert(1)>'])
+    page.locator('#resource-read').click()
+    expect(page.locator('#resource-estimate-status')).to_contain_text('估算不完整')
+    expect(page.locator('#resource-estimate')).to_contain_text('初始总量估算：未知')
+    assert page.locator('#resource-estimate img').count()==0
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':900})
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'resource composer overflow at {width}'
+        page.screenshot(path=str(SCREENSHOTS / f'relay-resource-estimate-{width}.png'),full_page=True)
+    page.set_viewport_size({'width':1440,'height':1150})
     # Token details distinguish current-turn totals from the final snapshot.
     data['tasks'][2]['result']=json.dumps({'outcome':'success','agent':{'provider':{
         'provider':'codex_app_server','usage':{'usage_scope':'last_snapshot',
@@ -415,6 +467,7 @@ with sync_playwright() as p:
     with fresh_page.expect_response(lambda response: response.url==base+'/api/tasks/121'):
         fresh_page.locator('#refresh').click()
     expect(fresh_page.locator('#retry-task')).to_be_visible()
+    fresh_page.locator('#operator-read').click()
     expect(fresh_page.locator('#retry-task')).to_be_enabled()
     expect(fresh_page.locator('#continuation-next')).to_be_hidden()
     fresh_page.locator('#retry-task').click();fresh_page.locator('#retry-confirm').click()
@@ -582,6 +635,44 @@ with sync_playwright() as p:
     select_task(stale_page,150);assert_successor(stale_page,150,151);stale_page.close()
     select_task(page,150);assert_successor(page,150,151)
     # Logout clears sensitive task content and stops polling.
+    # Resource recovery uses exact server eligibility, never failure-message heuristics.
+    resource_task=task(180,'finished',outcome='failure')
+    resource_job=json.loads(resource_task['payload']);resource_job['workspace_quota_bytes']=10485760;resource_task['payload']=json.dumps(resource_job)
+    resource_task['result']=json.dumps({'outcome':'failure','workspace':'/fixture/task-180','draft_pr':None,'failure':{'code':'workspace_quota_exceeded','stage':'test','cause':'<img src=x onerror=alert(1)> logical capacity exceeded','required_bytes':20971520,'limit_bytes':10485760}})
+    data['tasks'].append(resource_task)
+    planned_operator=operator_fixture(resource_task)
+    assert planned_operator['resources']['quota_bytes']==resource_job['workspace_quota_bytes']
+    assert planned_operator['recovery']['inherited_quota_bytes']==resource_job['workspace_quota_bytes']
+    planned_operator['recovery']['actions'][0].update(quota_increase_required=True,min_quota_bytes=20971520)
+    data['operator_overrides'][180]=planned_operator
+    with page.expect_response(lambda response: response.url==base+'/api/tasks'):
+        page.locator('#refresh').click()
+    select_task(page,180)
+    expect(page.locator('#operator-failure')).to_contain_text('workspace_quota_exceeded')
+    expect(page.locator('#operator-failure')).to_contain_text('<img src=x onerror=alert(1)>')
+    assert page.locator('#operator-failure img').count()==0
+    expect(page.locator('#operator-retained')).to_contain_text('已保留且不可改写')
+    for label in ['已记录任务容量','无覆盖续接容量']:
+        expect(page.locator('#operator-resources > div').filter(has_text=label)).to_contain_text('10.00 MiB（10485760 字节）')
+    page.locator('#retry-task').click();page.locator('#retry-confirm').click()
+    expect(page.locator('#retry-dialog')).to_be_visible()
+    expect(page.locator('#retry-dialog-error')).to_contain_text('宿主要求显式提高容量')
+    page.locator('#retry-quota').fill('20971520')
+    expect(page.locator('#retry-dialog-error')).to_be_hidden()
+    expect(page.locator('#retry-quota-summary')).to_contain_text('10485760 字节） → 20.00 MiB（20971520 字节）')
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':900})
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'resource recovery overflow at {width}'
+        page.screenshot(path=str(SCREENSHOTS / f'relay-resource-recovery-{width}.png'),full_page=True)
+    page.locator('#retry-dismiss').click()
+    blocked=operator_fixture(resource_task);blocked['resources']['usage'].update(logical_bytes=None,complete=False,reason='Inventory incomplete');blocked['recovery'].update(actions=[],blocked_reason='Unknown process or publication requires host reconciliation')
+    data['operator_overrides'][180]=blocked;page.locator('#operator-read').click()
+    expect(page.locator('#retry-task')).to_be_disabled()
+    expect(page.locator('#operator-resources')).to_contain_text('观测不完整')
+    expect(page.locator('#operator-recovery')).to_contain_text('requires host reconciliation')
+    blocked['resources']['quota_bytes']=blocked['resources']['host_policy_cap_bytes'];blocked['failure']['code']='source_snapshot_limit';page.locator('#operator-read').click()
+    expect(page.locator('#operator-failure')).to_contain_text('source_snapshot_limit')
+    expect(page.locator('#operator-recovery')).to_contain_text('经过授权的宿主配置变更')
     page.locator('#logout').click();after_logout=len(requests);page.wait_for_timeout(2400)
     assert len(requests)==after_logout
     assert page.locator('#auth-panel').is_visible()

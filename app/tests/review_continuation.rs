@@ -114,6 +114,7 @@ fn git(repository: &Path, args: &[&str]) -> String {
 
 fn request(key: &str) -> ReviewContinuationRequest {
     ReviewContinuationRequest {
+        workspace_quota_bytes: None,
         key: key.into(),
         confirm_stopped_and_reconciled: true,
         revalidate_tests: true,
@@ -379,6 +380,7 @@ fn duplicate_requests_reload_and_mixed_retry_share_first_winner() {
         app.retry(
             1,
             RetryRequest {
+                workspace_quota_bytes: None,
                 key: "ordinary-retry".into(),
                 confirm_stopped_and_reconciled: true
             }
@@ -455,6 +457,7 @@ fn ordinary_retry_reservation_also_wins_over_review_continuation() {
         .retry(
             1,
             RetryRequest {
+                workspace_quota_bytes: None,
                 key: "ordinary-first".into(),
                 confirm_stopped_and_reconciled: true,
             },
@@ -1079,6 +1082,7 @@ impl Fixture {
             app.retry(
                 id,
                 RetryRequest {
+                    workspace_quota_bytes: None,
                     key: "cannot-retry-unknown".into(),
                     confirm_stopped_and_reconciled: true
                 }

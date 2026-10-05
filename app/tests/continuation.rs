@@ -20,6 +20,7 @@ fn input() -> Submission {
 }
 fn retry(key: &str) -> RetryRequest {
     RetryRequest {
+        workspace_quota_bytes: None,
         key: key.into(),
         confirm_stopped_and_reconciled: true,
     }
@@ -45,6 +46,7 @@ fn explicit_retry_preserves_files_reserves_one_successor_and_survives_restart() 
         app.retry(
             1,
             RetryRequest {
+                workspace_quota_bytes: None,
                 key: "retry".into(),
                 confirm_stopped_and_reconciled: false
             }

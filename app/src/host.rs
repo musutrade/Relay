@@ -7,6 +7,7 @@
 use crate::providers::{
     NativeProfile, ProtocolParser, ProviderKind, ProviderProbe, ProviderResult,
 };
+use crate::resources::{self, Failure, ResourceState};
 use crate::workflow::{self, WorkflowConfig, WorkflowResult};
 use relay::{MAX_PAYLOAD_BYTES, MAX_RESULT_BYTES, State, Task};
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,8 @@ pub struct HostConfig {
 #[serde(deny_unknown_fields)]
 pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_quota_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<crate::workspaces::Continuation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<String>,
@@ -155,6 +158,15 @@ impl Job {
     }
 
     pub fn validate(&self, config: &HostConfig) -> Result<(), HostError> {
+        if self
+            .workspace_quota_bytes
+            .is_some_and(|bytes| bytes == 0 || bytes > config.workspace_byte_limit())
+        {
+            return Err(HostError::Job(
+                "workspace_quota_bytes must be positive and no greater than the host policy cap"
+                    .into(),
+            ));
+        }
         if self.continuation.as_ref().is_some_and(|c| {
             c.workspace_task_id <= 0
                 || c.predecessor_task_id < c.workspace_task_id
@@ -223,6 +235,8 @@ pub enum Outcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Failure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<Vec<crate::capabilities::ModelCapability>>,
@@ -240,6 +254,7 @@ pub struct CommandResult {
 impl CommandResult {
     pub(crate) fn error(outcome: Outcome, error: impl Into<String>) -> Self {
         Self {
+            failure: None,
             provider: None,
             catalog: None,
             outcome,
@@ -259,6 +274,10 @@ impl CommandResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Failure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<WorkflowResult>,
     pub outcome: Outcome,
     pub workspace: Option<PathBuf>,
@@ -270,6 +289,8 @@ pub struct RunResult {
 impl RunResult {
     pub(crate) fn new(outcome: Outcome, error: Option<String>) -> Self {
         Self {
+            failure: None,
+            resources: None,
             workflow: None,
             outcome,
             workspace: None,
@@ -283,6 +304,17 @@ impl RunResult {
     /// Includes JSON escaping in the core's 16 KiB result budget.
     pub fn to_json(&self) -> String {
         let mut value = self.clone();
+        if let Some(failure) = &mut value.failure {
+            truncate_utf8(&mut failure.cause, 1024);
+            truncate_utf8(&mut failure.code, 80);
+            truncate_utf8(&mut failure.stage, 128);
+        }
+        if let Some(resources) = &mut value.resources {
+            truncate_utf8(&mut resources.enforcement, 64);
+            if let Some(reason) = &mut resources.usage.reason {
+                truncate_utf8(reason, 512);
+            }
+        }
         if let Some(error) = &mut value.error {
             truncate_utf8(error, 1024);
         }
@@ -290,6 +322,11 @@ impl RunResult {
             .into_iter()
             .flatten()
         {
+            if let Some(failure) = &mut command.failure {
+                truncate_utf8(&mut failure.cause, 1024);
+                truncate_utf8(&mut failure.code, 80);
+                truncate_utf8(&mut failure.stage, 128);
+            }
             if let Some(provider) = &mut command.provider {
                 provider.bound();
             }
@@ -324,15 +361,83 @@ impl RunResult {
             if !reduced {
                 value.workspace = None;
                 value.error = Some("result metadata exceeded the persistence budget".into());
-                for command in [&mut value.agent, &mut value.tests, &mut value.draft_pr]
-                    .into_iter()
-                    .flatten()
-                {
-                    command.error = None;
-                    command.provider = None;
-                }
+                value.failure = Some(Failure::new(
+                    "result_evidence_truncated",
+                    "persistence",
+                    "result metadata exceeded the persistence budget; retained workspace identity cannot be confirmed from this result",
+                ));
+                value.workflow = None;
+                value.agent = None;
+                value.tests = None;
+                value.draft_pr = None;
+                // No loop can retain unbounded caller-provided metadata. The bounded
+                // failure and resource limits remain visible; workspace=None blocks recovery.
+                return serde_json::to_string(&value).expect("serializable bounded fallback");
             }
         }
+    }
+}
+
+fn failure_for_outcome(outcome: Outcome, stage: &str, cause: String) -> Failure {
+    let code = match outcome {
+        Outcome::Unknown => "execution_unknown",
+        Outcome::TimedOut => "execution_timed_out",
+        Outcome::Cancelled => "execution_cancelled",
+        _ => "command_failed",
+    };
+    Failure::new(code, stage, cause)
+}
+impl RunResult {
+    fn complete_metadata(&mut self, policy: &HostConfig, quota: u64) {
+        if self.resources.is_none() {
+            let usage = self
+                .workspace
+                .as_deref()
+                .map(|path| resources::measure_workspace(path, policy))
+                .unwrap_or_else(|| {
+                    resources::Usage::unavailable("workspace has not been measured")
+                });
+            self.resources = Some(ResourceState::new(usage, Some(quota), policy));
+        }
+        if self.outcome == Outcome::Success {
+            self.failure = None;
+            return;
+        }
+        if self.failure.is_some() {
+            return;
+        }
+        for (stage, command) in [
+            ("publication", &self.draft_pr),
+            ("tests", &self.tests),
+            ("developer", &self.agent),
+        ] {
+            if let Some(command) = command
+                && command.outcome != Outcome::Success
+            {
+                self.failure = command.failure.clone().or_else(|| {
+                    Some(failure_for_outcome(
+                        command.outcome,
+                        stage,
+                        command
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| command.stderr.clone()),
+                    ))
+                });
+                return;
+            }
+        }
+        self.failure = Some(failure_for_outcome(
+            self.outcome,
+            if self.workspace.is_some() {
+                "workspace_setup"
+            } else {
+                "validation"
+            },
+            self.error
+                .clone()
+                .unwrap_or_else(|| "execution stopped before the next stage".into()),
+        ));
     }
 }
 
@@ -504,6 +609,27 @@ impl Host {
     /// Only execute a newly claimed generation. A pre-existing workspace is unknown,
     /// never evidence that the previous process stopped. No method here requeues.
     pub fn execute(&self, task: &Task, cancellation: Arc<AtomicBool>) -> RunResult {
+        let quota = Job::from_payload(&task.payload, &self.config)
+            .ok()
+            .and_then(|job| job.workspace_quota_bytes)
+            .unwrap_or_else(|| self.config.workspace_byte_limit());
+        let mut config = self.config.clone();
+        config.max_workspace_bytes = Some(quota);
+        let attempt = Self {
+            config,
+            supervisor: self.supervisor.clone(),
+            leases: Mutex::new(BTreeMap::new()),
+        };
+        let mut result = attempt.execute_at_limit(task, cancellation, &self.config);
+        result.complete_metadata(&self.config, quota);
+        result
+    }
+    fn execute_at_limit(
+        &self,
+        task: &Task,
+        cancellation: Arc<AtomicBool>,
+        policy: &HostConfig,
+    ) -> RunResult {
         if task.state != State::Claimed
             || task.id <= 0
             || task.generation <= 0
@@ -542,6 +668,7 @@ impl Host {
         };
         let mut result =
             self.execute_in(task, &job, &workspace, workspace_state.reused, cancellation);
+        result.complete_metadata(policy, self.config.workspace_byte_limit());
         if result.outcome != Outcome::Unknown
             && let Err(error) = crate::sessions::atomic_write(
                 &workspace.join("last-result.json"),
@@ -551,6 +678,11 @@ impl Host {
         {
             result.outcome = Outcome::Unknown;
             result.error = Some(format!("cannot persist stopped execution result: {error}"));
+            result.failure = Some(Failure::new(
+                "result_persistence_failed",
+                "persistence",
+                result.error.clone().unwrap_or_default(),
+            ));
         }
         result
     }
@@ -607,6 +739,14 @@ impl Host {
         })();
         if let Err(error) = setup {
             result.outcome = interrupted(&cancellation, deadline).unwrap_or(Outcome::Failure);
+            result.failure = Some(match &error {
+                HostError::Io(error) => resources::failure_from_io(error, "workspace_setup"),
+                _ => Failure::new(
+                    "workspace_setup_failed",
+                    "workspace_setup",
+                    error.to_string(),
+                ),
+            });
             result.error = Some(error.to_string());
             return result;
         }
@@ -672,6 +812,7 @@ impl Host {
             );
             if git.outcome != Outcome::Success {
                 result.outcome = git.outcome;
+                result.failure = git.failure;
                 result.error = Some(format!(
                     "cannot initialize private snapshot Git repository: {}",
                     git.error.unwrap_or_else(|| "Git init failed".into())
@@ -1087,6 +1228,29 @@ impl Host {
 
     pub(crate) fn run_supervised(
         &self,
+        spec: CommandSpec,
+        cancellation: &AtomicBool,
+        workspace: &Path,
+        phase: &str,
+    ) -> CommandResult {
+        let mut result = self.run_supervised_inner(spec, cancellation, workspace, phase);
+        if result.outcome != Outcome::Success && result.failure.is_none() {
+            result.failure = Some(failure_for_outcome(
+                result.outcome,
+                phase,
+                result.error.clone().unwrap_or_else(|| {
+                    if result.stderr.is_empty() {
+                        format!("command stopped with exit {:?}", result.exit_code)
+                    } else {
+                        result.stderr.clone()
+                    }
+                }),
+            ));
+        }
+        result
+    }
+    fn run_supervised_inner(
+        &self,
         mut spec: CommandSpec,
         cancellation: &AtomicBool,
         workspace: &Path,
@@ -1094,7 +1258,9 @@ impl Host {
     ) -> CommandResult {
         // Reject an already oversized task before starting any command or model.
         if let Err(error) = check_workspace_budget(workspace, &self.config) {
-            return CommandResult::error(Outcome::Failure, error.to_string());
+            let mut result = CommandResult::error(Outcome::Failure, error.to_string());
+            result.failure = Some(resources::failure_from_io(&error, phase));
+            return result;
         }
         let lease = match self.leases.lock() {
             Ok(leases) => leases.get(workspace).cloned(),
@@ -1205,9 +1371,7 @@ impl Host {
                 }
             }
             if Instant::now() >= next_workspace_check && resource_error.is_none() {
-                resource_error = check_workspace_budget(workspace, &self.config)
-                    .err()
-                    .map(|error| error.to_string());
+                resource_error = check_workspace_budget(workspace, &self.config).err();
                 next_workspace_check = Instant::now() + Duration::from_millis(250);
                 if resource_error.is_some() {
                     input.take();
@@ -1243,14 +1407,12 @@ impl Host {
                     {
                         result.supervisor_pid = Some(pid);
                         if result.outcome != Outcome::Unknown {
-                            let resource_error = resource_error.or_else(|| {
-                                check_workspace_budget(workspace, &self.config)
-                                    .err()
-                                    .map(|error| error.to_string())
-                            });
+                            let resource_error = resource_error
+                                .or_else(|| check_workspace_budget(workspace, &self.config).err());
                             if let Some(error) = resource_error {
                                 result.outcome = Outcome::Failure;
-                                result.error = Some(error);
+                                result.failure = Some(resources::failure_from_io(&error, phase));
+                                result.error = Some(error.to_string());
                             } else if cancellation.load(Ordering::Acquire) {
                                 result.outcome = Outcome::Cancelled;
                             }
@@ -1373,7 +1535,12 @@ fn inspect_snapshot(source: &Path, budget: &mut SnapshotBudget<'_>) -> io::Resul
         }
         budget.entries += 1;
         if budget.entries > budget.config.max_snapshot_entries {
-            return Err(io::Error::other("snapshot entry limit exceeded"));
+            return Err(resources::budget_error(
+                "snapshot_entry_limit_exceeded",
+                resources::Usage::observed(budget.bytes, false),
+                budget.config.max_snapshot_entries as u64,
+                "snapshot entry limit exceeded",
+            ));
         }
         let metadata = fs::symlink_metadata(entry.path())?;
         if metadata.is_dir() {
@@ -1384,10 +1551,15 @@ fn inspect_snapshot(source: &Path, budget: &mut SnapshotBudget<'_>) -> io::Resul
                 .checked_add(metadata.len())
                 .ok_or_else(|| io::Error::other("snapshot admission byte count overflow"))?;
             if budget.bytes > budget.config.max_snapshot_bytes {
-                return Err(io::Error::other(format!(
-                    "snapshot byte limit exceeded: at least {} logical bytes, max_snapshot_bytes={}",
-                    budget.bytes, budget.config.max_snapshot_bytes
-                )));
+                return Err(resources::budget_error(
+                    "snapshot_limit_exceeded",
+                    resources::Usage::observed(budget.bytes, false),
+                    budget.config.max_snapshot_bytes,
+                    format!(
+                        "snapshot byte limit exceeded: at least {} logical bytes, max_snapshot_bytes={}",
+                        budget.bytes, budget.config.max_snapshot_bytes
+                    ),
+                ));
             }
         } else {
             return Err(io::Error::other(
@@ -1417,7 +1589,12 @@ fn copy_snapshot(
         }
         budget.entries += 1;
         if budget.entries > budget.config.max_snapshot_entries {
-            return Err(io::Error::other("snapshot entry limit exceeded"));
+            return Err(resources::budget_error(
+                "snapshot_entry_limit_exceeded",
+                resources::Usage::observed(budget.bytes, false),
+                budget.config.max_snapshot_entries as u64,
+                "snapshot entry limit exceeded",
+            ));
         }
         let metadata = fs::symlink_metadata(entry.path())?;
         let target = destination.join(&name);
@@ -1452,7 +1629,12 @@ fn copy_snapshot(
                 }
                 budget.bytes = budget.bytes.saturating_add(read as u64);
                 if budget.bytes > budget.config.max_snapshot_bytes {
-                    return Err(io::Error::other("snapshot byte limit exceeded"));
+                    return Err(resources::budget_error(
+                        "snapshot_limit_exceeded",
+                        resources::Usage::observed(budget.bytes, false),
+                        budget.config.max_snapshot_bytes,
+                        "snapshot byte limit exceeded",
+                    ));
                 }
                 target.write_all(&buffer[..read])?;
             }
@@ -1484,10 +1666,15 @@ pub(crate) fn check_workspace_admission(
         .checked_add(additional_bytes)
         .ok_or_else(|| io::Error::other("workspace admission byte count overflow"))?;
     if required > config.workspace_byte_limit() {
-        return Err(io::Error::other(format!(
-            "workspace admission estimate is {required} logical bytes ({present} present + {additional_bytes} planned file bytes), exceeding max_workspace_bytes={} (omitted: max_snapshot_bytes); Git objects, checkpoints and build growth may require more",
-            config.workspace_byte_limit()
-        )));
+        return Err(resources::admission_error(
+            present,
+            required,
+            config.workspace_byte_limit(),
+            format!(
+                "workspace admission estimate is {required} logical bytes ({present} present + {additional_bytes} planned file bytes), exceeding max_workspace_bytes={} (omitted: max_snapshot_bytes); Git objects, checkpoints and build growth may require more",
+                config.workspace_byte_limit()
+            ),
+        ));
     }
     Ok(())
 }
@@ -1515,7 +1702,12 @@ fn workspace_bytes(root: &Path, config: &HostConfig) -> io::Result<u64> {
             };
             entries += 1;
             if entries > config.max_snapshot_entries {
-                return Err(io::Error::other("running workspace entry limit exceeded"));
+                return Err(resources::budget_error(
+                    "workspace_entry_limit_exceeded",
+                    resources::Usage::observed(bytes, false),
+                    config.max_snapshot_entries as u64,
+                    "running workspace entry limit exceeded",
+                ));
             }
             if metadata.is_dir() {
                 directories.push(entry.path());
@@ -1524,10 +1716,15 @@ fn workspace_bytes(root: &Path, config: &HostConfig) -> io::Result<u64> {
             }
             // Never follow new symlinks while inspecting a running workspace.
             if bytes > config.workspace_byte_limit() {
-                return Err(io::Error::other(format!(
-                    "running workspace byte limit exceeded: at least {bytes} logical bytes, max_workspace_bytes={} (omitted: max_snapshot_bytes); includes Git metadata, reviewer copies and task control files",
-                    config.workspace_byte_limit()
-                )));
+                return Err(resources::budget_error(
+                    "workspace_quota_exceeded",
+                    resources::Usage::observed(bytes, false),
+                    config.workspace_byte_limit(),
+                    format!(
+                        "running workspace byte limit exceeded: at least {bytes} logical bytes, max_workspace_bytes={} (omitted: max_snapshot_bytes); includes Git metadata, reviewer copies and task control files",
+                        config.workspace_byte_limit()
+                    ),
+                ));
             }
         }
     }
@@ -1887,6 +2084,7 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
     });
     let (exit_code, signal) = status.unwrap_or((None, None));
     CommandResult {
+        failure: None,
         provider: if spec.catalog { None } else { provider },
         catalog: if outcome == Outcome::Success && error.is_none() {
             catalog

@@ -48,6 +48,7 @@ impl Fixture {
     }
     fn job(&self) -> Job {
         Job {
+            workspace_quota_bytes: None,
             continuation: None,
             workflow: None,
             repository: "fixture".into(),

@@ -20,9 +20,9 @@
 - `timeout_seconds`：整个快照、Agent、测试和 PR 流程的共同期限，1–3600 秒，默认 300
 - `output_limit_bytes`：每阶段 stdout/stderr 分别捕获 1–8192 字节，默认 2048；多余内容继续排空并标注截断，不无限累积
 - `max_snapshot_bytes` / `max_snapshot_entries`：复制输入快照时的字节数和条目限制，默认 50 MiB / 20,000；字节上限允许 1–1099511627776（1 TiB），条目允许 1–100000；复制排除 `.git`、`target` 和 `node_modules`，拒绝符号链接和特殊文件
-- `max_workspace_bytes`：可选的整项任务逻辑字节预算，允许 1–1099511627776（1 TiB）；省略或 null 时沿用 `max_snapshot_bytes`，保持旧配置行为。显式设置可独立允许 Git、审查与构建开销，不放宽输入快照预算
+- `max_workspace_bytes`：可信宿主允许的单次工作区逻辑字节上限，允许 1–1099511627776（1 TiB）；省略或 null 时沿用 `max_snapshot_bytes`。请求可在此上限内选择更小的 `workspace_quota_bytes`，不能修改宿主策略或放宽输入快照预算
 - `successful_workspace_retention_seconds`：可选成功工作区保留期（60–31536000 秒）；省略不自动清理。失败/未知现场保留，详见 [固定工作区与继续](workspace-continuation.md)
-- `max_retained_workspaces`：默认最多保留 100 个工作区；达到上限后拒绝新执行，需可信操作员先检查和清理。每个命令启动前、结束后及运行期每 250ms 尽力检查整项任务的 `max_workspace_bytes` / `max_snapshot_entries` 预算，超限会停止当前命令；快写入可能暂时超过限制，这不是内核文件系统配额
+- `max_retained_workspaces`：默认最多保留 100 个工作区；达到上限后拒绝新执行，需可信操作员先检查和清理。每个命令启动前、结束后及运行期每 250ms 尽力检查整项任务的本次字节配额 / `max_snapshot_entries` 预算，超限会停止当前命令；快写入可能暂时超过限制，这不是内核文件系统配额
 
 ### 工作区容量选择
 
@@ -32,7 +32,15 @@
 
 复制普通快照前只扫描元数据做准入检查，复制中仍检查变化。工作流在 fetch 前估算已固定基线的物化工作树大小（若需要独立 reviewer，预留两份工作树），fetch 后、checkout 前再计入已存在的实际 Git/控制字节；创建 reviewer 时再次检查，复用 reviewer 仅估算增长差额。该估算不重复完整内容哈希，也不复制对象；源 Git filters 可能影响实际 checkout 大小，Git 压缩/临时 pack、后续模型和构建增长均不能提前精确预测。通过准入检查不保证后续所有阶段都能容纳；运行期检查仍是同一整项预算，错误报告有效上限和观测/估算字节。
 
-这些是尽力而为的逻辑字节限制，不是 OS 硬配额、已分配磁盘空间或整机可用空间保证。命令检查间隔与最终结果落盘可短暂超限；Relay 不为整个主机、其他任务或 CLI 外部缓存预留磁盘。保留上限只限制工作区数量，不是全局字节配额；例如 20 个各 4 GiB 的现场可能需要约 80 GiB，另需系统、源仓库和临时空间余量。提升预算前请核对真实磁盘容量；不自动删除失败现场、不共享 Git 对象来绕过预算。资源预算不进入工作区身份绑定，停止且已核对的失败任务可在提高容量后通过原有显式继续入口复用现场，无需重建或清空。
+这些是尽力而为的逻辑字节限制，不是 OS 硬配额、已分配磁盘空间或整机可用空间保证。命令检查间隔与最终结果落盘可短暂超限；Relay 不为整个主机、其他任务或 CLI 外部缓存预留磁盘。保留上限只限制工作区数量，不是全局字节配额；例如 20 个各 4 GiB 的现场可能需要约 80 GiB，另需系统、源仓库和临时空间余量。提升预算前请核对真实磁盘容量；不自动删除失败现场、不共享 Git 对象来绕过预算。失败现场保留，普通恢复不要求手工编辑主机配置。新任务可选 `workspace_quota_bytes`（正整数字节，不超过宿主上限）；省略或 null 使用整个宿主上限，因此默认没有可上调余量。已停止任务通过显式继续入口选择更大的单次配额，服务端验证前置结果、现场和当前用量后复用原目录；不会自动提额或清理文件。
+
+#### 只读估算与任务操作状态
+
+`GET /api/resources?repository=<允许的名字>&workflow=<可选名字>`（MCP：`relay_resources`）只读扫描宿主文件元数据，不复制、不运行 Git、Agent 或测试，也不预留磁盘。返回宿主上限 `host_policy_cap_bytes`、默认值 `default_quota_bytes`、输入快照上限 `snapshot_cap_bytes`，以及 `initial_estimate`：来源固定为 `host_inventory`，分别列出快照、源 Git 元数据参考值、独立 reviewer 副本和初始总量。普通快照不复制源 `.git`；其新 Git/控制文件开销无法精确预测，总量可为 null。工作流估算包含物化工作树、必要的 reviewer 副本、各 checkout 的源 Git 参考值和控制文件余量；源对象大小不等于实际 fetch/checkout 大小。`complete` 只表示估算所需数据齐全，不是容量保证；未知量不按零处理，后续构建增长始终为 `unknown`。
+
+`GET /api/tasks/<id>/operator`（MCP：`relay_operator`）返回结构化 `failure {code,stage,cause}`、当前 `resources`、旧结果是否保留、工作区是否仍在，以及服务端允许的 `recovery.actions`。`workspace_quota_exceeded` 表示整项目录的本次配额不足；`snapshot_limit_exceeded` 表示源快照准入失败，增加工作区配额不能解决。旧结果缺少结构化字段时明确标记 legacy；不根据日志措辞猜测原因。面板的配额优先显示该次结果实际记录的值；历史未记录且未显式选择时为未知，不按新宿主上限回填。`recovery.inherited_quota_bytes` 另示后继不覆盖时的额度，旧省略字段仍随当前宿主上限，详见[继续说明](workspace-continuation.md#单次容量不足时显式上调)。
+
+用量包含 `logical_bytes`、`complete`、Unix 秒 `measured_at` 和不完整原因；扫描受条目数、深度与 100ms 协作期限约束，不遍历符号链接，读操作短暂缓存 5 秒。操作提交时重新验证；无法确认的用量不允许提额。非资源失败只有已知部分用量不超原额度时，才可按原额度继续并由执行前检查把关；已知资源超限或用量未知时须先得到完整测量。所有资源响应都明确 `enforcement=logical_bytes_best_effort`、`os_hard_quota=false`、`disk_reserved=false`。不支持的恢复请求以 HTTP 409 和结构化 request-stage 失败说明拒绝，不能绕过 unknown owner、缺失现场、候选改变或发布核对门禁。
 
 开发 job 示例：
 
@@ -106,7 +114,7 @@
 
 HTTP 所有 `/api` 路由校验 bearer token（32–256 非空白 ASCII 字节）。HTML 入口无需 token，但无 token 不能读取任务或配置。页面内存保存 token，没有 URL/token 持久化；响应 `no-store`，无第三方脚本和 CORS 开放。用户可查看任务、提交、请求取消及显式继续已停止的失败任务；接口没有运行任意命令、自动恢复或删除工作区入口。
 
-MCP 采用 stdio newline JSON-RPC，支持 `initialize`（协议 2024-11-05）、`ping`、`tools/list`、`tools/call`。工具为 `relay_submit`、`relay_get`、`relay_list`、`relay_config`，只作需求入口和读取结果。每条消息上限 128 KiB；没有 ID 的通知不返回响应，也不会提交任务。MCP 是可信 OS 本机进程接口，不使用 HTTP token。MCP 本身不启动 worker，因此需要同时运行 `serve`。
+MCP 采用 stdio newline JSON-RPC，支持 `initialize`（协议 2024-11-05）、`ping`、`tools/list`、`tools/call`。工具包括 `relay_submit`、`relay_get`、`relay_list`、`relay_config`、`relay_resources`、`relay_operator`，以及显式确认的 `relay_retry` / `relay_continue_review`。资源读取不启动执行，继续操作仍由同一队列 worker 执行。每条消息上限 128 KiB；没有 ID 的通知不返回响应，也不会提交任务。MCP 是可信 OS 本机进程接口，不使用 HTTP token。MCP 本身不启动 worker，因此需要同时运行 `serve`。
 
 MCP 配置示例（把路径替换成实际绝对路径）：
 

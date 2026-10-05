@@ -42,11 +42,13 @@ pub fn handle(app: &Application, request: Value) -> Option<Value> {
         }
         Some("ping") => json!({}),
         Some("tools/list") => json!({"tools":[
-            {"name":"relay_submit","description":"Submit a requirement to the durable development queue; use the same key for retries.","inputSchema":{"type":"object","required":["key","job"],"properties":{"key":{"type":"string","minLength":1,"maxLength":128},"job":{"type":"object","required":["repository","requirements","agent"],"properties":{"repository":{"type":"string"},"requirements":{"type":"string"},"agent":{"type":"string"},"test":{"type":["string","null"]},"publish":{"type":"boolean","default":false},"draft_pr_adapter":{"type":["string","null"]},"workflow":{"type":["string","null"]}},"additionalProperties":false}},"additionalProperties":false}},
-            {"name":"relay_retry","description":"Explicitly continue a stopped unsuccessful task in its preserved workspace. Inspect side effects first; repeated calls return the same successor.","inputSchema":{"type":"object","required":["id","key","confirm_stopped_and_reconciled"],"properties":{"id":{"type":"integer","minimum":1},"key":{"type":"string","minLength":1,"maxLength":128},"confirm_stopped_and_reconciled":{"type":"boolean","const":true}},"additionalProperties":false}},
-            {"name":"relay_continue_review","description":"Explicitly continue only the interrupted review of the preserved candidate, rerunning its configured tests first and never invoking the developer. Confirm stopped execution and reconciled side effects. Optional review_focus is 1–8192 UTF-8 bytes; omit to retain the original focus. Original publication choice still applies after approval; prior publication attempts are not replayed. Shares one durable successor with relay_retry; the first reservation fixes its mode and focus.","inputSchema":{"type":"object","required":["id","key","confirm_stopped_and_reconciled","revalidate_tests"],"properties":{"id":{"type":"integer","minimum":1},"key":{"type":"string","minLength":1,"maxLength":128},"confirm_stopped_and_reconciled":{"type":"boolean","const":true},"revalidate_tests":{"type":"boolean","const":true},"review_focus":{"type":["string","null"],"minLength":1,"maxLength":8192,"description":"Optional review acceptance criteria, at most 8192 UTF-8 bytes. Omit or null to retain original focus."}},"additionalProperties":false}},
+            {"name":"relay_submit","description":"Submit a requirement to the durable development queue; use the same key for retries.","inputSchema":{"type":"object","required":["key","job"],"properties":{"key":{"type":"string","minLength":1,"maxLength":128},"job":{"type":"object","required":["repository","requirements","agent"],"properties":{"repository":{"type":"string"},"requirements":{"type":"string"},"agent":{"type":"string"},"test":{"type":["string","null"]},"publish":{"type":"boolean","default":false},"draft_pr_adapter":{"type":["string","null"]},"workflow":{"type":["string","null"]},"workspace_quota_bytes":{"type":["integer","null"],"minimum":1,"maximum":1099511627776u64}},"additionalProperties":false}},"additionalProperties":false}},
+            {"name":"relay_retry","description":"Explicitly continue a stopped unsuccessful task in its preserved workspace. Inspect side effects first; repeated calls return the same successor.","inputSchema":{"type":"object","required":["id","key","confirm_stopped_and_reconciled"],"properties":{"id":{"type":"integer","minimum":1},"key":{"type":"string","minLength":1,"maxLength":128},"confirm_stopped_and_reconciled":{"type":"boolean","const":true},"workspace_quota_bytes":{"type":["integer","null"],"minimum":1,"maximum":1099511627776u64}},"additionalProperties":false}},
+            {"name":"relay_continue_review","description":"Explicitly continue only the interrupted review of the preserved candidate, rerunning its configured tests first and never invoking the developer. Confirm stopped execution and reconciled side effects. Optional review_focus is 1–8192 UTF-8 bytes; omit to retain the original focus. Original publication choice still applies after approval; prior publication attempts are not replayed. Shares one durable successor with relay_retry; the first reservation fixes its mode and focus.","inputSchema":{"type":"object","required":["id","key","confirm_stopped_and_reconciled","revalidate_tests"],"properties":{"id":{"type":"integer","minimum":1},"key":{"type":"string","minLength":1,"maxLength":128},"confirm_stopped_and_reconciled":{"type":"boolean","const":true},"workspace_quota_bytes":{"type":["integer","null"],"minimum":1,"maximum":1099511627776u64},"revalidate_tests":{"type":"boolean","const":true},"review_focus":{"type":["string","null"],"minLength":1,"maxLength":8192,"description":"Optional review acceptance criteria, at most 8192 UTF-8 bytes. Omit or null to retain original focus."}},"additionalProperties":false}},
             {"name":"relay_get","description":"Read one task and its durable result.","inputSchema":{"type":"object","required":["id"],"properties":{"id":{"type":"integer","minimum":1}},"additionalProperties":false}},
             {"name":"relay_list","description":"List the newest 100 tasks, optionally before a task ID.","inputSchema":{"type":"object","properties":{"before":{"type":"integer","minimum":1}},"additionalProperties":false}},
+            {"name":"relay_resources","description":"Read a bounded host-derived initial workspace estimate for allowlisted repository/workflow names. No model execution or disk reservation.","inputSchema":{"type":"object","required":["repository"],"properties":{"repository":{"type":"string"},"workflow":{"type":["string","null"]}},"additionalProperties":false}},
+            {"name":"relay_operator","description":"Read structured failure, logical resource usage and server-declared recovery actions for one attempt.","inputSchema":{"type":"object","required":["id"],"properties":{"id":{"type":"integer","minimum":1}},"additionalProperties":false}},
             {"name":"relay_config","description":"Read configured repository, agent and test profile identifiers.","inputSchema":{"type":"object","additionalProperties":false}}
         ]}),
         Some("tools/call") => {
@@ -75,7 +77,7 @@ pub fn handle(app: &Application, request: Value) -> Option<Value> {
                             .and_then(|input| {
                                 app.retry(id, input)
                                     .map(|task| json!(task))
-                                    .map_err(|e| e.to_string())
+                                    .map_err(application_error)
                             }),
                         None => Err("positive task id required".into()),
                     }
@@ -117,6 +119,37 @@ pub fn handle(app: &Application, request: Value) -> Option<Value> {
                             .map(|tasks| json!(tasks))
                             .map_err(|e| e.to_string())
                     }
+                }
+                Some("relay_resources") => {
+                    #[derive(serde::Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Input {
+                        repository: String,
+                        workflow: Option<String>,
+                    }
+                    serde_json::from_value::<Input>(arguments)
+                        .map_err(|error| error.to_string())
+                        .and_then(|input| {
+                            app.resource_estimate(&input.repository, input.workflow.as_deref())
+                                .map(|estimate| json!(estimate))
+                                .map_err(|error| error.to_string())
+                        })
+                }
+                Some("relay_operator") => {
+                    #[derive(serde::Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Input {
+                        id: i64,
+                    }
+                    serde_json::from_value::<Input>(arguments)
+                        .map_err(|error| error.to_string())
+                        .and_then(|input| {
+                            if input.id > 0 {
+                                app.operator(input.id).map_err(|error| error.to_string())
+                            } else {
+                                Err("positive task id required".into())
+                            }
+                        })
                 }
                 Some("relay_config") => Ok(app.public_config()),
                 _ => return Some(error(id, -32602, "unknown tool")),
@@ -164,5 +197,12 @@ pub fn serve(
             writeln!(output)?;
             output.flush()?;
         }
+    }
+}
+
+fn application_error(error: crate::Error) -> String {
+    match error {
+        crate::Error::ActionUnavailable { code, cause } => json!({"error":cause,"failure":crate::resources::Failure::new(code,"request",cause.clone())}).to_string(),
+        other => other.to_string(),
     }
 }

@@ -9,6 +9,7 @@ pub mod host;
 pub mod http;
 pub mod mcp;
 pub mod providers;
+pub mod resources;
 mod sessions;
 pub mod workflow;
 mod workspaces;
@@ -37,6 +38,8 @@ pub enum Error {
     Invalid(String),
     #[error("{0}")]
     DiscoveryUnavailable(String),
+    #[error("{cause}")]
+    ActionUnavailable { code: String, cause: String },
     #[error(
         "task execution is unknown after restart; confirm the old process tree has stopped before local recovery"
     )]
@@ -56,6 +59,8 @@ pub struct Submission {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetryRequest {
+    #[serde(default)]
+    pub workspace_quota_bytes: Option<u64>,
     pub key: String,
     pub confirm_stopped_and_reconciled: bool,
 }
@@ -63,6 +68,8 @@ pub struct RetryRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewContinuationRequest {
+    #[serde(default)]
+    pub workspace_quota_bytes: Option<u64>,
     pub key: String,
     pub confirm_stopped_and_reconciled: bool,
     pub revalidate_tests: bool,
@@ -111,6 +118,8 @@ struct StateData {
     running: Option<(relay::Claim, Arc<AtomicBool>)>,
 }
 pub struct Application {
+    resource_measurements:
+        Mutex<std::collections::BTreeMap<(i64, i64), (std::time::Instant, resources::Usage)>>,
     catalogs: Mutex<catalog_cache::CatalogCache>,
     state: Mutex<StateData>,
     pub host: Host,
@@ -126,6 +135,7 @@ impl Application {
         // Adapter-owned metadata. It does not change the core queue state machine.
         control.execute_batch("CREATE TABLE IF NOT EXISTS app_continuations(predecessor_id INTEGER PRIMARY KEY, key TEXT NOT NULL, payload TEXT NOT NULL, task_id INTEGER); CREATE TABLE IF NOT EXISTS app_cancellations(task_id INTEGER PRIMARY KEY REFERENCES tasks(id)); CREATE TABLE IF NOT EXISTS app_diagnostics(task_id INTEGER PRIMARY KEY, generation INTEGER NOT NULL, result TEXT NOT NULL);")?;
         Ok(Arc::new(Self {
+            resource_measurements: Mutex::new(std::collections::BTreeMap::new()),
             catalogs: Mutex::new(catalog_cache::CatalogCache::default()),
             state: Mutex::new(StateData {
                 store,
@@ -171,6 +181,7 @@ impl Application {
         self.continue_task(
             id,
             RetryRequest {
+                workspace_quota_bytes: input.workspace_quota_bytes,
                 key: input.key,
                 confirm_stopped_and_reconciled: input.confirm_stopped_and_reconciled,
             },
@@ -214,27 +225,93 @@ impl Application {
                 result.outcome,
                 host::Outcome::Failure | host::Outcome::TimedOut | host::Outcome::Cancelled
             ) {
-                return Err(Error::Invalid(
-                    "only stopped unsuccessful tasks can continue".into(),
+                return Err(action_unavailable(
+                    "continuation_not_eligible",
+                    "only stopped unsuccessful tasks can continue",
                 ));
             }
-            if result.draft_pr.is_some() {
-                return Err(Error::Invalid(
-                    "publication was attempted; local reconciliation is required".into(),
+            if result.draft_pr.is_some()
+                || result.workflow.as_ref().is_some_and(|workflow| {
+                    workflow.reconciliation_required || workflow.publication.is_some()
+                })
+            {
+                return Err(action_unavailable(
+                    "publication_reconciliation_required",
+                    "publication was attempted; local reconciliation is required",
                 ));
             }
             let mut job = Job::from_payload(&predecessor.payload, self.host.config())
                 .map_err(|e| Error::Invalid(e.to_string()))?;
+            let prior_quota = recorded_quota(&result, &job);
+            let inherited_quota = job
+                .workspace_quota_bytes
+                .unwrap_or_else(|| self.config.workspace_byte_limit());
+            let path = workspaces::root(self.host.config(), &predecessor, &job);
+            workspaces::verify_candidate_checkpoint(self.host.config(), &job, &path).map_err(
+                |error| action_unavailable("candidate_checkpoint_changed", error.to_string()),
+            )?;
+            if result.workspace.as_ref() != Some(&path) {
+                return Err(action_unavailable(
+                    "retained_workspace_unverified",
+                    "the stopped result does not retain a matching workspace identity",
+                ));
+            }
+            let usage = resources::measure_workspace(&path, self.host.config());
+            let eligibility = resource_eligibility(
+                &result,
+                &usage,
+                prior_quota,
+                inherited_quota,
+                self.config.workspace_byte_limit(),
+            );
+            if let Some(requested) = input.workspace_quota_bytes {
+                if prior_quota.is_none_or(|prior| requested <= prior)
+                    || requested > self.config.workspace_byte_limit()
+                {
+                    return Err(action_unavailable(
+                        "invalid_workspace_quota_increase",
+                        "workspace quota must strictly increase the predecessor quota and remain within the host policy cap",
+                    ));
+                }
+                if eligibility
+                    .increase_min
+                    .is_none_or(|minimum| requested < minimum)
+                {
+                    return Err(action_unavailable("workspace_quota_increase_unavailable", eligibility.reason.unwrap_or_else(|| "a quota increase requires complete current usage, matching stopped quota proof and host-policy headroom".into())));
+                }
+            } else if !eligibility.same_quota {
+                return Err(action_unavailable("workspace_quota_increase_required", eligibility.reason.unwrap_or_else(|| "explicitly choose an eligible higher quota before continuing the retained workspace".into())));
+            }
             let prior_review_focus = job
                 .continuation
                 .as_ref()
                 .and_then(|c| c.review_only.as_ref())
                 .and_then(|c| c.review_focus.clone());
             job.continuation = Some(
-                workspaces::continuation(self.host.config(), &predecessor, &job)
-                    .map_err(|e| Error::Invalid(e.to_string()))?,
+                workspaces::continuation(self.host.config(), &predecessor, &job).map_err(
+                    |error| action_unavailable("workspace_recovery_unavailable", error.to_string()),
+                )?,
             );
+            if let Some(requested) = input.workspace_quota_bytes {
+                job.workspace_quota_bytes = Some(requested);
+                job.continuation
+                    .as_mut()
+                    .expect("continuation recorded")
+                    .quota_increase = Some(workspaces::QuotaIncrease {
+                    previous_bytes: prior_quota.expect("validated previous quota"),
+                    new_bytes: requested,
+                });
+                // Validate the exact override against the host-owned predecessor
+                // record before reserving it, then repeat the guard at execution.
+                workspaces::continuation(self.host.config(), &predecessor, &job).map_err(
+                    |error| action_unavailable("predecessor_quota_unverified", error.to_string()),
+                )?;
+            }
             if let Some(focus) = review_focus {
+                workspaces::verify_review_checkpoint(self.host.config(), &job, &result, &path)
+                    .map_err(|error| {
+                        action_unavailable("review_checkpoint_unverified", error.to_string())
+                    })?;
                 let review = workflow::review_continuation(&result, focus.or(prior_review_focus))
                     .map_err(Error::Invalid)?;
                 if job.workflow.is_none() {
@@ -367,6 +444,183 @@ impl Application {
             catalog.process_cleanup.state == capabilities::CapabilityState::Supported;
         let mut cache = self.catalogs.lock().map_err(|_| Error::Poisoned)?;
         Ok(cache.finish(name, profile, generation, catalog, cleanup_confirmed))
+    }
+    /// Bounded metadata-only source estimate; never invokes a configured command.
+    pub fn resource_estimate(
+        &self,
+        repository: &str,
+        workflow: Option<&str>,
+    ) -> Result<resources::ResourceEstimate> {
+        resources::estimate(self.host.config(), repository, workflow).map_err(Error::Invalid)
+    }
+    /// Read a single attempt's operator controls. Filesystem measurements have a
+    /// short cache; eligibility and every action are checked independently.
+    pub fn operator(&self, id: i64) -> Result<Value> {
+        let (task, successor, reservation, diagnostic) = {
+            let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+            let view = task_view(&state.control, state.store.get(id)?)?;
+            let reservation: Option<(String, String)> = state
+                .control
+                .query_row(
+                    "SELECT key,payload FROM app_continuations WHERE predecessor_id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let diagnostic: Option<String> = state
+                .control
+                .query_row(
+                    "SELECT result FROM app_diagnostics WHERE task_id=?1 AND generation=?2",
+                    params![id, view.task.generation],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            (
+                view.task,
+                view.continuation_status
+                    .and_then(|status| status.successor_id),
+                reservation,
+                diagnostic,
+            )
+        };
+        let job = Job::from_payload(&task.payload, self.host.config()).ok();
+        let result = task
+            .result
+            .as_deref()
+            .or(diagnostic.as_deref())
+            .and_then(|text| serde_json::from_str::<host::RunResult>(text).ok());
+        let path = job
+            .as_ref()
+            .map(|job| workspaces::root(self.host.config(), &task, job));
+        let inherited_quota = job.as_ref().map(|job| {
+            job.workspace_quota_bytes
+                .unwrap_or_else(|| self.config.workspace_byte_limit())
+        });
+        let quota = result
+            .as_ref()
+            .and_then(|result| result.resources.as_ref())
+            .and_then(|resources| resources.quota_bytes)
+            .or_else(|| job.as_ref().and_then(|job| job.workspace_quota_bytes))
+            .or_else(|| {
+                (task.state == relay::State::Queued)
+                    .then_some(inherited_quota)
+                    .flatten()
+            });
+        let workspace_retained = path.as_ref().is_some_and(|path| {
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+                && path
+                    .canonicalize()
+                    .is_ok_and(|canonical| canonical == *path)
+        });
+        let usage = {
+            let mut cache = self
+                .resource_measurements
+                .lock()
+                .map_err(|_| Error::Poisoned)?;
+            let key = (task.id, task.generation);
+            if let Some((time, usage)) = cache.get(&key)
+                && time.elapsed() < Duration::from_secs(5)
+            {
+                usage.clone()
+            } else {
+                let usage = path
+                    .as_deref()
+                    .map(|path| resources::measure_workspace(path, self.host.config()))
+                    .unwrap_or_else(|| {
+                        resources::Usage::unavailable("task has no valid host workspace binding")
+                    });
+                if cache.len() >= 100 {
+                    cache.clear();
+                }
+                cache.insert(key, (std::time::Instant::now(), usage.clone()));
+                usage
+            }
+        };
+        let resources = resources::ResourceState::new(usage.clone(), quota, self.host.config());
+        let mut actions = Vec::new();
+        let mut reserved_request = Value::Null;
+        let mut blocked_reason = None;
+        if let Some(successor) = successor {
+            blocked_reason = Some(format!("continuation already created as task #{successor}"));
+        } else if let Some((key, payload)) = reservation {
+            if let Ok(reserved) = serde_json::from_str::<Job>(&payload) {
+                let review = reserved
+                    .continuation
+                    .as_ref()
+                    .and_then(|continuation| continuation.review_only.as_ref());
+                let action = if review.is_some() {
+                    "continue_review"
+                } else {
+                    "retry"
+                };
+                reserved_request = json!({"action_id":action,"key":key,"workspace_quota_bytes":reserved.continuation.as_ref().and_then(|c| c.quota_increase.as_ref()).map(|q|q.new_bytes),"revalidate_tests":review.is_some(),"review_focus":review.and_then(|review|review.review_focus.as_ref())});
+                actions.push(json!({"id":action,"quota_increase_allowed":false,"quota_increase_required":false,"min_quota_bytes":null,"max_quota_bytes":self.config.workspace_byte_limit(),"requires_test_revalidation":review.is_some()}));
+            } else {
+                blocked_reason = Some("reserved continuation payload cannot be verified".into());
+            }
+        } else if task.state != relay::State::Finished {
+            blocked_reason = Some("only durably stopped unsuccessful attempts can continue; unknown or active ownership requires host reconciliation".into());
+        } else if let (Some(job), Some(result), Some(path), Some(inherited_quota)) =
+            (&job, &result, &path, inherited_quota)
+        {
+            if !matches!(
+                result.outcome,
+                host::Outcome::Failure | host::Outcome::TimedOut | host::Outcome::Cancelled
+            ) {
+                blocked_reason = Some("only stopped unsuccessful attempts can continue".into());
+            } else if result.draft_pr.is_some()
+                || result.workflow.as_ref().is_some_and(|workflow| {
+                    workflow.reconciliation_required || workflow.publication.is_some()
+                })
+            {
+                blocked_reason = Some("publication was attempted or is ambiguous; reconcile external effects before recovery".into());
+            } else if !workspace_retained || result.workspace.as_ref() != Some(path) {
+                blocked_reason = Some(
+                    "the retained workspace is missing or does not match the stopped result".into(),
+                );
+            } else if let Err(error) = workspaces::continuation(self.host.config(), &task, job)
+                .and_then(|_| {
+                    workspaces::verify_candidate_checkpoint(self.host.config(), job, path)
+                })
+            {
+                blocked_reason = Some(error.to_string());
+            } else {
+                let eligibility = resource_eligibility(
+                    result,
+                    &usage,
+                    quota,
+                    inherited_quota,
+                    self.config.workspace_byte_limit(),
+                );
+                blocked_reason = eligibility.reason;
+                if eligibility.same_quota || eligibility.increase_min.is_some() {
+                    let action = |id: &str, review: bool| json!({"id":id,"quota_increase_allowed":eligibility.increase_min.is_some(),"quota_increase_required":!eligibility.same_quota,"min_quota_bytes":eligibility.increase_min,"max_quota_bytes":self.config.workspace_byte_limit(),"requires_test_revalidation":review});
+                    actions.push(action("retry", false));
+                    if workflow::review_continuation(result, None).is_ok() {
+                        match workspaces::verify_review_checkpoint(
+                            self.host.config(),
+                            job,
+                            result,
+                            path,
+                        ) {
+                            Ok(()) => actions.push(action("continue_review", true)),
+                            Err(error) => {
+                                blocked_reason = Some(format!(
+                                    "review-only continuation is unavailable: {error}"
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            blocked_reason =
+                Some("task payload or stopped result is not a verified host record".into());
+        }
+        let failure = result.as_ref().and_then(|result| result.failure.clone()).or_else(|| result.as_ref().filter(|result|result.outcome != host::Outcome::Success).map(|result|resources::Failure::new("legacy_failure", "unknown", result.error.clone().unwrap_or_else(|| "legacy result has no structured failure; inspect the retained stage output".into()))));
+        Ok(
+            json!({"task_id":task.id,"generation":task.generation,"failure":failure,"resources":resources,"retained_result":{"available":task.result.is_some(),"immutable":true},"workspace_retained":workspace_retained,"recovery":{"inherited_quota_bytes":inherited_quota,"actions":actions,"blocked_reason":blocked_reason,"successor_id":successor,"reserved_request":reserved_request}}),
+        )
     }
     pub fn public_config(&self) -> Value {
         let agents: Vec<_> = self
@@ -536,4 +790,191 @@ fn matches_claim(task: &Task, claim: &relay::Claim) -> bool {
     task.id == claim.task_id
         && task.generation == claim.generation
         && task.owner.as_deref() == Some(claim.owner.as_str())
+}
+
+fn action_unavailable(code: impl Into<String>, cause: impl Into<String>) -> Error {
+    Error::ActionUnavailable {
+        code: code.into(),
+        cause: cause.into(),
+    }
+}
+
+struct ResourceEligibility {
+    same_quota: bool,
+    increase_min: Option<u64>,
+    reason: Option<String>,
+}
+/// GET controls and POST validation deliberately share this decision. An incomplete
+/// metadata walk is not proof of an incomplete workspace initialization: the latter
+/// remains an independent, unconditional ownership/ready-marker guard.
+fn resource_eligibility(
+    result: &host::RunResult,
+    usage: &resources::Usage,
+    prior_quota: Option<u64>,
+    inherited_quota: u64,
+    cap: u64,
+) -> ResourceEligibility {
+    let blocked = |reason: &str| ResourceEligibility {
+        same_quota: false,
+        increase_min: None,
+        reason: Some(reason.into()),
+    };
+    let code = result.failure.as_ref().map(|failure| failure.code.as_str());
+    if matches!(
+        code,
+        Some("snapshot_limit_exceeded" | "snapshot_entry_limit_exceeded")
+    ) {
+        return blocked(
+            "source snapshot admission failed; a workspace quota increase cannot change the source limit",
+        );
+    }
+    let Some(bytes) = usage.logical_bytes else {
+        return blocked("current workspace usage is unavailable; recovery cannot be verified");
+    };
+    if !usage.complete {
+        if bytes > inherited_quota
+            || matches!(
+                code,
+                Some("workspace_quota_exceeded" | "workspace_entry_limit_exceeded")
+            )
+        {
+            return blocked(
+                "resource failure requires a complete fresh workspace measurement before recovery",
+            );
+        }
+        return ResourceEligibility { same_quota: true, increase_min: None, reason: Some("usage is an incomplete lower bound; quota increases are unavailable and the original limit will be checked again before execution".into()) };
+    }
+    let has_proof = prior_quota.is_some()
+        && result
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.quota_bytes)
+            == prior_quota;
+    let quota = prior_quota.unwrap_or(inherited_quota);
+    let admission_required = result
+        .failure
+        .as_ref()
+        .and_then(|failure| failure.required_bytes)
+        .unwrap_or(0);
+    let increase_min = bytes
+        .checked_add(1)
+        .map(|bytes| bytes.max(quota.saturating_add(1)).max(admission_required))
+        .filter(|minimum| has_proof && *minimum <= cap);
+    ResourceEligibility {
+        same_quota: bytes <= inherited_quota && admission_required <= inherited_quota,
+        increase_min,
+        reason: if bytes > inherited_quota || admission_required > inherited_quota {
+            Some(if increase_min.is_some() { "retained usage or known planned-copy admission exceeds this attempt quota; choose an explicit increase to continue" } else { "retained usage exceeds this attempt quota and no verified increase fits the host policy cap" }.into())
+        } else if quota >= cap {
+            Some(
+                "this attempt already uses the host policy cap; no quota increase is available"
+                    .into(),
+            )
+        } else if !has_proof {
+            Some(
+                "stopped result has no matching quota proof; only same-quota recovery is available"
+                    .into(),
+            )
+        } else {
+            None
+        },
+    }
+}
+
+fn recorded_quota(result: &host::RunResult, job: &Job) -> Option<u64> {
+    result
+        .resources
+        .as_ref()
+        .and_then(|resources| resources.quota_bytes)
+        .or(job.workspace_quota_bytes)
+}
+
+#[cfg(test)]
+mod resource_policy_tests {
+    use super::*;
+    fn result(code: &str, quota: u64) -> host::RunResult {
+        serde_json::from_value(json!({"outcome":"failure","workspace":null,"agent":null,"tests":null,"draft_pr":null,"error":null,
+            "failure":{"code":code,"stage":"workspace_admission","cause":"fixture"},
+            "resources":{"usage":{"logical_bytes":10,"complete":true,"measured_at":0,"reason":null},"quota_bytes":quota,"host_policy_cap_bytes":1000,"snapshot_cap_bytes":1000,"enforcement":"logical_bytes_best_effort","os_hard_quota":false,"disk_reserved":false}})).unwrap()
+    }
+    #[test]
+    fn planned_admission_requires_the_known_minimum_even_when_current_usage_is_low() {
+        let mut result = result("workspace_quota_exceeded", 100);
+        result.failure.as_mut().unwrap().required_bytes = Some(300);
+        let eligibility = resource_eligibility(
+            &result,
+            &resources::Usage::observed(10, true),
+            Some(100),
+            100,
+            1000,
+        );
+        assert!(!eligibility.same_quota);
+        assert_eq!(eligibility.increase_min, Some(300));
+        let blocked = resource_eligibility(
+            &result,
+            &resources::Usage::observed(10, true),
+            Some(100),
+            100,
+            200,
+        );
+        assert!(!blocked.same_quota);
+        assert_eq!(blocked.increase_min, None);
+    }
+    #[test]
+    fn incomplete_resource_failure_differs_from_nonresource_failure_and_unavailable_usage() {
+        for code in ["workspace_quota_exceeded", "workspace_entry_limit_exceeded"] {
+            let eligibility = resource_eligibility(
+                &result(code, 100),
+                &resources::Usage::observed(10, false),
+                Some(100),
+                100,
+                1000,
+            );
+            assert!(!eligibility.same_quota);
+            assert_eq!(eligibility.increase_min, None);
+        }
+        let result = result("command_failed", 100);
+        assert!(
+            resource_eligibility(
+                &result,
+                &resources::Usage::observed(10, false),
+                Some(100),
+                100,
+                1000
+            )
+            .same_quota
+        );
+        assert!(
+            !resource_eligibility(
+                &result,
+                &resources::Usage::unavailable("missing"),
+                Some(100),
+                100,
+                1000
+            )
+            .same_quota
+        );
+    }
+    #[test]
+    fn prior_quota_and_unchanged_default_payload_are_distinct_after_policy_change() {
+        let result = result("workspace_quota_exceeded", 600);
+        let eligibility = resource_eligibility(
+            &result,
+            &resources::Usage::observed(650, true),
+            Some(600),
+            800,
+            800,
+        );
+        assert!(eligibility.same_quota);
+        assert_eq!(eligibility.increase_min, Some(651));
+        let legacy = resource_eligibility(
+            &result,
+            &resources::Usage::observed(650, true),
+            None,
+            800,
+            800,
+        );
+        assert!(legacy.same_quota);
+        assert_eq!(legacy.increase_min, None);
+    }
 }
