@@ -36,6 +36,7 @@ fn explicit_retry_preserves_files_reserves_one_successor_and_survives_restart() 
     let app = Application::open(&db, config.clone()).unwrap();
     app.submit(input()).unwrap();
     assert!(app.work_once().unwrap());
+    assert!(app.get_view(1).unwrap().continuation_status.is_none());
     let original_result = app.get(1).unwrap().result.clone();
     let old = result(&app, 1);
     assert_eq!(old.outcome, Outcome::Failure);
@@ -52,9 +53,33 @@ fn explicit_retry_preserves_files_reserves_one_successor_and_survives_restart() 
     );
     let first = app.retry(1, retry("retry")).unwrap();
     assert_eq!(first.id, 2);
+    assert_eq!(
+        app.get_view(1)
+            .unwrap()
+            .continuation_status
+            .unwrap()
+            .successor_id,
+        Some(2)
+    );
+    assert_eq!(
+        app.list_views(Some(2)).unwrap()[0]
+            .continuation_status
+            .as_ref()
+            .unwrap()
+            .successor_id,
+        Some(2)
+    );
     assert_eq!(app.retry(1, retry("different-click-key")).unwrap(), first);
     drop(app);
     let app = Application::open(&db, config).unwrap();
+    assert_eq!(
+        app.get_view(1)
+            .unwrap()
+            .continuation_status
+            .unwrap()
+            .successor_id,
+        Some(2)
+    );
     assert_eq!(app.retry(1, retry("after-restart")).unwrap(), first);
     assert!(app.work_once().unwrap());
     let next = result(&app, 2);
@@ -315,6 +340,7 @@ async fn authenticated_http_and_mcp_share_the_same_explicit_continuation() {
         .unwrap();
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
     let response = router
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -330,6 +356,43 @@ async fn authenticated_http_and_mcp_share_the_same_explicit_continuation() {
     let task: serde_json::Value =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(task["id"], 2);
+    for (uri, list) in [("/api/tasks/1", false), ("/api/tasks?before=2", true)] {
+        let denied = router
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let view: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let predecessor = if list {
+            assert_eq!(view.as_array().unwrap().len(), 1);
+            &view[0]
+        } else {
+            &view
+        };
+        assert_eq!(predecessor["id"], 1);
+        assert_eq!(predecessor["continuation_status"]["successor_id"], 2);
+        assert_eq!(predecessor["result"], app.get(1).unwrap().result.unwrap());
+    }
+    let mcp = relay_app::mcp::handle(&app, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"relay_get","arguments":{"id":1}}})).unwrap();
+    let view: serde_json::Value =
+        serde_json::from_str(mcp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(view["continuation_status"]["successor_id"], 2);
+
     let response=relay_app::mcp::handle(&app,json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"relay_retry","arguments":{"id":1,"key":"mcp-retry","confirm_stopped_and_reconciled":true}}})).unwrap();
     assert_eq!(response["result"]["isError"], false);
     assert!(response.to_string().contains("http-retry"));
@@ -370,4 +433,97 @@ fn raising_workspace_quota_continues_same_files_without_reset_or_identity_change
         1280 * 1024 * 1024
     );
     assert_eq!(fs::read_dir(tmp.path().join("runs")).unwrap().count(), 1);
+}
+
+#[test]
+fn continuation_views_resolve_commit_gap_and_preserve_unsubmitted_reservations() {
+    let tmp = TempDir::new().unwrap();
+    let config = config(tmp.path(), FAIL_ONCE);
+    let db = tmp.path().join("db");
+    let app = Application::open(&db, config.clone()).unwrap();
+    app.submit(input()).unwrap();
+    app.work_once().unwrap();
+    let child = app.retry(1, retry("reserved-key")).unwrap();
+    let control = rusqlite::Connection::open(&db).unwrap();
+    // Simulate interruption after core submission, before adapter checkpoint.
+    control
+        .execute(
+            "UPDATE app_continuations SET task_id=NULL WHERE predecessor_id=1",
+            [],
+        )
+        .unwrap();
+    drop(app);
+    let app = Application::open(&db, config).unwrap();
+    assert_eq!(
+        app.get_view(1)
+            .unwrap()
+            .continuation_status
+            .unwrap()
+            .successor_id,
+        Some(child.id)
+    );
+    let checkpoint: Option<i64> = control
+        .query_row(
+            "SELECT task_id FROM app_continuations WHERE predecessor_id=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(checkpoint, None, "reads must not mutate reservations");
+    // Remove only this test's child to model interruption before core submission.
+    control
+        .execute("DELETE FROM tasks WHERE id=?1", [child.id])
+        .unwrap();
+    assert_eq!(
+        app.get_view(1)
+            .unwrap()
+            .continuation_status
+            .unwrap()
+            .successor_id,
+        None
+    );
+    let recovered = app.retry(1, retry("new-tab-key")).unwrap();
+    assert_eq!(recovered.key, "reserved-key");
+    assert_eq!(app.retry(1, retry("repeat")).unwrap().id, recovered.id);
+    assert_eq!(
+        app.get_view(1)
+            .unwrap()
+            .continuation_status
+            .unwrap()
+            .successor_id,
+        Some(recovered.id)
+    );
+    assert_eq!(app.list(None).unwrap().len(), 2);
+}
+
+#[test]
+fn failed_successor_continues_from_latest_child_without_reopening_original() {
+    let tmp = TempDir::new().unwrap();
+    let app = Application::open(tmp.path().join("db"), config(tmp.path(), "exit 7")).unwrap();
+    app.submit(input()).unwrap();
+    app.work_once().unwrap();
+    let original = app.get(1).unwrap();
+    let child = app.retry(1, retry("child")).unwrap();
+    app.work_once().unwrap();
+    assert_eq!(result(&app, child.id).outcome, Outcome::Failure);
+    let next = app.retry(child.id, retry("grandchild")).unwrap();
+    assert_eq!(app.retry(1, retry("old-button")).unwrap().id, child.id);
+    assert_eq!(
+        app.get_view(1)
+            .unwrap()
+            .continuation_status
+            .unwrap()
+            .successor_id,
+        Some(child.id)
+    );
+    assert_eq!(
+        app.get_view(child.id)
+            .unwrap()
+            .continuation_status
+            .unwrap()
+            .successor_id,
+        Some(next.id)
+    );
+    assert_eq!(app.get(1).unwrap(), original);
+    assert_eq!(app.list(None).unwrap().len(), 3);
 }

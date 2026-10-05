@@ -6,7 +6,7 @@ The application itself has no JavaScript/build dependencies.
 import json, threading, tempfile, os
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, expect
 HTML = (Path(__file__).resolve().parents[1] / 'static' / 'index.html').read_bytes()
 SCREENSHOTS = Path(os.environ.get('RELAY_UI_SCREENSHOTS') or tempfile.mkdtemp(prefix='relay-ui-smoke-'))
 SCREENSHOTS.mkdir(parents=True, exist_ok=True)
@@ -19,13 +19,18 @@ server=ThreadingHTTPServer(('127.0.0.1',0),Server)
 threading.Thread(target=server.serve_forever,daemon=True).start()
 base=f'http://127.0.0.1:{server.server_port}'
 def task(i, state='queued', requirement=None, outcome=None):
-    return {'id':i,'key':f'key-{i}','payload':json.dumps({'repository':'relay-demo','requirements':requirement or f'改进工作台的任务体验 #{i}','agent':'codex','test':'unit','publish':False},ensure_ascii=False),'state':state,'generation':1 if state!='queued' else 0,'owner':'worker-1' if state!='queued' else None,'result':json.dumps({'outcome':outcome,'summary':'完成结果需要人工审阅'},ensure_ascii=False) if outcome else None}
+    return {'id':i,'key':f'key-{i}','payload':json.dumps({'repository':'relay-demo','requirements':requirement or f'改进工作台的任务体验 #{i}','agent':'codex','test':'unit','publish':False},ensure_ascii=False),'state':state,'generation':1 if state!='queued' else 0,'owner':'worker-1' if state!='queued' else None,'result':json.dumps({'outcome':outcome,'summary':'完成结果需要人工审阅'},ensure_ascii=False) if outcome else None,'continuation_status':None}
 with sync_playwright() as p:
     browser=p.chromium.launch(executable_path=os.environ.get('CHROMIUM_PATH'),headless=True,args=['--no-sandbox'])
     context=browser.new_context(viewport={'width':1440,'height':1150},locale='zh-CN')
     page=context.new_page(); errors=[]; requests=[]; submissions=[]
-    page.on('pageerror',lambda e:errors.append(str(e)))
-    data={'tasks':[task(3,'queued'),task(2,'claimed'),task(1,'finished',outcome='success')], 'status':{'active':task(2,'claimed'),'recovery_required':False,'diagnostic':None},'post':'success','list_error':False,'config':{'repositories':['relay-demo','api-service'],'agents':['codex','reviewer'],'tests':['unit','full']}}
+    data={'tasks':[task(3,'queued'),task(2,'claimed'),task(1,'finished',outcome='success')], 'status':{'active':task(2,'claimed'),'recovery_required':False,'diagnostic':None},'post':'success','list_error':False,'continuations':{},'hidden_task_ids':set(),'frozen_lists':{},'retry_requests':[],'config':{'repositories':['relay-demo','api-service'],'agents':['codex','reviewer'],'tests':['unit','full']}}
+    # Model persisted reservations separately from visible task payloads. A child
+    # outside the recent page must not make its predecessor appear retryable.
+    def task_response(value):
+        return dict(value,continuation_status=data['continuations'].get(value['id']))
+    def visible_tasks():
+        return [task_response(value) for value in data['tasks'] if value['id'] not in data['hidden_task_ids']]
     def route(r):
         req=r.request; path=req.url.replace(base,''); requests.append((req.method,path,req.headers))
         assert req.headers.get('authorization')=='Bearer test-token',req.headers
@@ -33,29 +38,56 @@ with sync_playwright() as p:
         elif path=='/api/status': result=data['status']
         elif path=='/api/tasks' and req.method=='GET':
             if data['list_error']: r.abort();return
-            result=data['tasks']
+            result=data['frozen_lists'].get(req.frame.page,visible_tasks())
         elif path=='/api/tasks' and req.method=='POST':
             body=req.post_data_json; submissions.append(body)
             assert body['job']['publish'] is False
             if data['post']=='abort': r.abort();return
             if data['post']=='401': r.fulfill(status=401,content_type='application/json',body=json.dumps({'error':'Unauthorized'}));return
-            result={'id':max(t['id'] for t in data['tasks'])+1,'key':body['key'],'payload':json.dumps(body['job'],ensure_ascii=False),'state':'queued','generation':0,'owner':None,'result':None}
+            result={'id':max(t['id'] for t in data['tasks'])+1,'key':body['key'],'payload':json.dumps(body['job'],ensure_ascii=False),'state':'queued','generation':0,'owner':None,'result':None,'continuation_status':None}
             data['tasks'].append(result)
         elif path.endswith('/retry'):
             old_id=int(path.split('/')[-2]);body=req.post_data_json
             assert body['confirm_stopped_and_reconciled'] is True
+            assert req.method=='POST'
+            data['retry_requests'].append((old_id,body))
             old=next(t for t in data['tasks'] if t['id']==old_id)
-            result=next((t for t in data['tasks'] if json.loads(t['payload']).get('continuation',{}).get('predecessor_task_id')==old_id),None)
-            if result is None:
-                job=json.loads(old['payload']);job['continuation']={'workspace_task_id':old_id,'predecessor_task_id':old_id,'predecessor_generation':1}
+            reservation=data['continuations'].setdefault(old_id,{'successor_id':None})
+            if reservation['successor_id'] is None:
+                job=json.loads(old['payload'])
+                workspace_id=job.get('continuation',{}).get('workspace_task_id',old_id)
+                job['continuation']={'workspace_task_id':workspace_id,'predecessor_task_id':old_id,'predecessor_generation':old['generation']}
                 result=task(max(t['id'] for t in data['tasks'])+1);result['key']=body['key'];result['payload']=json.dumps(job)
                 data['tasks'].append(result)
+                reservation['successor_id']=result['id']
+            else:
+                result=next(t for t in data['tasks'] if t['id']==reservation['successor_id'])
+            # A stale tab receives the same authoritative successor, even when
+            # it generated a fresh key and opened its dialog before another tab.
+            data['frozen_lists'].pop(req.frame.page,None)
+            result=task_response(result)
         elif path.endswith('/cancel'): result={'requested':True}
-        elif path.startswith('/api/tasks/'): result=next(t for t in data['tasks'] if t['id']==int(path.rsplit('/',1)[-1]))
+        elif path.startswith('/api/tasks/'): result=task_response(next(t for t in data['tasks'] if t['id']==int(path.rsplit('/',1)[-1])))
         else: raise Exception(path)
         r.fulfill(status=200,content_type='application/json',body=json.dumps(result,ensure_ascii=False))
-    page.route('**/auth/status', lambda r: r.fulfill(status=200,content_type='application/json',body=json.dumps({'mode':'bearer','authenticated':False})))
-    page.route('**/api/**',route)
+    def instrument(target):
+        target.on('pageerror',lambda e:errors.append(str(e)))
+        target.route('**/auth/status', lambda r: r.fulfill(status=200,content_type='application/json',body=json.dumps({'mode':'bearer','authenticated':False})))
+        target.route('**/api/**',route)
+    def connect(target):
+        target.locator('#token').fill('test-token');target.locator('#connect').click()
+        expect(target.locator('#auth-panel')).to_be_hidden()
+    def select_task(target,task_id):
+        with target.expect_response(lambda response: response.url==base+'/api/tasks/'+str(task_id) and response.request.method=='GET'):
+            target.locator('[data-task-id="'+str(task_id)+'"]').click()
+        expect(target.locator('#detail-title')).to_have_text('任务 #'+str(task_id))
+    def assert_successor(target,predecessor_id,successor_id):
+        expect(target.locator('#detail-title')).to_have_text('任务 #'+str(predecessor_id))
+        expect(target.locator('#retry-task')).to_be_hidden()
+        expect(target.locator('#continuation-next')).to_have_text('已续接至任务 #'+str(successor_id))
+        expect(target.locator('#continuation-next')).to_be_visible()
+        expect(target.locator('#continuation-next')).to_be_enabled()
+    instrument(page)
     page.goto(base); page.wait_for_timeout(2200)
     assert not requests, 'Requests before authentication'
     page.screenshot(path=str(SCREENSHOTS / 'relay-disconnected-desktop.png'),full_page=True)
@@ -214,6 +246,14 @@ with sync_playwright() as p:
     data['tasks'].append(failed);data['status']={'active':None,'recovery_required':False,'diagnostic':None}
     page.locator('#refresh').click();page.wait_for_timeout(200);page.locator('[data-task-id="120"]').click();page.wait_for_timeout(100)
     assert page.locator('#retry-task').is_enabled()
+    original_failed=json.loads(json.dumps(failed))
+    # Keep a second tab on an old server snapshot, with its confirmation already
+    # open. Its independent key must still return the first tab's successor.
+    stale_page=context.new_page();instrument(stale_page);stale_page.goto(base);connect(stale_page)
+    select_task(stale_page,120)
+    data['frozen_lists'][stale_page]=json.loads(json.dumps(visible_tasks()))
+    stale_page.locator('#retry-task').click()
+    expect(stale_page.locator('#retry-dialog')).to_be_visible()
     page.locator('#retry-task').click();assert page.locator('#retry-dialog').is_visible()
     assert '不从源仓库重新复制' in page.locator('#retry-dialog').inner_text()
     page.screenshot(path=str(SCREENSHOTS / 'relay-continue-mobile.png'),full_page=True)
@@ -222,6 +262,82 @@ with sync_playwright() as p:
     assert page.locator('#detail-title').inner_text()=='任务 #121'
     assert '续接自' in page.locator('#detail-meta').inner_text()
     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+    assert data['continuations'][120]=={'successor_id':121}
+    assert len(data['retry_requests'])==1
+    select_task(page,120);assert_successor(page,120,121)
+    page.screenshot(path=str(SCREENSHOTS / 'relay-continued-original-mobile.png'),full_page=True)
+    # Revisiting and repeatedly following an existing successor are GET-only.
+    for _ in range(3):
+        page.locator('#continuation-next').click()
+        expect(page.locator('#detail-title')).to_have_text('任务 #121')
+        select_task(page,120);assert_successor(page,120,121)
+    assert len(data['retry_requests'])==1
+    expect(stale_page.locator('#retry-dialog')).to_be_visible()
+    stale_page.locator('#retry-confirm').click()
+    expect(stale_page.locator('#detail-title')).to_have_text('任务 #121')
+    assert len(data['retry_requests'])==2
+    assert data['retry_requests'][0][1]['key']!=data['retry_requests'][1][1]['key']
+    assert [value['id'] for value in data['tasks'] if value['id']>120]==[121]
+    select_task(stale_page,120);assert_successor(stale_page,120,121)
+    stale_page.close()
+    # Both manual refresh and a full document reload use persisted state.
+    with page.expect_response(lambda response: response.url==base+'/api/tasks'):
+        page.locator('#refresh').click()
+    assert_successor(page,120,121)
+    page.reload();expect(page.locator('#auth-panel')).to_be_visible();connect(page)
+    select_task(page,120);assert_successor(page,120,121)
+    # A fresh browser context receives only the predecessor in its recent page.
+    # The server status, not a visible child payload or browser storage, drives UI.
+    data['hidden_task_ids'].add(121)
+    fresh_context=browser.new_context(viewport={'width':1440,'height':1150},locale='zh-CN')
+    fresh_page=fresh_context.new_page();instrument(fresh_page);fresh_page.goto(base);connect(fresh_page)
+    assert fresh_page.evaluate('localStorage.length + sessionStorage.length')==0
+    assert fresh_page.locator('[data-task-id="121"]').count()==0
+    select_task(fresh_page,120);assert_successor(fresh_page,120,121)
+    fresh_page.screenshot(path=str(SCREENSHOTS / 'relay-continued-original-desktop.png'),full_page=True)
+    with fresh_page.expect_response(lambda response: response.url==base+'/api/tasks/121'):
+        fresh_page.locator('#continuation-next').click()
+    expect(fresh_page.locator('#detail-title')).to_have_text('任务 #121')
+    with fresh_page.expect_response(lambda response: response.url==base+'/api/tasks/121'):
+        fresh_page.locator('#refresh').click()
+    expect(fresh_page.locator('#detail-title')).to_have_text('任务 #121')
+    assert len(data['retry_requests'])==2
+    # If that successor fails, only it can extend the chain. The original keeps
+    # pointing at its first successor, not at the newest task in the workspace.
+    child=next(value for value in data['tasks'] if value['id']==121)
+    child.update(state='finished',generation=1,owner='worker-1',result=json.dumps({'outcome':'failure','workspace':'/fixture/task-120','draft_pr':None}))
+    with fresh_page.expect_response(lambda response: response.url==base+'/api/tasks/121'):
+        fresh_page.locator('#refresh').click()
+    expect(fresh_page.locator('#retry-task')).to_be_visible()
+    expect(fresh_page.locator('#retry-task')).to_be_enabled()
+    expect(fresh_page.locator('#continuation-next')).to_be_hidden()
+    fresh_page.locator('#retry-task').click();fresh_page.locator('#retry-confirm').click()
+    expect(fresh_page.locator('#detail-title')).to_have_text('任务 #122')
+    assert data['continuations'][121]=={'successor_id':122}
+    grandchild=next(value for value in data['tasks'] if value['id']==122)
+    assert json.loads(grandchild['payload'])['continuation']=={'workspace_task_id':120,'predecessor_task_id':121,'predecessor_generation':1}
+    select_task(fresh_page,120);assert_successor(fresh_page,120,121)
+    fresh_page.locator('#continuation-next').click()
+    expect(fresh_page.locator('#detail-title')).to_have_text('任务 #121')
+    assert_successor(fresh_page,121,122)
+    assert len(data['retry_requests'])==3
+    assert failed==original_failed, 'Continuing must not modify the original task or result'
+    fresh_context.close();data['hidden_task_ids'].clear()
+    # A durable reservation without a submitted child remains recoverable even
+    # if the original result has no reusable-workspace field to rediscover.
+    reserved=task(130,'finished',outcome='failure')
+    data['tasks'].append(reserved);data['continuations'][130]={'successor_id':None}
+    with page.expect_response(lambda response: response.url==base+'/api/tasks'):
+        page.locator('#refresh').click()
+    select_task(page,130)
+    expect(page.locator('#retry-task')).to_have_text('恢复已预留的续接')
+    expect(page.locator('#retry-task')).to_be_enabled()
+    expect(page.locator('#continuation-next')).to_be_hidden()
+    page.locator('#retry-task').click();page.locator('#retry-confirm').click()
+    expect(page.locator('#detail-title')).to_have_text('任务 #131')
+    assert data['continuations'][130]=={'successor_id':131}
+    select_task(page,130);assert_successor(page,130,131)
+    assert len(data['retry_requests'])==4
     # Logout clears sensitive task content and stops polling.
     page.locator('#logout').click();after_logout=len(requests);page.wait_for_timeout(2400)
     assert len(requests)==after_logout
@@ -235,6 +351,6 @@ with sync_playwright() as p:
     assert not page.locator('#workflow-field').is_visible()
     assert page.locator('#workflow-hint').inner_text()==''
     assert not errors, errors
-    print('PASS: optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, logout; no browser errors')
+    print('PASS: optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, persisted continuation status, repeated successor navigation, stale two-tab confirmation, reload/new-context recovery, off-page successor detail/refresh, continuation chains, reserved-submit recovery, logout; no browser errors')
     browser.close()
 server.shutdown()

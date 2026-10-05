@@ -24,6 +24,7 @@ const task=(id,state='queued',outcome=null)=>({id,key:'key-'+id,payload:JSON.str
 let config={repositories:['repo'],agents:['agent'],tests:['test']};
 let db=[task(3),task(2,'claimed'),task(1,'finished','success')],status={active:task(2,'claimed'),recovery_required:false,diagnostic:null},requests=[],submissions=[],retries=[],mode='success',pendingFetch=[],failList=false,delayList=false,delayDetail=false,delayPost=false,delayConfig=false,ignoreAbort=false;
 const authMode=process.argv.includes('--session')?'session':process.argv.includes('--hybrid')?'hybrid':'bearer';
+const excludedListIds=new Set();
 let cookieAuthenticated=process.argv.includes('--restore'),rejectLogin=false,failLogout=false;
 async function fetch(url,opts){assert.equal(opts.headers.Authorization,authMode==='bearer'&&url.startsWith('/api/')?'Bearer test-token':undefined);assert.equal(opts.redirect,'error');assert.equal(opts.credentials,authMode==='bearer'&&url.startsWith('/api/')?'omit':'same-origin');requests.push({url,opts});let code=200,data;
  if(url==='/auth/status')return {ok:true,status:200,json:async()=>({mode:authMode,authenticated:cookieAuthenticated})};
@@ -32,7 +33,7 @@ async function fetch(url,opts){assert.equal(opts.headers.Authorization,authMode=
 
  if(url==='/api/config')data=config;
  else if(url==='/api/status')data=status;
- else if(url==='/api/tasks'&&opts.method==='GET'){if(failList)throw new TypeError('offline');data=db;}
+ else if(url==='/api/tasks'&&opts.method==='GET'){if(failList)throw new TypeError('offline');data=db.filter(task=>!excludedListIds.has(task.id));}
  else if(url==='/api/tasks'&&opts.method==='POST'){const body=JSON.parse(opts.body);submissions.push(body);assert.equal(body.job.publish,false);if(mode==='abort')throw new TypeError('offline');if(mode==='401'||mode==='422'){code=Number(mode);data={error:mode==='401'?'Unauthorized':'Unknown workflow'}}else{data=db.find(t=>t.key===body.key)||{...task(Math.max(...db.map(t=>t.id))+1),key:body.key,payload:JSON.stringify(body.job)};db=[data,...db.filter(t=>t.id!==data.id)];}}
  else if(url.endsWith('/retry')) {
   const id=Number(url.split('/').at(-2)),body=JSON.parse(opts.body);retries.push({id,...body});
@@ -40,6 +41,7 @@ async function fetch(url,opts){assert.equal(opts.headers.Authorization,authMode=
   if(mode==='401'){code=401;data={error:'Unauthorized'}}else{
    data=db.find(t=>JSON.parse(t.payload).continuation?.predecessor_task_id===id);
    if(!data){const old=db.find(t=>t.id===id);data={...task(Math.max(...db.map(t=>t.id))+1),key:body.key,payload:JSON.stringify({...JSON.parse(old.payload),continuation:{workspace_task_id:id,predecessor_task_id:id,predecessor_generation:1}})};}
+   db.find(t=>t.id===id).continuation_status={successor_id:data.id};
    db=[data,...db.filter(t=>t.id!==data.id)];
   }
  }
@@ -142,6 +144,22 @@ vm.runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1],ctx);
  await $('retry-task').emit('click');assert($('retry-dialog').open);await $('retry-dismiss').emit('click');assert.equal(retries.length,0);
  mode='abort';await $('retry-task').emit('click');await $('retry-confirm').emit('click');assert.equal(retries.length,1);const originalRetry=retries[0];assert.match($('detail-error').textContent,/续接未确认/);
  mode='success';delayPost=true;await $('retry-task').emit('click');const continuing=$('retry-confirm').emit('click');await tick();await $('retry-confirm').emit('click');assert.equal(retries.length,2);assert.deepEqual(retries[1],originalRetry);assert($('retry-task').disabled);delayPost=false;pendingFetch.find(x=>x.url.endsWith('/retry')).resolve();pendingFetch=[];await continuing;await tick();assert.equal($('detail-title').textContent,'任务 #121');assert.match($('detail-meta').textContent,/续接自#120/);
+ // Revisit and refresh read persisted successor metadata; no second action remains.
+ await select(120);assert($('retry-task').hidden);assert($('retry-task').disabled);assert(!$('continuation-next').hidden);assert.match($('continuation-next').textContent,/#121/);
+ const retryCount=retries.length;await $('retry-task').emit('click');assert(!$('retry-dialog').open);assert.equal(retries.length,retryCount);
+ await $('refresh').emit('click');await select(120);assert($('retry-task').hidden);await $('continuation-next').emit('click');assert.equal($('detail-title').textContent,'任务 #121');
+ // Off-page child navigation survives an intervening poll and reselecting its row.
+ excludedListIds.add(121);await select(120);await $('refresh').emit('click');delayDetail=true;
+ const offPage=$('continuation-next').emit('click');await tick();await $('refresh').emit('click');
+ delayDetail=false;pendingFetch.find(x=>x.url==='/api/tasks/121').resolve();pendingFetch=[];await offPage;assert.equal($('detail-title').textContent,'任务 #121');
+ await select(121);await $('refresh').emit('click');assert.equal($('detail-title').textContent,'任务 #121');
+ await select(120);await $('continuation-next').emit('click');await $('refresh').emit('click');assert.equal($('detail-title').textContent,'任务 #121');await select(120);await filters.find(node=>node.dataset.filter==='queued').emit('click');await $('refresh').emit('click');assert.equal($('detail-title').textContent,'任务 #121');await filters.find(node=>node.dataset.filter==='all').emit('click');excludedListIds.clear();
+ // A persisted reservation is distinguishable and can recover the same submission.
+ failed.continuation_status={successor_id:null};await select(120);assert(!$('retry-task').hidden);assert(!$('retry-task').disabled);assert.equal($('retry-task').textContent,'恢复已预留的续接');
+ await $('retry-task').emit('click');failed.continuation_status={successor_id:121};await $('refresh').emit('click');await $('retry-confirm').emit('click');assert.equal(retries.length,retryCount);assert.equal($('detail-title').textContent,'任务 #121');
+ // Reauthentication reconstructs state from the server, not browser storage.
+ await $('logout').emit('click');$('token').value='test-token';await $('auth-form').emit('submit');await select(120);assert($('retry-task').hidden);assert.match($('continuation-next').textContent,/#121/);
+ failed.continuation_status=null;
  failed.result=JSON.stringify({outcome:'failure',workspace:'/private/task-120',draft_pr:{outcome:'failure'}});await select(120);assert($('retry-task').disabled);assert.match($('cancel-note').textContent,/发布已尝试/);
  // Expired auth preserves unresolved workflow submission even if the new config removes its profiles.
  await chooseWorkflow('reviewed');$('requirements').value='令牌中断测试';mode='401';await $('task-form').emit('submit');assert(!$('auth-panel').hidden);assert.equal($('token').value,'');const authPending=submissions.at(-1);assert.equal(authPending.job.workflow,'reviewed');assert($('workflow-field').hidden);assert.equal($('workflow').value,'');assert.equal($('workflow-hint').textContent,'');config={repositories:['repo'],agents:['agent'],tests:['test'],workflows:[]};mode='success';$('token').value='test-token';await $('auth-form').emit('submit');assert.equal($('requirements').value,authPending.job.requirements);assert.equal($('workflow').value,'reviewed');assert.equal($('agent').value,'native-dev');assert(!$('workflow-field').hidden);assert($('workflow').disabled);assert.match($('workflow-hint').textContent,/相同工作流与参数/);await $('task-form').emit('submit');await tick();assert.deepEqual(submissions.at(-1),authPending);assert.equal($('workflow').value,'');assert($('workflow-field').hidden);assert.equal($('agent').value,'agent');assert(!$('agent').disabled);

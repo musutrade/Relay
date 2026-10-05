@@ -84,7 +84,7 @@ pub fn handle(app: &Application, request: Value) -> Option<Value> {
                     .filter(|id| *id > 0)
                     .ok_or("positive task id required".to_string())
                     .and_then(|id| {
-                        app.get(id)
+                        app.get_view(id)
                             .map(|task| json!(task))
                             .map_err(|e| e.to_string())
                     }),
@@ -93,7 +93,7 @@ pub fn handle(app: &Application, request: Value) -> Option<Value> {
                     if before.is_some_and(|v| v.as_i64().is_none_or(|n| n <= 0)) {
                         Err("positive before cursor required".into())
                     } else {
-                        app.list(before.and_then(Value::as_i64))
+                        app.list_views(before.and_then(Value::as_i64))
                             .map(|tasks| json!(tasks))
                             .map_err(|e| e.to_string())
                     }
