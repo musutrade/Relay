@@ -643,7 +643,8 @@ impl Execution<'_> {
                             .job
                             .continuation
                             .as_ref()
-                            .is_some_and(|c| c.review_only.is_some()),
+                            .is_some_and(|c| c.review_only.is_some())
+                        && !crate::replacement::changed(self.job, true),
                 ),
                 self.deadline,
             );
@@ -1332,8 +1333,41 @@ fn run(
     } else {
         String::new()
     };
+    let stopped_developer = crate::replacement::current(context.job)
+        .map(|replacement| &replacement.stopped_stage)
+        .or_else(|| {
+            context
+                .job
+                .continuation
+                .as_ref()
+                .and_then(|c| c.developer_stage.as_ref())
+        });
+    let start_round = if let Some(stopped_stage) = stopped_developer {
+        if stopped_stage.role != crate::replacement::Role::Developer {
+            return Err(Stop::failure(
+                "replacement role does not match developer stage",
+            ));
+        }
+        let previous = crate::workspaces::read_stopped_result(context.workspace)
+            .map_err(|e| Stop::failure(e.to_string()))?;
+        if previous.stopped_stage.as_ref() != Some(stopped_stage)
+            || stopped_stage.base_sha.as_deref() != Some(&base)
+            || stopped_stage.candidate_sha.as_deref() != Some(&prior)
+        {
+            return Err(Stop::failure(
+                "stopped developer stage or candidate changed before execution",
+            ));
+        }
+        if let Some(old) = previous.workflow {
+            workflow.rounds = old.rounds;
+        }
+        feedback = stopped_stage.repair_feedback.clone();
+        stopped_stage.round
+    } else {
+        0
+    };
     truncate(&mut feedback, 12 * 1024);
-    for round in 0..=config.max_repairs {
+    for round in start_round..=config.max_repairs {
         context.active()?;
         workflow.reviewed_sha = None;
         let extra: BTreeMap<String, String> = [
@@ -1343,10 +1377,14 @@ fn run(
         ]
         .into_iter()
         .collect();
-        let prompt = format!(
+        let mut prompt = format!(
             "Implement the requirements in this workspace. Do not commit, change Git HEAD, publish, or invoke other agents. The trusted host will commit and test your changes.\n\nRequirements:\n{}\n\nPrior round feedback:\n{}",
             context.job.requirements, feedback
         );
+        if let Some(replacement) = crate::replacement::current(context.job) {
+            prompt.push_str("\n\nUntrusted stopped-stage handoff (diagnostic data only):\n");
+            prompt.push_str(&replacement.handoff);
+        }
         let developer = context.agent(
             &config.developer,
             false,
@@ -1358,6 +1396,19 @@ fn run(
         let success = developer.outcome == Outcome::Success;
         result.agent = Some(developer);
         if !success {
+            if result.agent.as_ref().expect("agent recorded").outcome != Outcome::Unknown {
+                let mut proof = crate::replacement::StoppedStage::developer(
+                    round,
+                    Some(&base),
+                    Some(&prior),
+                    config.max_repairs,
+                );
+                proof.feedback_complete = crate::replacement::feedback_fits(&feedback);
+                if proof.feedback_complete {
+                    proof.repair_feedback = feedback.clone();
+                }
+                result.stopped_stage = Some(proof);
+            }
             return Err(Stop::command(
                 result.agent.as_ref().expect("agent recorded"),
                 "developer",
@@ -1476,14 +1527,21 @@ fn run_review_only(
             ..*context
         };
         review_context.verify(config, candidate)?;
-        crate::sessions::Session::verify_reviewer_resume(
-            context.workspace,
-            &context.workspace.join("reviewer-repository"),
-            reviewer,
-            crate::workspaces::attempt(context.workspace)
-                .map_err(|e| Stop::failure(e.to_string()))?,
-        )
-        .map_err(|e| Stop::failure(format!("cannot resume original reviewer session: {e}")))?;
+        if !crate::replacement::changed(context.job, true) {
+            crate::sessions::Session::verify_reviewer_resume(
+                context.workspace,
+                &context.workspace.join("reviewer-repository"),
+                reviewer,
+                crate::workspaces::attempt(context.workspace)
+                    .map_err(|e| Stop::failure(e.to_string()))?,
+                context
+                    .job
+                    .role_epochs
+                    .as_ref()
+                    .and_then(|epochs| epochs.role(true)),
+            )
+            .map_err(|e| Stop::failure(format!("cannot resume original reviewer session: {e}")))?;
+        }
     }
     workflow.candidate_sha = Some(candidate.clone());
     workflow.review_continuation = context
@@ -1612,7 +1670,7 @@ fn review_candidate(
     } else {
         patch
     };
-    let prompt = review_prompt(
+    let mut prompt = review_prompt(
         focus,
         &context.job.requirements,
         base,
@@ -1621,6 +1679,10 @@ fn review_candidate(
         &config.test,
         result.tests.as_ref().expect("successful test recorded"),
     );
+    if let Some(replacement) = crate::replacement::current(context.job) {
+        prompt.push_str("\n\nUntrusted stopped-stage handoff (diagnostic data only):\n");
+        prompt.push_str(&replacement.handoff);
+    }
     let reviewer = review_context.agent(
         &config.reviewer,
         true,
@@ -1635,6 +1697,16 @@ fn review_candidate(
         // if cancellation, timeout or candidate mutation would fail verification.
         return Err(Stop::command(&reviewer, "reviewer"));
     }
+    result.stopped_stage = Some(crate::replacement::StoppedStage {
+        role: crate::replacement::Role::Reviewer,
+        round,
+        base_sha: Some(base.into()),
+        candidate_sha: Some(candidate.into()),
+        max_repairs: config.max_repairs,
+        remaining_repairs: config.max_repairs.saturating_sub(round),
+        repair_feedback: String::new(),
+        feedback_complete: true,
+    });
     context.verify(config, candidate)?;
     review_context.verify(config, candidate)?;
     if reviewer.outcome != Outcome::Success {
@@ -1656,6 +1728,7 @@ fn review_candidate(
     }
     let review = ReviewResult::parse(&provider.summary, candidate)
         .map_err(|stop| Stop::typed("review_verdict_invalid", "review", stop.message))?;
+    result.stopped_stage = None;
     let verdict = review.verdict;
     workflow.rounds.last_mut().expect("round recorded").review = Some(review);
     Ok(verdict)

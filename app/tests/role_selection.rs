@@ -836,3 +836,403 @@ fn changed_inherited_defaults_require_a_new_key_even_with_same_raw_role_request(
     );
     assert_eq!(app.list(None).unwrap().len(), 1);
 }
+
+fn stopped_native_for_replacement(app: &Application, key: &str) -> relay::Task {
+    let task = submit(
+        app,
+        key,
+        json!({"repository":"repo","requirements":"Continue retained work","agent":"dev"}),
+    )
+    .unwrap();
+    app.work_once().unwrap();
+    let task = app.get(task.id).unwrap();
+    let result: Value = serde_json::from_str(task.result.as_deref().unwrap()).unwrap();
+    assert_eq!(result["stopped_stage"]["role"], "developer", "{result}");
+    task
+}
+fn replacement_input(
+    key: &str,
+    selection: Value,
+    challenge: Option<&str>,
+) -> relay_app::RetryRequest {
+    serde_json::from_value(json!({"key":key,"confirm_stopped_and_reconciled":true,"replacement":selection,"permission_challenge":challenge})).unwrap()
+}
+#[test]
+fn replacement_permission_challenge_binds_predecessor_action_and_exact_new_selection() {
+    let temp = Fixture::new();
+    let config = expanded_config(temp.path());
+    let app = Application::open(temp.path().join("db"), config).unwrap();
+    stopped_native_for_replacement(&app, "old-one");
+    stopped_native_for_replacement(&app, "old-two");
+    let choice = json!({"profile":"dev","model":{"value":"replacement-model","source":"manual"},"native_permission":"codex_full_access","confirm_permission_expansion":true});
+    assert!(
+        app.retry(1, replacement_input("no-challenge", choice.clone(), None))
+            .is_err()
+    );
+    let challenge = app
+        .replacement_challenge(
+            1,
+            serde_json::from_value(json!({"action":"retry","replacement":choice})).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(challenge["scope"]["predecessor_task_id"], 1);
+    assert_eq!(challenge["scope"]["action"], "retry");
+    assert_eq!(challenge["scope"]["role"], "developer");
+    let token = challenge["challenge"].as_str().unwrap();
+    assert!(
+        app.retry(
+            2,
+            replacement_input("wrong-task", choice.clone(), Some(token))
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("predecessor")
+    );
+    let mut different = choice.clone();
+    different["model"]["value"] = json!("different-model");
+    assert!(
+        app.retry(1, replacement_input("wrong-model", different, Some(token)))
+            .is_err()
+    );
+    let mut unattested = choice.clone();
+    unattested
+        .as_object_mut()
+        .unwrap()
+        .remove("confirm_permission_expansion");
+    assert!(
+        app.retry(1, replacement_input("unattested", unattested, Some(token)))
+            .is_err()
+    );
+    let accepted = app
+        .retry(1, replacement_input("accepted", choice, Some(token)))
+        .unwrap();
+    assert!(!accepted.payload.contains(token));
+    assert!(
+        !accepted
+            .payload
+            .contains("never-persist-this-credential-value")
+    );
+    assert!(serde_json::from_str::<Value>(&accepted.payload).unwrap()["role_binding"]["acceptance_reference"].is_string());
+}
+#[test]
+fn initial_submission_consent_cannot_authorize_replacement_and_accepted_replay_survives_restart_gap()
+ {
+    let temp = Fixture::new();
+    let config = expanded_config(temp.path());
+    let db = temp.path().join("db");
+    let app = Application::open(&db, config.clone()).unwrap();
+    stopped_native_for_replacement(&app, "old");
+    let choice = json!({"profile":"dev","model":{"value":"new-model","source":"manual"},"native_permission":"codex_full_access","confirm_permission_expansion":true});
+    let initial = challenge(
+        &app,
+        json!({"repository":"repo","requirements":"Continue retained work","agent":"dev","role_selections":{"developer":choice}}),
+    );
+    assert!(
+        app.retry(
+            1,
+            replacement_input("bad-consent", choice.clone(), initial["challenge"].as_str())
+        )
+        .is_err()
+    );
+    let scoped = app
+        .replacement_challenge(
+            1,
+            serde_json::from_value(json!({"action":"retry","replacement":choice})).unwrap(),
+        )
+        .unwrap();
+    let accepted = app
+        .retry(
+            1,
+            replacement_input("good-consent", choice.clone(), scoped["challenge"].as_str()),
+        )
+        .unwrap();
+    drop(app);
+    // Simulate durable reservation preceding core submission; no old challenge survives restart.
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute("DELETE FROM tasks WHERE id=?1", [accepted.id])
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE app_continuations SET task_id=NULL WHERE predecessor_id=1",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let app = Application::open(&db, config).unwrap();
+    let operator = app.operator(1).unwrap();
+    assert_eq!(
+        operator["recovery"]["reserved_request"]["replacement"],
+        choice
+    );
+    let replay = app
+        .retry(
+            1,
+            replacement_input("different-tab", json!({"profile":"not-allowed"}), None),
+        )
+        .unwrap();
+    assert_eq!(replay.payload, accepted.payload);
+    assert_eq!(replay.key, accepted.key);
+    let second = app
+        .retry(
+            1,
+            replacement_input("another-tab", json!({"profile":"dev"}), None),
+        )
+        .unwrap();
+    assert_eq!(second, replay);
+}
+#[test]
+fn replacement_rejects_noop_alias_and_host_drift_before_reservation() {
+    let temp = Fixture::new();
+    let mut config = config(temp.path());
+    config
+        .native_agents
+        .insert("alias".into(), config.native_agents["dev"].clone());
+    let db = temp.path().join("db");
+    let app = Application::open(&db, config.clone()).unwrap();
+    stopped_native_for_replacement(&app, "original");
+    for profile in ["dev", "alias"] {
+        assert!(
+            app.retry(
+                1,
+                replacement_input(profile, json!({"profile":profile}), None)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("effective execution")
+        );
+    }
+    assert!(
+        app.retry(
+            1,
+            replacement_input(
+                "explicit-same-safe-mode",
+                json!({"profile":"dev","native_permission":"codex_workspace_write"}),
+                None
+            )
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("effective execution")
+    );
+    drop(app);
+    config.native_agents.get_mut("dev").unwrap().model = Some("drifted-default".into());
+    let app = Application::open(&db, config).unwrap();
+    assert!(
+        app.retry(
+            1,
+            replacement_input("drift", json!({"profile":"other"}), None)
+        )
+        .is_err()
+    );
+    assert!(app.get_view(1).unwrap().continuation_status.is_none());
+}
+#[test]
+fn replacement_requires_authoritative_stopped_proof_and_never_uses_error_text() {
+    let temp = Fixture::new();
+    let config = config(temp.path());
+    let db = temp.path().join("db");
+    let app = Application::open(&db, config.clone()).unwrap();
+    let task = stopped_native_for_replacement(&app, "original");
+    let mut result: Value = serde_json::from_str(task.result.as_deref().unwrap()).unwrap();
+    result.as_object_mut().unwrap().remove("stopped_stage");
+    result["error"] = json!("developer failed at round 0 and is definitely stopped");
+    let path = result["workspace"].as_str().unwrap();
+    fs::write(Path::new(path).join("last-result.json"), result.to_string()).unwrap();
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET result=?1 WHERE id=1",
+            [result.to_string()],
+        )
+        .unwrap();
+    let error = app
+        .retry(
+            1,
+            replacement_input("legacy", json!({"profile":"other"}), None),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("legacy result has no host-authored stopped-stage proof"),
+        "{error}"
+    );
+    let operator = app.operator(1).unwrap();
+    assert_eq!(
+        operator["recovery"]["actions"][0]["replacement"]["allowed"],
+        false
+    );
+    assert!(app.get_view(1).unwrap().continuation_status.is_none());
+}
+
+#[test]
+fn replacement_connections_have_one_frozen_winner() {
+    let temp = Fixture::new();
+    let config = config(temp.path());
+    let db = temp.path().join("db");
+    let app = Application::open(&db, config.clone()).unwrap();
+    stopped_native_for_replacement(&app, "original");
+    let other = Application::open(&db, config).unwrap();
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let handles=[app,other].into_iter().enumerate().map(|(index,app)|{let gate=gate.clone();std::thread::spawn(move||{
+        gate.wait();app.retry(1,replacement_input(&format!("tab-{index}"),json!({"profile":"dev","model":{"value":format!("model-{index}"),"source":"manual"}}),None)).unwrap()
+    })}).collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results[0], results[1]);
+    let job: Value = serde_json::from_str(&results[0].payload).unwrap();
+    assert!(job["role_epochs"]["developer"].is_string());
+    assert_eq!(
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+#[test]
+fn reviewer_replacement_inherits_expanded_developer_consent_without_rechallenging_it() {
+    let temp = Fixture::new();
+    let mut config = config(temp.path());
+    let source = config.repositories["repo"].clone();
+    git(&source, &["init", "--initial-branch=main"]);
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-m", "base"]);
+    let path = temp.path().join("roles");
+    let script = ROLE_CLI
+        .replace(
+            "assert model==('review-model' if review else 'developer-model')",
+            "assert model in ('review-model','replacement-review-model','developer-model')",
+        )
+        .replace(
+            "'permissionMode':'default'",
+            "'permissionMode':('default' if review else 'dontAsk')",
+        );
+    executable(&path, &script);
+    let profile=serde_json::from_value(json!({"provider":"claude_cli","program":path,"session_continuity":true,"allowed_permission_modes":["claude_dont_ask"],"env":{"TRACE":temp.path().join("trace"),"FAIL_REVIEW_ONCE":temp.path().join("failed")}})).unwrap();
+    config.native_agents.insert("shared".into(), profile);
+    let workflow = config.workflows.get_mut("checked").unwrap();
+    workflow.selectable_developers = Some(vec!["shared".into()]);
+    workflow.selectable_reviewers = Some(vec!["shared".into()]);
+    let app = Application::open(temp.path().join("db"), config).unwrap();
+    let selected = json!({"repository":"repo","requirements":"Implement","agent":"shared","workflow":"checked","role_selections":{"developer":{"profile":"shared","model":{"value":"developer-model","source":"manual"},"native_permission":"claude_dont_ask","confirm_permission_expansion":true},"reviewer":{"profile":"shared","model":{"value":"review-model","source":"manual"},"native_permission":"claude_restricted"}}});
+    let token = challenge(&app, selected.clone());
+    confirmed_submit(&app, "initial", selected, &token).unwrap();
+    app.work_once().unwrap();
+    let original = app.get(1).unwrap();
+    let stopped: Value = serde_json::from_str(original.result.as_deref().unwrap()).unwrap();
+    assert_eq!(stopped["stopped_stage"]["role"], "reviewer", "{stopped}");
+    let successor=app.continue_review(1,serde_json::from_value(json!({"key":"new-review-model","confirm_stopped_and_reconciled":true,"revalidate_tests":true,"replacement":{"profile":"shared","model":{"value":"replacement-review-model","source":"manual"},"native_permission":"claude_restricted"}})).unwrap()).unwrap();
+    app.work_once().unwrap();
+    let result: Value =
+        serde_json::from_str(app.get(successor.id).unwrap().result.as_deref().unwrap()).unwrap();
+    assert_eq!(result["outcome"], "success", "{result}");
+    let trace = fs::read_to_string(temp.path().join("trace")).unwrap();
+    assert_eq!(trace.lines().count(), 3);
+    assert_eq!(app.get(1).unwrap(), original);
+}
+
+#[tokio::test]
+async fn replacement_http_and_mcp_expose_scoped_contract_without_server_metadata_inputs() {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let temp = Fixture::new();
+    let config = expanded_config(temp.path());
+    let app = Application::open(temp.path().join("db"), config).unwrap();
+    stopped_native_for_replacement(&app, "stopped");
+    let token = "fixture-token-0000000000000000000000";
+    let router = relay_app::http::router(app.clone(), token.into()).unwrap();
+    let selection = json!({"profile":"dev","model":{"value":"replacement","source":"manual"},"native_permission":"codex_full_access"});
+    let body = json!({"action":"retry","replacement":selection});
+    let unauthorized = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tasks/1/replacement-challenge")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tasks/1/replacement-challenge")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let scope: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(scope["scope"]["predecessor_task_id"], 1);
+    assert_eq!(scope["scope"]["developer"]["model"], "replacement");
+    let mcp=relay_app::mcp::handle(&app,json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"relay_replacement_challenge","arguments":{"id":1,"action":"retry","replacement":selection}}})).unwrap();
+    assert_eq!(mcp["result"]["isError"], false, "{mcp}");
+    let tools = relay_app::mcp::handle(&app, json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+        .unwrap();
+    for name in [
+        "relay_retry",
+        "relay_continue_review",
+        "relay_replacement_challenge",
+    ] {
+        let schema = &tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap()["inputSchema"];
+        assert!(schema["properties"]["replacement"].is_object());
+        assert!(schema["properties"]["role_epochs"].is_null());
+    }
+    let injection = json!({"key":"bad","confirm_stopped_and_reconciled":true,"replacement":{"profile":"dev","session_epoch":"injected"}});
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tasks/1/retry")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(injection.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+#[test]
+fn replacement_and_quota_increase_are_independent_frozen_deltas() {
+    let temp = Fixture::new();
+    let mut config = config(temp.path());
+    config.max_workspace_bytes = Some(2 * 1024 * 1024);
+    let app = Application::open(temp.path().join("db"), config).unwrap();
+    submit(&app,"small",json!({"repository":"repo","requirements":"Keep work","agent":"dev","workspace_quota_bytes":256*1024})).unwrap();
+    app.work_once().unwrap();
+    let input=serde_json::from_value(json!({"key":"larger-replacement","confirm_stopped_and_reconciled":true,"workspace_quota_bytes":1024*1024,"replacement":{"profile":"dev","model":{"value":"different","source":"manual"}}})).unwrap();
+    let task = app.retry(1, input).unwrap();
+    let job: Value = serde_json::from_str(&task.payload).unwrap();
+    assert_eq!(
+        job["continuation"]["quota_increase"]["previous_bytes"],
+        256 * 1024
+    );
+    assert_eq!(job["workspace_quota_bytes"], 1024 * 1024);
+    app.work_once().unwrap();
+    let result: Value =
+        serde_json::from_str(app.get(task.id).unwrap().result.as_deref().unwrap()).unwrap();
+    assert_eq!(result["stopped_stage"]["role"], "developer", "{result}");
+    assert_eq!(result["resources"]["quota_bytes"], 1024 * 1024);
+}

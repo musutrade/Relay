@@ -76,6 +76,8 @@ impl Fixture {
 }
 fn retry(key: &str, quota: Option<u64>) -> RetryRequest {
     RetryRequest {
+        replacement: None,
+        permission_challenge: None,
         key: key.into(),
         confirm_stopped_and_reconciled: true,
         workspace_quota_bytes: quota,

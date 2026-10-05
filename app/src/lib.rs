@@ -9,6 +9,7 @@ pub mod host;
 pub mod http;
 pub mod mcp;
 pub mod providers;
+pub mod replacement;
 pub mod resources;
 pub mod selection;
 mod sessions;
@@ -63,6 +64,10 @@ pub struct Submission {
 #[serde(deny_unknown_fields)]
 pub struct RetryRequest {
     #[serde(default)]
+    pub replacement: Option<selection::RoleSelection>,
+    #[serde(default)]
+    pub permission_challenge: Option<String>,
+    #[serde(default)]
     pub workspace_quota_bytes: Option<u64>,
     pub key: String,
     pub confirm_stopped_and_reconciled: bool,
@@ -72,12 +77,23 @@ pub struct RetryRequest {
 #[serde(deny_unknown_fields)]
 pub struct ReviewContinuationRequest {
     #[serde(default)]
+    pub replacement: Option<selection::RoleSelection>,
+    #[serde(default)]
+    pub permission_challenge: Option<String>,
+    #[serde(default)]
     pub workspace_quota_bytes: Option<u64>,
     pub key: String,
     pub confirm_stopped_and_reconciled: bool,
     pub revalidate_tests: bool,
     #[serde(default)]
     pub review_focus: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplacementChallengeRequest {
+    pub action: String,
+    pub replacement: selection::RoleSelection,
 }
 
 /// Adapter-owned continuation metadata; the core task and result stay immutable.
@@ -153,7 +169,7 @@ impl Application {
         }))
     }
     pub fn permission_challenge(&self, mut job: Job) -> Result<Value> {
-        if job.continuation.is_some() || job.role_binding.is_some() {
+        if job.continuation.is_some() || job.role_binding.is_some() || job.role_epochs.is_some() {
             return Err(Error::Invalid(
                 "permission challenges are only for new user-authored selections".into(),
             ));
@@ -179,8 +195,62 @@ impl Application {
             .issue(&job, self.host.config())
             .map_err(Error::Invalid)
     }
+    pub fn replacement_challenge(
+        &self,
+        id: i64,
+        mut input: ReplacementChallengeRequest,
+    ) -> Result<Value> {
+        let reviewer = match input.action.as_str() {
+            "retry" => false,
+            "continue_review" => true,
+            _ => {
+                return Err(Error::Invalid(
+                    "replacement action must be retry or continue_review".into(),
+                ));
+            }
+        };
+        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let task = state.store.get(id)?;
+        if task.state != relay::State::Finished {
+            return Err(Error::RecoveryRequired);
+        }
+        let job = Job::from_payload(&task.payload, self.host.config())
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        let result: host::RunResult = serde_json::from_str(task.result.as_deref().unwrap_or(""))
+            .map_err(|_| Error::Invalid("missing stopped result".into()))?;
+        let proof = replacement::stage(&result, &job, self.host.config(), reviewer)
+            .map_err(Error::Invalid)?;
+        let path = workspaces::root(self.host.config(), &task, &job);
+        let _lease = workspaces::lock(&path).map_err(|e| Error::Invalid(e.to_string()))?;
+        workspaces::continuation_under_lease(self.host.config(), &task, &job)
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        replacement::verify_stage_checkpoint(&proof, &path)
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        workspaces::verify_candidate_checkpoint(self.host.config(), &job, &path)
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        input.replacement.confirm_permission_expansion = Some(true);
+        let next = replacement::compose(&job, &input.replacement, reviewer, self.host.config())
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        if !selection::native_profile(&next, self.host.config(), reviewer)
+            .map_err(|e| Error::Invalid(e.to_string()))?
+            .and_then(|p| p.native_permission)
+            .is_some_and(providers::NativePermission::requires_confirmation)
+        {
+            return Err(Error::Invalid(
+                "changed role does not require a permission-expansion challenge".into(),
+            ));
+        }
+        self.permission_challenges
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .issue_replacement(&next, self.host.config(), id, reviewer)
+            .map_err(Error::Invalid)
+    }
     pub fn submit(&self, mut input: Submission) -> Result<Task> {
-        if input.job.continuation.is_some() || input.job.role_binding.is_some() {
+        if input.job.continuation.is_some()
+            || input.job.role_binding.is_some()
+            || input.job.role_epochs.is_some()
+        {
             return Err(Error::Invalid(
                 "use explicit continuation endpoints; role_binding is server-owned".into(),
             ));
@@ -299,6 +369,8 @@ impl Application {
         self.continue_task(
             id,
             RetryRequest {
+                replacement: input.replacement,
+                permission_challenge: input.permission_challenge,
                 workspace_quota_bytes: input.workspace_quota_bytes,
                 key: input.key,
                 confirm_stopped_and_reconciled: input.confirm_stopped_and_reconciled,
@@ -360,11 +432,14 @@ impl Application {
             }
             let mut job = Job::from_payload(&predecessor.payload, self.host.config())
                 .map_err(|e| Error::Invalid(e.to_string()))?;
+            let predecessor_job = job.clone();
             let prior_quota = recorded_quota(&result, &job);
             let inherited_quota = job
                 .workspace_quota_bytes
                 .unwrap_or_else(|| self.config.workspace_byte_limit());
             let path = workspaces::root(self.host.config(), &predecessor, &job);
+            let _workspace_lease = workspaces::lock(&path)
+                .map_err(|e| action_unavailable("workspace_recovery_unavailable", e.to_string()))?;
             workspaces::verify_candidate_checkpoint(self.host.config(), &job, &path).map_err(
                 |error| action_unavailable("candidate_checkpoint_changed", error.to_string()),
             )?;
@@ -406,9 +481,10 @@ impl Application {
                 .and_then(|c| c.review_only.as_ref())
                 .and_then(|c| c.review_focus.clone());
             job.continuation = Some(
-                workspaces::continuation(self.host.config(), &predecessor, &job).map_err(
-                    |error| action_unavailable("workspace_recovery_unavailable", error.to_string()),
-                )?,
+                workspaces::continuation_under_lease(self.host.config(), &predecessor, &job)
+                    .map_err(|error| {
+                        action_unavailable("workspace_recovery_unavailable", error.to_string())
+                    })?,
             );
             if let Some(requested) = input.workspace_quota_bytes {
                 job.workspace_quota_bytes = Some(requested);
@@ -421,15 +497,25 @@ impl Application {
                 });
                 // Validate the exact override against the host-owned predecessor
                 // record before reserving it, then repeat the guard at execution.
-                workspaces::continuation(self.host.config(), &predecessor, &job).map_err(
-                    |error| action_unavailable("predecessor_quota_unverified", error.to_string()),
-                )?;
+                workspaces::continuation_under_lease(self.host.config(), &predecessor, &job)
+                    .map_err(|error| {
+                        action_unavailable("predecessor_quota_unverified", error.to_string())
+                    })?;
             }
             if let Some(focus) = review_focus {
-                workspaces::verify_review_checkpoint(self.host.config(), &job, &result, &path)
-                    .map_err(|error| {
-                        action_unavailable("review_checkpoint_unverified", error.to_string())
-                    })?;
+                (if input.replacement.is_some() {
+                    workspaces::verify_review_candidate_checkpoint(
+                        self.host.config(),
+                        &job,
+                        &result,
+                        &path,
+                    )
+                } else {
+                    workspaces::verify_review_checkpoint(self.host.config(), &job, &result, &path)
+                })
+                .map_err(|error| {
+                    action_unavailable("review_checkpoint_unverified", error.to_string())
+                })?;
                 let review = workflow::review_continuation(&result, focus.or(prior_review_focus))
                     .map_err(Error::Invalid)?;
                 if job.workflow.is_none() {
@@ -442,7 +528,117 @@ impl Application {
                     .expect("continuation recorded")
                     .review_only = Some(review);
             }
+            if input.replacement.is_none()
+                && job
+                    .continuation
+                    .as_ref()
+                    .is_some_and(|c| c.review_only.is_none())
+                && replacement::requires_stage_retry(&job)
+            {
+                let stage =
+                    replacement::stage(&result, &predecessor_job, self.host.config(), false)
+                        .map_err(|e| action_unavailable("preserved_developer_stage_required", e))?;
+                replacement::verify_stage_checkpoint(&stage, &path).map_err(|e| {
+                    action_unavailable("replacement_stage_unverified", e.to_string())
+                })?;
+                job.continuation
+                    .as_mut()
+                    .expect("continuation")
+                    .developer_stage = Some(stage);
+            }
+            if let Some(selected) = &input.replacement {
+                let reviewer = job
+                    .continuation
+                    .as_ref()
+                    .is_some_and(|c| c.review_only.is_some());
+                let stage =
+                    replacement::stage(&result, &predecessor_job, self.host.config(), reviewer)
+                        .map_err(|e| action_unavailable("replacement_stage_unsupported", e))?;
+                replacement::verify_stage_checkpoint(&stage, &path).map_err(|e| {
+                    action_unavailable("replacement_stage_unverified", e.to_string())
+                })?;
+                let stopped = workspaces::read_stopped_result(&path)
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                if replacement::digest(
+                    &serde_json::from_str::<Value>(&stopped.to_json()).expect("host result"),
+                )
+                .map_err(|e| Error::Invalid(e.to_string()))?
+                    != replacement::digest(
+                        &serde_json::from_str::<Value>(&result.to_json()).expect("host result"),
+                    )
+                    .map_err(|e| Error::Invalid(e.to_string()))?
+                {
+                    return Err(action_unavailable(
+                        "replacement_result_unverified",
+                        "retained stopped result differs from immutable predecessor",
+                    ));
+                }
+                let mut next = replacement::compose(&job, selected, reviewer, self.host.config())
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                if let Some(profile) = self.config.native_agents.get(&selected.profile) {
+                    let view = self
+                        .catalogs
+                        .lock()
+                        .map_err(|_| Error::Poisoned)?
+                        .view(&selected.profile, profile);
+                    selection::validate_catalog(selected, &view).map_err(Error::Invalid)?;
+                }
+                let expanded = selection::native_profile(&next, self.host.config(), reviewer)
+                    .map_err(|e| Error::Invalid(e.to_string()))?
+                    .and_then(|p| p.native_permission)
+                    .is_some_and(providers::NativePermission::requires_confirmation);
+                if expanded {
+                    self.permission_challenges
+                        .lock()
+                        .map_err(|_| Error::Poisoned)?
+                        .validate_replacement(
+                            input.permission_challenge.as_deref(),
+                            &next,
+                            self.host.config(),
+                            id,
+                            reviewer,
+                        )
+                        .map_err(Error::Invalid)?;
+                    next.role_binding
+                        .as_mut()
+                        .expect("new role binding")
+                        .acceptance_reference = Some(
+                        selection::acceptance_reference(
+                            input
+                                .permission_challenge
+                                .as_deref()
+                                .expect("validated challenge"),
+                        )
+                        .map_err(Error::Invalid)?,
+                    );
+                }
+                replacement::freeze(
+                    &predecessor_job,
+                    &mut next,
+                    &result,
+                    predecessor.owner.as_deref().unwrap_or(""),
+                    reviewer,
+                    self.host.config(),
+                )
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+                replacement::verify_transition(
+                    &predecessor_job,
+                    &next,
+                    &stopped,
+                    predecessor.owner.as_deref().unwrap_or(""),
+                    self.host.config(),
+                )
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+                job = next;
+            } else if input.permission_challenge.is_some() {
+                return Err(Error::Invalid(
+                    "permission_challenge requires replacement".into(),
+                ));
+            }
             let payload = serde_json::to_string(&job).map_err(|e| Error::Invalid(e.to_string()))?;
+            if payload.len() > relay::MAX_PAYLOAD_BYTES {
+                return Err(Error::Invalid("continuation payload exceeds 64 KiB; shorten the bounded review focus or selection".into()));
+            }
             let conflicting: Option<String> = tx
                 .query_row(
                     "SELECT payload FROM tasks WHERE key=?1",
@@ -476,6 +672,18 @@ impl Application {
             "UPDATE app_continuations SET task_id=?2 WHERE predecessor_id=?1",
             params![id, task.id],
         )?;
+        if let Some(token) = input.permission_challenge.as_deref()
+            && serde_json::from_str::<Job>(&payload)
+                .ok()
+                .and_then(|job| job.role_binding)
+                .and_then(|binding| binding.acceptance_reference)
+                == selection::acceptance_reference(token).ok()
+        {
+            self.permission_challenges
+                .lock()
+                .map_err(|_| Error::Poisoned)?
+                .consume(token);
+        }
         Ok(task)
     }
     pub fn get(&self, id: i64) -> Result<Task> {
@@ -686,7 +894,12 @@ impl Application {
                     "retry"
                 };
                 reserved_request = json!({"action_id":action,"key":key,"workspace_quota_bytes":reserved.continuation.as_ref().and_then(|c| c.quota_increase.as_ref()).map(|q|q.new_bytes),"revalidate_tests":review.is_some(),"review_focus":review.and_then(|review|review.review_focus.as_ref())});
-                actions.push(json!({"id":action,"quota_increase_allowed":false,"quota_increase_required":false,"min_quota_bytes":null,"max_quota_bytes":self.config.workspace_byte_limit(),"requires_test_revalidation":review.is_some()}));
+                if let Some(proof) = replacement::current(&reserved) {
+                    reserved_request["replacement"] =
+                        serde_json::to_value(selection::role(&reserved, proof.role.reviewer()))
+                            .expect("role serializable");
+                }
+                actions.push(json!({"allowed":true,"ordinary_allowed":true,"id":action,"quota_increase_allowed":false,"quota_increase_required":false,"min_quota_bytes":null,"max_quota_bytes":self.config.workspace_byte_limit(),"requires_test_revalidation":review.is_some()}));
             } else {
                 blocked_reason = Some("reserved continuation payload cannot be verified".into());
             }
@@ -726,8 +939,20 @@ impl Application {
                 );
                 blocked_reason = eligibility.reason;
                 if eligibility.same_quota || eligibility.increase_min.is_some() {
-                    let action = |id: &str, review: bool| json!({"id":id,"quota_increase_allowed":eligibility.increase_min.is_some(),"quota_increase_required":!eligibility.same_quota,"min_quota_bytes":eligibility.increase_min,"max_quota_bytes":self.config.workspace_byte_limit(),"requires_test_revalidation":review});
-                    actions.push(action("retry", false));
+                    let action = |id: &str, review: bool| json!({"allowed":true,"ordinary_allowed":true,"replacement":replacement::capability(job,result,self.host.config(),path,review),"id":id,"quota_increase_allowed":eligibility.increase_min.is_some(),"quota_increase_required":!eligibility.same_quota,"min_quota_bytes":eligibility.increase_min,"max_quota_bytes":self.config.workspace_byte_limit(),"requires_test_revalidation":review});
+                    let mut retry = action("retry", false);
+                    if replacement::requires_stage_retry(job)
+                        && replacement::stage(result, job, self.host.config(), false).is_err()
+                    {
+                        retry["ordinary_allowed"] = json!(false);
+                        retry["allowed"] = json!(false);
+                        blocked_reason=Some("ordinary retry cannot reset the repair budget of a replacement chain; only a proven stopped developer stage can resume".into());
+                    }
+                    if retry["ordinary_allowed"] == true || retry["replacement"]["allowed"] == true
+                    {
+                        actions.push(retry);
+                    }
+
                     if workflow::review_continuation(result, None).is_ok() {
                         match workspaces::verify_review_checkpoint(
                             self.host.config(),
@@ -737,9 +962,15 @@ impl Application {
                         ) {
                             Ok(()) => actions.push(action("continue_review", true)),
                             Err(error) => {
+                                let mut replacement_only = action("continue_review", true);
+                                replacement_only["ordinary_allowed"] = json!(false);
+                                replacement_only["allowed"] = json!(false);
+                                if replacement_only["replacement"]["allowed"] == true {
+                                    actions.push(replacement_only);
+                                }
                                 blocked_reason = Some(format!(
                                     "review-only continuation is unavailable: {error}"
-                                ))
+                                ));
                             }
                         }
                     }

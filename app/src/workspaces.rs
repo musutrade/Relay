@@ -14,6 +14,10 @@ use std::sync::Arc;
 #[serde(deny_unknown_fields)]
 pub struct Continuation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer_stage: Option<crate::replacement::StoppedStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<crate::replacement::Replacement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_increase: Option<QuotaIncrease>,
     pub workspace_task_id: i64,
     pub predecessor_task_id: i64,
@@ -31,6 +35,8 @@ pub struct QuotaIncrease {
 #[serde(deny_unknown_fields)]
 struct Record {
     version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fresh_session_role: Option<crate::replacement::Role>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quota_bytes: Option<u64>,
     workspace_task_id: i64,
@@ -109,7 +115,7 @@ fn read_record(path: &Path) -> io::Result<Record> {
     }
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
-fn lock(path: &Path) -> io::Result<Arc<File>> {
+pub(crate) fn lock(path: &Path) -> io::Result<Arc<File>> {
     lock_with_create(path, false)
 }
 fn lock_with_create(path: &Path, create: bool) -> io::Result<Arc<File>> {
@@ -143,7 +149,35 @@ fn inspect(config: &HostConfig, task: &Task, job: &Job, path: &Path) -> io::Resu
         .continuation
         .as_ref()
         .map_or(task.id, |c| c.workspace_task_id);
-    let mut expected = normalized(job);
+    let replacement_transition =
+        record.task_id != task.id && crate::replacement::current(job).is_some();
+    if replacement_transition {
+        let proof = crate::replacement::current(job).expect("replacement");
+        let continuation = job.continuation.as_ref().expect("continuation");
+        if record.task_id != continuation.predecessor_task_id
+            || record.generation != continuation.predecessor_generation
+        {
+            return Err(io::Error::other(
+                "replacement predecessor ownership changed",
+            ));
+        }
+        crate::replacement::verify_transition(
+            &record.job,
+            job,
+            &read_stopped_result(path)?,
+            &record.owner,
+            config,
+        )?;
+        crate::replacement::verify_stage_checkpoint(&proof.stopped_stage, path)?;
+        verify_candidate_checkpoint(config, &record.job, path)?;
+    }
+    let mut expected = if replacement_transition {
+        record.job.clone()
+    } else {
+        normalized(job)
+    };
+    // Quota is an independent approved delta, even when the role also changes.
+    expected.workspace_quota_bytes = job.workspace_quota_bytes;
     if expected.workspace_quota_bytes != record.job.workspace_quota_bytes {
         let proof = job
             .continuation
@@ -174,7 +208,15 @@ fn inspect(config: &HostConfig, task: &Task, job: &Job, path: &Path) -> io::Resu
     }
     if record.version != 1
         || record.workspace_task_id != expected_root
-        || record.config_binding != config_binding(config, job)?
+        || record.config_binding
+            != config_binding(
+                config,
+                if replacement_transition {
+                    &record.job
+                } else {
+                    job
+                },
+            )?
         || serde_json::to_value(&record.job).map_err(io::Error::other)?
             != serde_json::to_value(expected).map_err(io::Error::other)?
     {
@@ -300,8 +342,12 @@ pub(crate) fn prepare(
     } else {
         1
     };
+    let fresh_session_role = crate::replacement::current(job)
+        .filter(|_| read_record(&path).is_ok_and(|record| record.task_id != task.id))
+        .map(|proof| proof.role);
     let record = Record {
         version: 1,
+        fresh_session_role,
         quota_bytes: Some(config.workspace_byte_limit()),
         workspace_task_id: job
             .continuation
@@ -326,6 +372,14 @@ pub(crate) fn continuation(
 ) -> io::Result<Continuation> {
     let path = root(config, task, job);
     let _lock = lock(&path)?;
+    continuation_under_lease(config, task, job)
+}
+pub(crate) fn continuation_under_lease(
+    config: &HostConfig,
+    task: &Task,
+    job: &Job,
+) -> io::Result<Continuation> {
+    let path = root(config, task, job);
     let record = inspect(config, task, job, &path)?;
     if record.task_id != task.id
         || record.generation != task.generation
@@ -339,12 +393,36 @@ pub(crate) fn continuation(
         return Err(io::Error::other("workspace was not completely initialized"));
     }
     Ok(Continuation {
+        developer_stage: None,
+        replacement: None,
         quota_increase: None,
         workspace_task_id: record.workspace_task_id,
         predecessor_task_id: task.id,
         predecessor_generation: task.generation,
         review_only: None,
     })
+}
+pub(crate) fn consume_fresh_role_epoch(path: &Path, reviewer: bool) -> io::Result<()> {
+    let mut record = read_record(path)?;
+    if record
+        .fresh_session_role
+        .is_some_and(|role| role.reviewer() == reviewer)
+    {
+        record.fresh_session_role = None;
+        crate::sessions::atomic_write(&path.join("claim.json"), &record)?;
+    }
+    Ok(())
+}
+pub(crate) fn fresh_role_epoch(path: &Path, reviewer: bool) -> io::Result<bool> {
+    Ok(read_record(path)?
+        .fresh_session_role
+        .is_some_and(|role| role.reviewer() == reviewer))
+}
+pub(crate) fn role_epoch(path: &Path, reviewer: bool) -> io::Result<Option<String>> {
+    Ok(read_record(path)?
+        .job
+        .role_epochs
+        .and_then(|epochs| epochs.role(reviewer).map(str::to_owned)))
 }
 pub(crate) fn attempt(path: &Path) -> io::Result<u64> {
     Ok(read_record(path)?.attempt)
@@ -597,6 +675,15 @@ pub(crate) fn verify_review_checkpoint(
     result: &RunResult,
     path: &Path,
 ) -> io::Result<()> {
+    verify_review_candidate_checkpoint(config, job, result, path)?;
+    verify_review_session(config, job, path)
+}
+pub(crate) fn verify_review_candidate_checkpoint(
+    config: &HostConfig,
+    job: &Job,
+    result: &RunResult,
+    path: &Path,
+) -> io::Result<()> {
     let review = crate::workflow::review_continuation(result, None).map_err(io::Error::other)?;
     let profile = crate::selection::native_profile(job, config, true)
         .map_err(io::Error::other)?
@@ -611,10 +698,26 @@ pub(crate) fn verify_review_checkpoint(
                 "reviewer candidate checkpoint does not match the stopped candidate",
             ));
         }
+    }
+    Ok(())
+}
+fn verify_review_session(config: &HostConfig, job: &Job, path: &Path) -> io::Result<()> {
+    let profile = crate::selection::native_profile(job, config, true)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("reviewer missing"))?;
+    if crate::sessions::enabled(&profile) {
         let next_attempt = attempt(path)?
             .checked_add(1)
             .ok_or_else(|| io::Error::other("workspace attempt limit reached"))?;
-        crate::sessions::Session::verify_reviewer_resume(path, &repository, profile, next_attempt)?;
+        crate::sessions::Session::verify_reviewer_resume(
+            path,
+            &path.join("reviewer-repository"),
+            &profile,
+            next_attempt,
+            job.role_epochs
+                .as_ref()
+                .and_then(|epochs| epochs.role(true)),
+        )?;
     }
     Ok(())
 }

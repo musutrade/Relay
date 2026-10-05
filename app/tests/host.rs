@@ -48,6 +48,7 @@ impl Fixture {
     }
     fn job(&self) -> Job {
         Job {
+            role_epochs: None,
             role_selections: None,
             role_binding: None,
             workspace_quota_bytes: None,

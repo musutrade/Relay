@@ -290,6 +290,8 @@ fn explicitly_retried_failed_app_server_turn_resumes_checkpointed_id_and_files()
     app.retry(
         1,
         relay_app::RetryRequest {
+            replacement: None,
+            permission_challenge: None,
             workspace_quota_bytes: None,
             key: "continue".into(),
             confirm_stopped_and_reconciled: true,
