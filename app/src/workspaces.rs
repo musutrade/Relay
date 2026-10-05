@@ -65,6 +65,24 @@ fn normalized(job: &Job) -> Job {
     job
 }
 fn config_binding(config: &HostConfig, job: &Job) -> io::Result<String> {
+    if job.role_selections.is_some() {
+        let workflow = job
+            .workflow
+            .as_ref()
+            .and_then(|name| config.workflows.get(name))
+            .map(|workflow| crate::selection::effective_workflow(job, config, workflow));
+        let developer =
+            crate::selection::native_profile(job, config, false).map_err(io::Error::other)?;
+        let reviewer =
+            crate::selection::native_profile(job, config, true).map_err(io::Error::other)?;
+        return crate::sessions::fingerprint(&json!({
+            "source":config.repositories.get(&job.repository),
+            "agent":config.agents.get(&job.agent),"native":developer,"workflow":workflow,"reviewer":reviewer,
+            "test":job.test.as_ref().or(workflow.as_ref().map(|w|&w.test)).and_then(|name|config.tests.get(name)),
+            "publisher":job.draft_pr_adapter.as_ref().and_then(|name|config.draft_pr_adapters.get(name)),
+            "role_selections":job.role_selections,
+        }));
+    }
     let workflow = job
         .workflow
         .as_ref()
@@ -580,12 +598,10 @@ pub(crate) fn verify_review_checkpoint(
     path: &Path,
 ) -> io::Result<()> {
     let review = crate::workflow::review_continuation(result, None).map_err(io::Error::other)?;
-    let workflow = job
-        .workflow
-        .as_ref()
-        .and_then(|name| config.workflows.get(name))
-        .ok_or_else(|| io::Error::other("review continuation has no configured workflow"))?;
-    let profile = &config.native_agents[&workflow.reviewer];
+    let profile = crate::selection::native_profile(job, config, true)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("review continuation has no configured reviewer"))?;
+    let profile = &profile;
     if crate::sessions::enabled(profile) {
         let repository = path.join("reviewer-repository");
         if read_marker(&path.join("reviewer-candidate.txt"))? != review.candidate_sha
@@ -601,4 +617,52 @@ pub(crate) fn verify_review_checkpoint(
         crate::sessions::Session::verify_reviewer_resume(path, &repository, profile, next_attempt)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod selection_binding_tests {
+    use super::*;
+    #[test]
+    fn legacy_workspace_fingerprint_is_stable_and_selected_settings_are_bound() {
+        let config: HostConfig = serde_json::from_value(json!({
+            "workspace_root":"/fixture/runs","repositories":{"repo":"/fixture/source"},
+            "native_agents":{"dev":{"provider":"codex_cli","program":"/bin/true"}}
+        }))
+        .unwrap();
+        let mut job: Job = serde_json::from_value(
+            json!({"repository":"repo","requirements":"Do work","agent":"dev"}),
+        )
+        .unwrap();
+        assert_eq!(
+            config_binding(&config, &job).unwrap(),
+            "fnv1a-v1-6de094035fdf55a3"
+        );
+        job.role_selections = Some(
+            serde_json::from_value(
+                json!({"developer":{"profile":"dev","model":{"value":"first","source":"manual"}}}),
+            )
+            .unwrap(),
+        );
+        let selected = config_binding(&config, &job).unwrap();
+        job.role_selections
+            .as_mut()
+            .unwrap()
+            .developer
+            .as_mut()
+            .unwrap()
+            .model
+            .as_mut()
+            .unwrap()
+            .value = "second".into();
+        assert_ne!(config_binding(&config, &job).unwrap(), selected);
+        let selected = config_binding(&config, &job).unwrap();
+        let mut changed = config.clone();
+        changed
+            .native_agents
+            .get_mut("dev")
+            .unwrap()
+            .env
+            .insert("POLICY".into(), "different".into());
+        assert_ne!(config_binding(&changed, &job).unwrap(), selected);
+    }
 }

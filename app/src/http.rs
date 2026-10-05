@@ -31,6 +31,7 @@ pub fn router_with_auth(app: Arc<Application>, auth: Auth) -> Router {
     let api = Router::new()
         .route("/config", get(config))
         .route("/resources", get(resources))
+        .route("/permission-challenge", post(permission_challenge))
         .route("/capabilities", get(capabilities))
         .route("/capabilities/{name}/refresh", post(refresh_capabilities))
         .route("/status", get(status))
@@ -145,15 +146,18 @@ async fn config(State(state): State<Web>) -> Json<Value> {
 struct ResourceQuery {
     repository: String,
     workflow: Option<String>,
+    reviewer_profile: Option<String>,
 }
 async fn resources(
     State(state): State<Web>,
     Query(query): Query<ResourceQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let result = tokio::task::spawn_blocking(move || {
-        state
-            .app
-            .resource_estimate(&query.repository, query.workflow.as_deref())
+        state.app.resource_estimate_with_reviewer(
+            &query.repository,
+            query.workflow.as_deref(),
+            query.reviewer_profile.as_deref(),
+        )
     })
     .await
     .map_err(|_| Error::Poisoned)??;
@@ -196,6 +200,17 @@ async fn detail(
     Path(id): Path<i64>,
 ) -> Result<Json<crate::TaskView>, ApiError> {
     Ok(Json(state.app.get_view(id)?))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PermissionChallengeInput {
+    job: crate::host::Job,
+}
+async fn permission_challenge(
+    State(state): State<Web>,
+    Json(input): Json<PermissionChallengeInput>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(state.app.permission_challenge(input.job)?))
 }
 async fn submit(
     State(state): State<Web>,

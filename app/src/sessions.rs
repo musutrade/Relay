@@ -280,6 +280,14 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
+    fn legacy_session_fingerprint_is_unchanged_and_native_mode_is_bound() {
+        let mut profile: NativeProfile =
+            serde_json::from_value(json!({"provider":"codex_cli","program":"/bin/true"})).unwrap();
+        assert_eq!(binding(&profile).unwrap(), "fnv1a-v1-5b028b8dab7207b5");
+        profile.native_permission = Some(crate::providers::NativePermission::CodexFullAccess);
+        assert_ne!(binding(&profile).unwrap(), "fnv1a-v1-5b028b8dab7207b5");
+    }
+    #[test]
     fn sessions_reject_inflight_role_profile_and_cwd_mixups() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().join("repository");

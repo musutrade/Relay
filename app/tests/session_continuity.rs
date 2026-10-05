@@ -5,7 +5,7 @@ use serde_json::json;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{Arc, Mutex, MutexGuard, atomic::AtomicBool};
 use tempfile::TempDir;
 
 const CODEX: &str = r#"#!/usr/bin/python3
@@ -81,9 +81,16 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
 struct Fixture {
     _temp: TempDir,
     config: HostConfig,
+    _serial: MutexGuard<'static, ()>,
 }
+// A concurrent fork can transiently inherit another fixture's CLOEXEC lease
+// before exec, so its nonblocking ownership check correctly reports EAGAIN.
+// Keep fixture lifetimes disjoint, as in review_continuation.rs; never retry
+// ownership checks or weaken production lease behavior to accommodate a test.
+static FIXTURES: Mutex<()> = Mutex::new(());
 impl Fixture {
     fn new(provider: &str, workflow: bool) -> Self {
+        let serial = FIXTURES.lock().unwrap_or_else(|error| error.into_inner());
         let temp = TempDir::new().unwrap();
         let source = temp.path().join("source");
         fs::create_dir(&source).unwrap();
@@ -127,6 +134,7 @@ impl Fixture {
         Self {
             _temp: temp,
             config,
+            _serial: serial,
         }
     }
     fn task(&self, id: i64) -> Task {
@@ -265,6 +273,7 @@ fn explicitly_retried_failed_app_server_turn_resumes_checkpointed_id_and_files()
         relay_app::Application::open(f._temp.path().join("retry.db"), f.config.clone()).unwrap();
     let job = serde_json::from_str(&f.task(1).payload).unwrap();
     app.submit(relay_app::Submission {
+        permission_challenge: None,
         key: "first".into(),
         job,
     })
@@ -339,4 +348,130 @@ fn reviewer_copy_shares_budget_and_reused_checkout_is_not_counted_twice() {
     let workspace = result.workspace.unwrap();
     assert!(workspace.join("repository/large").exists());
     assert!(workspace.join("reviewer-repository/large").exists());
+}
+
+#[test]
+fn codex_explicit_permission_mismatch_never_starts_a_turn_or_becomes_resumable() {
+    use relay_app::providers::NativePermission;
+    let mut f = Fixture::new("codex_app_server", false);
+    let profile = f.config.native_agents.get_mut("developer").unwrap();
+    profile.native_permission = Some(NativePermission::CodexWorkspaceWrite);
+    fs::write(&profile.program, CODEX.replace(
+        "'model':'fixture-model'", "'model':'fixture-model','sandbox':{'type':'dangerFullAccess'},'approvalPolicy':'never'"
+    )).unwrap();
+    let result = Host::new(f.config.clone())
+        .unwrap()
+        .execute(&f.task(1), Arc::new(AtomicBool::new(false)));
+    assert_eq!(result.outcome, Outcome::Failure, "{result:?}");
+    let provider = result
+        .agent
+        .as_ref()
+        .and_then(|stage| stage.provider.as_ref())
+        .unwrap();
+    assert_eq!(
+        provider.selection.as_ref().unwrap().verification.permission,
+        "mismatch"
+    );
+    let root = result.workspace.unwrap();
+    assert!(!root.join("repository/changed.txt").exists());
+    assert!(!root.join("repository/.git/turn-count").exists());
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("sessions/developer.json")).unwrap()).unwrap();
+    assert_eq!(state["ready"], false);
+}
+
+#[test]
+fn claude_permission_evidence_survives_host_and_mismatch_stops_sleeping_process() {
+    use relay_app::providers::NativePermission;
+    const SCRIPT: &str = r#"#!/usr/bin/python3
+import json, os, pathlib, sys, time
+if '--version' in sys.argv: print('2.1.281 (Claude Code)'); sys.exit()
+if '--help' in sys.argv:
+    print('--output-format --verbose --permission-prompts --permission-mode --session-id --resume --model --effort');sys.exit()
+assert sys.argv[sys.argv.index('--permission-mode')+1]=='auto'
+assert sys.argv[sys.argv.index('--permission-prompts')+1]=='none'
+prompt=sys.stdin.read(); sid=sys.argv[sys.argv.index('--session-id')+1]
+pathlib.Path('.git/permission-pid').write_text(str(os.getpid()))
+mismatch=os.environ.get('MISMATCH')=='yes'
+print(json.dumps({'type':'system','subtype':'init','session_id':sid,'model':'session-model','effort':'high','permissionMode':'bypassPermissions' if mismatch else 'auto'}),flush=True)
+if mismatch: time.sleep(30)
+print(json.dumps({'type':'assistant','message':{'model':'main-model'}}),flush=True)
+print(json.dumps({'type':'assistant','parent_tool_use_id':'nested','message':{'model':'subagent-model'}}),flush=True)
+print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_id':sid,'result':'done'}),flush=True)
+"#;
+    for mismatch in [false, true] {
+        let mut f = Fixture::new("claude_cli", false);
+        let profile = f.config.native_agents.get_mut("developer").unwrap();
+        profile.native_permission = Some(NativePermission::ClaudeAuto);
+        profile.allowed_permission_modes = vec![NativePermission::ClaudeAuto];
+        profile.model = Some("requested-model".into());
+        profile.effort = Some("high".into());
+        if mismatch {
+            profile.env.insert("MISMATCH".into(), "yes".into());
+        }
+        fs::write(&profile.program, SCRIPT).unwrap();
+        let mut job: serde_json::Value = serde_json::from_str(&f.task(1).payload).unwrap();
+        job["role_selections"] =
+            json!({"developer":{"profile":"developer","native_permission":"claude_auto"}});
+        let app = relay_app::Application::open(
+            f._temp.path().join("permission-evidence.db"),
+            f.config.clone(),
+        )
+        .unwrap();
+        let challenge = app
+            .permission_challenge(serde_json::from_value(job.clone()).unwrap())
+            .unwrap();
+        job["role_selections"]["developer"]["confirm_permission_expansion"] = json!(true);
+        let task = app.submit(serde_json::from_value(json!({
+            "key":"permission-evidence","job":job,"permission_challenge":challenge["challenge"],
+        })).unwrap()).unwrap();
+        let started = std::time::Instant::now();
+        assert!(app.work_once().unwrap());
+        let result: relay_app::host::RunResult =
+            serde_json::from_str(app.get(task.id).unwrap().result.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            result.outcome,
+            if mismatch {
+                Outcome::Failure
+            } else {
+                Outcome::Success
+            },
+            "{result:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let provider = result
+            .agent
+            .as_ref()
+            .and_then(|stage| stage.provider.as_ref())
+            .unwrap();
+        let evidence = provider.selection.as_ref().unwrap();
+        assert_eq!(evidence.requested.profile.as_deref(), Some("developer"));
+        assert_eq!(evidence.requested.model.as_deref(), Some("requested-model"));
+        assert_eq!(
+            evidence.verification.permission,
+            if mismatch {
+                "mismatch"
+            } else {
+                "session_reported"
+            }
+        );
+        assert_eq!(
+            evidence.session_settings.as_ref().unwrap().model.as_deref(),
+            Some("session-model")
+        );
+        if !mismatch {
+            assert_eq!(provider.reported_model.as_deref(), Some("main-model"));
+        }
+        let root = result.workspace.unwrap();
+        let pid: i32 = fs::read_to_string(root.join("repository/.git/permission-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 observes the fixture process after host cleanup.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("sessions/developer.json")).unwrap())
+                .unwrap();
+        assert_eq!(state["ready"], !mismatch);
+    }
 }

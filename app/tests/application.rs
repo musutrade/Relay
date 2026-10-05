@@ -30,7 +30,7 @@ fn public_workflow_metadata_contains_selectors_without_execution_configuration()
     assert_eq!(
         public["workflows"],
         json!([{
-            "name":"checked", "repository":"fixture", "developer":"fake", "reviewer":"reviewer", "test":"pass", "max_repairs":1
+            "name":"checked", "repository":"fixture", "developer":"fake", "reviewer":"reviewer", "test":"pass", "max_repairs":1, "selectable_developers":["fake"], "selectable_reviewers":["reviewer"]
         }])
     );
     let serialized = public.to_string();

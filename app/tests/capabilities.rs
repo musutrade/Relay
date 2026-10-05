@@ -277,3 +277,29 @@ fn claude_reports_known_route_but_never_starts_unverified_managed_hooks() {
         .collect();
     assert_eq!(calls, vec![json!(["--version"]), json!(["--help"])]);
 }
+
+#[test]
+fn explicit_reviewer_profile_can_probe_without_implying_claude_catalog_safety() {
+    let fixture = Fixture::new("success", "claude_cli");
+    let mut config = fixture.host.config().clone();
+    config
+        .native_agents
+        .get_mut("fixture")
+        .unwrap()
+        .native_permission = Some(relay_app::providers::NativePermission::ClaudeRestricted);
+    let host = Host::new(config.clone()).unwrap();
+    let catalog = discover(&host, &config.native_agents["fixture"]);
+    assert_eq!(catalog.compatibility.state, CapabilityState::Supported);
+    assert_eq!(catalog.reviewer_isolation.state, CapabilityState::Supported);
+    assert_eq!(catalog.model_catalog.state, CapabilityState::Unknown);
+    assert_eq!(catalog.permission_control.state, CapabilityState::Unknown);
+    let config_path = fixture.temp.path().join("doctor.json");
+    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_relay-app"))
+        .args(["doctor", config_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["profiles"][0]["compatible"], true, "{result}");
+}

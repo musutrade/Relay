@@ -10,6 +10,7 @@ use std::path::PathBuf;
 pub const MAX_PROTOCOL_LINE: usize = 64 * 1024;
 const MAX_FIELD: usize = 256;
 const MAX_SUMMARY: usize = 4096;
+pub(crate) const MAX_SESSION_POLICY: usize = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -17,6 +18,54 @@ pub enum ProviderKind {
     CodexCli,
     CodexAppServer,
     ClaudeCli,
+}
+
+/// An explicit native developer permission mode, or Relay's fixed reviewer contract.
+/// Availability and account/model eligibility are still owned by the provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePermission {
+    CodexWorkspaceWrite,
+    CodexFullAccess,
+    ClaudeDontAsk,
+    ClaudeAuto,
+    ClaudeBypassPermissions,
+    ClaudeRestricted,
+}
+impl NativePermission {
+    pub fn requires_confirmation(self) -> bool {
+        !matches!(self, Self::CodexWorkspaceWrite | Self::ClaudeRestricted)
+    }
+    pub fn compatible(self, provider: ProviderKind, read_only: bool) -> bool {
+        matches!(
+            (self, provider, read_only),
+            (
+                Self::CodexWorkspaceWrite | Self::CodexFullAccess,
+                ProviderKind::CodexCli | ProviderKind::CodexAppServer,
+                false,
+            ) | (
+                Self::ClaudeDontAsk | Self::ClaudeAuto | Self::ClaudeBypassPermissions,
+                ProviderKind::ClaudeCli,
+                false,
+            ) | (Self::ClaudeRestricted, ProviderKind::ClaudeCli, true)
+        )
+    }
+    pub(crate) fn claude_mode(self) -> Option<&'static str> {
+        match self {
+            Self::ClaudeDontAsk => Some("dontAsk"),
+            Self::ClaudeAuto => Some("auto"),
+            Self::ClaudeBypassPermissions => Some("bypassPermissions"),
+            _ => None,
+        }
+    }
+}
+
+/// Selection values are literals, never flags or unescaped configuration syntax.
+pub fn validate_selection_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_FIELD
+        && !value.starts_with('-')
+        && !value.chars().any(char::is_control)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +79,10 @@ pub struct NativeProfile {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_permission: Option<NativePermission>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_permission_modes: Vec<NativePermission>,
     #[serde(default)]
     pub max_turns: Option<u32>,
     #[serde(default)]
@@ -58,24 +111,32 @@ impl NativeProfile {
         {
             return Err("invalid native CLI environment".into());
         }
-        if self.model.as_ref().is_some_and(|model| {
-            model.is_empty()
-                || model.starts_with('-')
-                || model.len() > MAX_FIELD
-                || model.chars().any(char::is_control)
-        }) {
+        if self
+            .model
+            .as_ref()
+            .is_some_and(|model| !validate_selection_value(model))
+        {
             return Err("native model must contain 1–256 bytes without control characters".into());
         }
-        if let Some(effort) = &self.effort {
-            let allowed = match self.provider {
-                ProviderKind::CodexCli | ProviderKind::CodexAppServer => {
-                    &["minimal", "low", "medium", "high", "xhigh"][..]
-                }
-                ProviderKind::ClaudeCli => &["low", "medium", "high", "xhigh", "max"][..],
-            };
-            if !allowed.contains(&effort.as_str()) {
-                return Err("unsupported native effort setting".into());
-            }
+        if self
+            .effort
+            .as_ref()
+            .is_some_and(|effort| !validate_selection_value(effort))
+        {
+            return Err("native effort must contain 1–256 bytes without control characters or a leading '-'".into());
+        }
+        if self.allowed_permission_modes.len() > 6
+            || self
+                .native_permission
+                .iter()
+                .chain(&self.allowed_permission_modes)
+                .any(|mode| {
+                    !mode.compatible(self.provider, false) && !mode.compatible(self.provider, true)
+                })
+        {
+            return Err(
+                "native permission modes must be bounded and compatible with the provider".into(),
+            );
         }
         if self
             .max_turns
@@ -109,7 +170,13 @@ impl NativeProfile {
     pub fn compile(&self, read_only: bool) -> Result<CommandProfile, String> {
         self.validate()?;
         if read_only && self.provider != ProviderKind::ClaudeCli {
-            return Err("review_profile_unsupported: Codex project MCP/hooks cannot be disabled by the supported CLI contract".into());
+            return Err("review_profile_unsupported: a complete version-verified Codex reviewer isolation contract is unproven".into());
+        }
+        if self
+            .native_permission
+            .is_some_and(|mode| !mode.compatible(self.provider, read_only))
+        {
+            return Err("native permission mode is incompatible with the provider role".into());
         }
         if self.provider == ProviderKind::CodexAppServer {
             return Ok(CommandProfile {
@@ -125,8 +192,8 @@ impl NativeProfile {
                 "--json".into(),
                 "--ephemeral".into(),
                 "--sandbox".into(),
-                if read_only {
-                    "read-only"
+                if self.native_permission == Some(NativePermission::CodexFullAccess) {
+                    "danger-full-access"
                 } else {
                     "workspace-write"
                 }
@@ -143,13 +210,28 @@ impl NativeProfile {
                 "--no-session-persistence".into(),
             ],
         };
+        if let Some(permission) = self.native_permission {
+            match self.provider {
+                ProviderKind::CodexCli => {
+                    args.extend(["-c".into(), "approval_policy=\"never\"".into()]);
+                }
+                ProviderKind::ClaudeCli => {
+                    if let Some(mode) = permission.claude_mode() {
+                        args.extend(["--permission-mode".into(), mode.into()]);
+                    }
+                }
+                ProviderKind::CodexAppServer => unreachable!(),
+            }
+        }
         if let Some(model) = &self.model {
             args.extend(["--model".into(), model.clone()]);
         }
         if let Some(effort) = &self.effort {
             match self.provider {
                 ProviderKind::CodexCli | ProviderKind::CodexAppServer => {
-                    args.extend(["-c".into(), format!("model_reasoning_effort=\"{effort}\"")])
+                    let literal =
+                        serde_json::to_string(effort).map_err(|error| error.to_string())?;
+                    args.extend(["-c".into(), format!("model_reasoning_effort={literal}")])
                 }
                 ProviderKind::ClaudeCli => args.extend(["--effort".into(), effort.clone()]),
             }
@@ -222,7 +304,13 @@ impl NativeProfile {
         hidden_max_turns_verified: bool,
     ) -> Result<String, String> {
         if read_only && self.provider != ProviderKind::ClaudeCli {
-            return Err("review_profile_unsupported: Codex project MCP/hooks cannot be disabled by the supported CLI contract".into());
+            return Err("review_profile_unsupported: a complete version-verified Codex reviewer isolation contract is unproven".into());
+        }
+        if self
+            .native_permission
+            .is_some_and(|mode| !mode.compatible(self.provider, read_only))
+        {
+            return Err("native permission mode is incompatible with the provider role".into());
         }
         let version = parse_version(version).ok_or("CLI version was not recognizable")?;
         if self.provider == ProviderKind::ClaudeCli && version.0 < (2, 1, 259) {
@@ -264,6 +352,15 @@ impl NativeProfile {
             } else {
                 "--effort"
             });
+        }
+        if let Some(permission) = self.native_permission {
+            if self.provider == ProviderKind::CodexCli {
+                required.push("--config");
+            } else if permission.claude_mode().is_some() {
+                // Flag availability does not certify Claude auto eligibility for
+                // this model/provider. Native rejection is surfaced, never bypassed.
+                required.push("--permission-mode");
+            }
         }
         if self.max_turns.is_some() && !hidden_max_turns_verified {
             required.push("--max-turns");
@@ -343,6 +440,178 @@ pub struct ProviderUsage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestedSelection {
+    pub profile: Option<String>,
+    pub provider: ProviderKind,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub native_permission: Option<NativePermission>,
+    pub model_source: Option<String>,
+}
+
+/// Provider-reported session configuration is not necessarily the model or effort
+/// used for the current turn, particularly after a turn override or reroute.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSettings {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub approval_policy: Option<String>,
+    /// Native string kind or bounded serialized object, never turn-execution proof.
+    pub sandbox: Option<String>,
+    pub permission_mode: Option<String>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelReroute {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub from_model: String,
+    pub to_model: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ObservedSelection {
+    pub model: Option<String>,
+    pub source: Option<String>,
+    #[serde(default)]
+    pub reroutes: Vec<ModelReroute>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionVerification {
+    pub model: String,
+    pub effort: String,
+    pub permission: String,
+}
+impl Default for SelectionVerification {
+    fn default() -> Self {
+        Self {
+            model: "unknown".into(),
+            effort: "unknown".into(),
+            permission: "unknown".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionEvidence {
+    pub requested: RequestedSelection,
+    pub session_settings: Option<SessionSettings>,
+    #[serde(default)]
+    pub observed: ObservedSelection,
+    #[serde(default)]
+    pub verification: SelectionVerification,
+    #[serde(default)]
+    pub truncated: bool,
+}
+impl SelectionEvidence {
+    pub(crate) fn bound(&mut self) {
+        for text in [
+            &mut self.requested.profile,
+            &mut self.requested.model,
+            &mut self.requested.effort,
+            &mut self.requested.model_source,
+            &mut self.observed.model,
+            &mut self.observed.source,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            self.truncated |= text.len() > MAX_FIELD;
+            truncate(text, MAX_FIELD);
+        }
+        for text in [
+            &mut self.verification.model,
+            &mut self.verification.effort,
+            &mut self.verification.permission,
+        ] {
+            self.truncated |= text.len() > MAX_FIELD;
+            truncate(text, MAX_FIELD);
+        }
+        if let Some(settings) = &mut self.session_settings {
+            for text in [
+                &mut settings.model,
+                &mut settings.effort,
+                &mut settings.permission_mode,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                self.truncated |= text.len() > MAX_FIELD;
+                truncate(text, MAX_FIELD);
+            }
+            for text in [&mut settings.approval_policy, &mut settings.sandbox]
+                .into_iter()
+                .flatten()
+            {
+                self.truncated |= text.len() > MAX_SESSION_POLICY;
+                truncate(text, MAX_SESSION_POLICY);
+            }
+            self.truncated |= settings.source.len() > MAX_FIELD;
+            truncate(&mut settings.source, MAX_FIELD);
+        }
+        self.truncated |= self.observed.reroutes.len() > 8;
+        self.observed.reroutes.truncate(8);
+        for reroute in &mut self.observed.reroutes {
+            for text in [
+                &mut reroute.thread_id,
+                &mut reroute.turn_id,
+                &mut reroute.from_model,
+                &mut reroute.to_model,
+                &mut reroute.reason,
+            ] {
+                self.truncated |= text.len() > MAX_FIELD;
+                truncate(text, MAX_FIELD);
+            }
+        }
+    }
+    pub(crate) fn shrink(&mut self) -> bool {
+        let mut changed = false;
+        if !self.observed.reroutes.is_empty() {
+            self.observed
+                .reroutes
+                .truncate(self.observed.reroutes.len() / 2);
+            changed = true;
+        }
+        for text in [
+            &mut self.requested.profile,
+            &mut self.requested.model,
+            &mut self.requested.effort,
+            &mut self.requested.model_source,
+            &mut self.observed.model,
+            &mut self.observed.source,
+        ] {
+            changed |= shrink_optional(text);
+        }
+        if let Some(settings) = &mut self.session_settings {
+            for text in [
+                &mut settings.model,
+                &mut settings.effort,
+                &mut settings.approval_policy,
+                &mut settings.sandbox,
+                &mut settings.permission_mode,
+            ] {
+                changed |= shrink_optional(text);
+            }
+        }
+        self.truncated |= changed;
+        changed
+    }
+}
+fn shrink_optional(text: &mut Option<String>) -> bool {
+    let Some(value) = text else {
+        return false;
+    };
+    truncate(value, value.len() / 2);
+    if value.is_empty() {
+        *text = None;
+    }
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderResult {
     pub provider: ProviderKind,
     pub cli_version: Option<String>,
@@ -354,6 +623,8 @@ pub struct ProviderResult {
     #[serde(default)]
     pub summary_truncated: bool,
     pub usage: ProviderUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SelectionEvidence>,
 }
 impl ProviderResult {
     pub fn new(profile: &NativeProfile, cli_version: Option<String>) -> Self {
@@ -367,6 +638,28 @@ impl ProviderResult {
             summary: String::new(),
             summary_truncated: false,
             usage: ProviderUsage::default(),
+            selection: Some(SelectionEvidence {
+                requested: RequestedSelection {
+                    profile: None,
+                    provider: profile.provider,
+                    model: profile.model.clone(),
+                    effort: profile.effort.clone(),
+                    native_permission: profile.native_permission,
+                    model_source: None,
+                },
+                session_settings: None,
+                observed: ObservedSelection::default(),
+                verification: SelectionVerification::default(),
+                truncated: false,
+            }),
+        }
+    }
+    pub(crate) fn observe_message_model(&mut self, model: String, source: &str) {
+        self.reported_model = Some(model.clone());
+        if let Some(selection) = &mut self.selection {
+            selection.observed.model = Some(model);
+            selection.observed.source = Some(source.into());
+            selection.verification.model = "message_reported".into();
         }
     }
     pub(crate) fn bound(&mut self) {
@@ -384,6 +677,9 @@ impl ProviderResult {
         }
         self.summary_truncated |= self.summary.len() > MAX_SUMMARY;
         truncate(&mut self.summary, MAX_SUMMARY);
+        if let Some(selection) = &mut self.selection {
+            selection.bound();
+        }
     }
     pub(crate) fn shrink(&mut self) -> bool {
         let mut changed = false;
@@ -407,6 +703,9 @@ impl ProviderResult {
             let len = self.summary.len() / 2;
             truncate(&mut self.summary, len);
             changed = true;
+        }
+        if let Some(selection) = &mut self.selection {
+            changed |= selection.shrink();
         }
         changed
     }
@@ -470,12 +769,16 @@ impl ProtocolParser {
         self.app_server
             .as_ref()
             .is_some_and(|driver| driver.stopped())
+            || self.error.is_some()
     }
     pub(crate) fn failure(&self) -> Option<&str> {
         if let Some(driver) = &self.catalog {
             return driver.failure();
         }
-        self.app_server.as_ref().and_then(|driver| driver.failure())
+        self.app_server
+            .as_ref()
+            .and_then(|driver| driver.failure())
+            .or(self.error.as_deref())
     }
     pub fn read_only(mut self, enabled: bool) -> Self {
         self.read_only = enabled;
@@ -573,7 +876,8 @@ impl ProtocolParser {
                 "thread.started" => {
                     self.active()?;
                     self.result.session_id = string_field(event, "thread_id", MAX_FIELD)?;
-                    self.result.reported_model = string_field(event, "model", MAX_FIELD)?;
+                    // The exec thread.started contract has no effective model or
+                    // effort. Unrecognized extra fields cannot verify either.
                 }
                 "turn.started" => self.active()?,
                 "item.started" | "item.updated" | "item.completed" => {
@@ -616,6 +920,10 @@ impl ProtocolParser {
                         && item.get("type").and_then(Value::as_str) == Some("agent_message")
                     {
                         self.set_summary(item, "text")?;
+                        if let Some(model) = optional_string_field(item, "model", MAX_FIELD)? {
+                            self.result
+                                .observe_message_model(model, "codex.item/agent_message");
+                        }
                     }
                 }
                 "turn.completed" => {
@@ -629,10 +937,52 @@ impl ProtocolParser {
             },
             ProviderKind::ClaudeCli => match kind {
                 "system" => {
-                    if event.get("subtype").and_then(Value::as_str) == Some("init") {
+                    if event.get("subtype").and_then(Value::as_str) == Some("init")
+                        && event.get("parent_tool_use_id").is_none_or(Value::is_null)
+                    {
                         self.active()?;
                         self.result.session_id = string_field(event, "session_id", MAX_FIELD)?;
-                        self.result.reported_model = string_field(event, "model", MAX_FIELD)?;
+                        let settings = SessionSettings {
+                            model: optional_string_field(event, "model", MAX_FIELD)?,
+                            effort: optional_string_field(event, "effort", MAX_FIELD)?,
+                            approval_policy: None,
+                            sandbox: None,
+                            permission_mode: optional_string_field(
+                                event,
+                                "permissionMode",
+                                MAX_FIELD,
+                            )?,
+                            source: "claude.system/init".into(),
+                        };
+                        let mut permission_mismatch = false;
+                        if let Some(selection) = &mut self.result.selection {
+                            if settings.model.is_some() && selection.observed.model.is_none() {
+                                selection.verification.model = "session_reported".into();
+                            }
+                            if settings.effort.is_some() {
+                                selection.verification.effort = "session_reported".into();
+                            }
+                            // Restricted is Relay's reviewer contract, not a native
+                            // permissionMode value. Missing evidence stays unknown.
+                            if let Some(expected) = selection
+                                .requested
+                                .native_permission
+                                .and_then(NativePermission::claude_mode)
+                                && let Some(actual) = &settings.permission_mode
+                            {
+                                permission_mismatch = actual != expected;
+                                selection.verification.permission = if permission_mismatch {
+                                    "mismatch"
+                                } else {
+                                    "session_reported"
+                                }
+                                .into();
+                            }
+                            selection.session_settings = Some(settings);
+                        }
+                        if permission_mismatch {
+                            return Err("native permission mismatch: Claude session reported a different permission mode".into());
+                        }
                     }
                 }
                 "assistant" => {
@@ -660,8 +1010,11 @@ impl ProtocolParser {
                                 }
                             }
                         }
-                        if let Some(model) = string_field(message, "model", MAX_FIELD)? {
-                            self.result.reported_model = Some(model);
+                        if event.get("parent_tool_use_id").is_none_or(Value::is_null)
+                            && let Some(model) = optional_string_field(message, "model", MAX_FIELD)?
+                        {
+                            self.result
+                                .observe_message_model(model, "claude.assistant.message");
                         }
                     }
                 }
@@ -783,6 +1136,17 @@ fn string_field(value: &Value, key: &str, limit: usize) -> Result<Option<String>
         })
         .transpose()
 }
+pub(crate) fn optional_string_field(
+    value: &Value,
+    key: &str,
+    limit: usize,
+) -> Result<Option<String>, String> {
+    if value.get(key).is_none_or(Value::is_null) {
+        Ok(None)
+    } else {
+        string_field(value, key, limit)
+    }
+}
 fn number_field(value: &Value, key: &str) -> Result<Option<u64>, String> {
     value
         .get(key)
@@ -804,4 +1168,88 @@ fn truncate(text: &mut String, limit: usize) {
         end -= 1;
     }
     text.truncate(end);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn selection_evidence_is_utf8_bounded_and_shrinks_without_claiming_full_evidence() {
+        let profile: NativeProfile = serde_json::from_value(json!({
+            "provider":"claude_cli","program":"/bin/true","native_permission":"claude_auto"
+        }))
+        .unwrap();
+        let mut result = ProviderResult::new(&profile, None);
+        let evidence = result.selection.as_mut().unwrap();
+        evidence.requested.profile = Some("界".repeat(256));
+        evidence.session_settings = Some(SessionSettings {
+            model: Some("界".repeat(256)),
+            effort: Some("x".repeat(500)),
+            approval_policy: None,
+            sandbox: None,
+            permission_mode: Some("auto".into()),
+            source: "claude.system/init".into(),
+        });
+        evidence.observed.reroutes = (0..10)
+            .map(|_| ModelReroute {
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                from_model: "界".repeat(256),
+                to_model: "x".repeat(500),
+                reason: "reason".repeat(100),
+            })
+            .collect();
+        result.bound();
+        let evidence = result.selection.as_ref().unwrap();
+        assert!(evidence.truncated);
+        assert!(evidence.requested.profile.as_ref().unwrap().len() <= 256);
+        assert_eq!(evidence.observed.reroutes.len(), 8);
+        for entry in &evidence.observed.reroutes {
+            assert!(entry.from_model.len() <= 256);
+            assert_eq!(entry.to_model.len(), 256);
+            assert_eq!(entry.reason.len(), 256);
+        }
+        let before = serde_json::to_vec(&result).unwrap().len();
+        let mut shrinks = 0;
+        while result.shrink() {
+            shrinks += 1;
+            assert!(shrinks < 32);
+        }
+        assert!(shrinks > 0);
+        assert!(serde_json::to_vec(&result).unwrap().len() < before);
+        let evidence = result.selection.unwrap();
+        assert!(evidence.truncated);
+        assert!(evidence.observed.reroutes.is_empty());
+        assert_eq!(
+            evidence.requested.native_permission,
+            Some(NativePermission::ClaudeAuto)
+        );
+        assert_eq!(evidence.verification.permission, "unknown");
+    }
+
+    #[test]
+    fn native_permission_mismatch_is_exposed_promptly_and_errors_are_sticky() {
+        let profile: NativeProfile = serde_json::from_value(json!({
+            "provider":"claude_cli","program":"/bin/true","native_permission":"claude_auto"
+        }))
+        .unwrap();
+        let mut parser = ProtocolParser::new(ProviderResult::new(&profile, None));
+        parser.feed(b"{\"type\":\"system\",\"subtype\":\"init\",\"permissionMode\":\"bypassPermissions\"}\n");
+        assert!(parser.stopped());
+        assert!(
+            parser
+                .failure()
+                .unwrap()
+                .contains("native permission mismatch")
+        );
+        parser.feed(b"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}\n");
+        let (result, error) = parser.finish();
+        assert!(error.unwrap().contains("native permission mismatch"));
+        assert_eq!(
+            result.selection.unwrap().verification.permission,
+            "mismatch"
+        );
+    }
 }
