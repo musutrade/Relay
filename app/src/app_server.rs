@@ -1,6 +1,9 @@
 //! Bounded Codex app-server stdio client. The supervisor owns the process tree;
 //! this driver owns only request correlation and one explicitly identified turn.
-use crate::providers::{MAX_PROTOCOL_LINE, ProviderResult, ProviderUsage, TokenCounts};
+use crate::providers::{
+    MAX_PROTOCOL_LINE, MAX_SESSION_POLICY, ModelReroute, NativePermission, ProviderKind,
+    ProviderResult, ProviderUsage, SessionSettings, TokenCounts, optional_string_field,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -13,6 +16,8 @@ pub(crate) struct Start {
     pub prompt: String,
     pub model: Option<String>,
     pub effort: Option<String>,
+    #[serde(default)]
+    pub native_permission: Option<NativePermission>,
     pub resume: Option<String>,
     pub checkpoint: Option<crate::sessions::Checkpoint>,
 }
@@ -50,6 +55,14 @@ impl Driver {
             error: None,
         };
         driver.result.usage.usage_scope = Some("last_snapshot".into());
+        if driver
+            .start
+            .native_permission
+            .is_some_and(|mode| !mode.compatible(ProviderKind::CodexAppServer, false))
+        {
+            driver.fail("native permission mode is incompatible with Codex app-server");
+            return driver;
+        }
         if driver.start.resume.is_none() {
             driver.baseline = Some(TokenCounts {
                 input_tokens: Some(0),
@@ -193,7 +206,14 @@ impl Driver {
             match self.request {
                 1 => {
                     self.send(json!({"method":"initialized","params":{}}));
-                    let mut params = json!({"cwd":self.start.cwd,"approvalPolicy":"never","sandbox":"workspace-write","model":self.start.model});
+                    let sandbox = if self.start.native_permission
+                        == Some(NativePermission::CodexFullAccess)
+                    {
+                        "danger-full-access"
+                    } else {
+                        "workspace-write"
+                    };
+                    let mut params = json!({"cwd":self.start.cwd,"approvalPolicy":"never","sandbox":sandbox,"model":self.start.model});
                     let method = if let Some(id) = &self.start.resume {
                         valid_id(id)?;
                         params["threadId"] = json!(id);
@@ -220,17 +240,20 @@ impl Driver {
                             .map_err(|e| format!("cannot persist started thread: {e}"))?;
                     }
                     self.result.session_id = Some(id.clone());
-                    self.result.reported_model = result
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
-                    self.result.bound();
+                    self.session_settings(result)?;
+                    let sandbox_policy = if self.start.native_permission
+                        == Some(NativePermission::CodexFullAccess)
+                    {
+                        json!({"type":"dangerFullAccess"})
+                    } else {
+                        json!({"type":"workspaceWrite","writableRoots":[self.start.cwd],
+                            "networkAccess":false,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false})
+                    };
                     self.send(json!({"id":3,"method":"turn/start","params":{
                         "threadId":id,"input":[{"type":"text","text":self.start.prompt}],
                         "cwd":self.start.cwd,"approvalPolicy":"never","model":self.start.model,
                         "effort":self.start.effort,
-                        "sandboxPolicy":{"type":"workspaceWrite","writableRoots":[self.start.cwd],
-                            "networkAccess":false,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false}
+                        "sandboxPolicy":sandbox_policy
                     }}));
                 }
                 3 => {
@@ -262,6 +285,7 @@ impl Driver {
                 | "turn/diff/updated"
                 | "turn/plan/updated"
                 | "turn/moderationMetadata"
+                | "model/rerouted"
         ) {
             if self.result.session_id.is_none()
                 || params.get("threadId").and_then(Value::as_str)
@@ -335,12 +359,40 @@ impl Driver {
                     self.result.bound();
                     self.answer_seen = true;
                 }
+                if item["type"] == "agentMessage"
+                    && let Some(model) = optional_string_field(item, "model", 256)?
+                {
+                    self.result
+                        .observe_message_model(model, "codex.item/agentMessage");
+                }
                 if item["status"] == "declined" {
                     return Err("app-server tool permission denied".into());
                 }
             }
             "thread/tokenUsage/updated" => {
                 self.apply_usage(token_usage(params)?);
+            }
+            "model/rerouted" => {
+                let reroute = ModelReroute {
+                    thread_id: id_field(params, "threadId")?,
+                    turn_id: id_field(params, "turnId")?,
+                    from_model: optional_string_field(params, "fromModel", 256)?
+                        .ok_or("app-server reroute requires fromModel")?,
+                    to_model: optional_string_field(params, "toModel", 256)?
+                        .ok_or("app-server reroute requires toModel")?,
+                    reason: optional_string_field(params, "reason", 256)?
+                        .ok_or("app-server reroute requires reason")?,
+                };
+                if let Some(selection) = &mut self.result.selection {
+                    selection.observed.model = Some(reroute.to_model.clone());
+                    selection.observed.source = Some("codex.model/rerouted".into());
+                    selection.verification.model = "rerouted".into();
+                    if selection.observed.reroutes.len() == 8 {
+                        selection.observed.reroutes.remove(0);
+                        selection.truncated = true;
+                    }
+                    selection.observed.reroutes.push(reroute);
+                }
             }
             "turn/started"
             | "turn/diff/updated"
@@ -350,6 +402,67 @@ impl Driver {
                 return Err("unknown app-server turn notification".into());
             }
             _ => {} // Ignore bounded ancillary notifications; never infer success from them.
+        }
+        Ok(())
+    }
+    fn session_settings(&mut self, result: &Value) -> Result<(), String> {
+        let (approval_policy, approval_truncated) = reported_setting(result, "approvalPolicy")?;
+        let (sandbox, sandbox_truncated) = reported_setting(result, "sandbox")?;
+        let settings = SessionSettings {
+            model: optional_string_field(result, "model", 256)?,
+            effort: optional_string_field(result, "reasoningEffort", 256)?,
+            approval_policy,
+            sandbox,
+            permission_mode: None,
+            source: if self.start.resume.is_some() {
+                "codex.thread/resume"
+            } else {
+                "codex.thread/start"
+            }
+            .into(),
+        };
+        let actual_sandbox = result.get("sandbox").filter(|value| !value.is_null());
+        let sandbox_kind = actual_sandbox.and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("type").and_then(Value::as_str))
+        });
+        let actual_approval = result
+            .get("approvalPolicy")
+            .filter(|value| !value.is_null());
+        let expected_sandbox = match self.start.native_permission {
+            Some(NativePermission::CodexWorkspaceWrite) => {
+                Some(["workspace-write", "workspaceWrite"])
+            }
+            Some(NativePermission::CodexFullAccess) => {
+                Some(["danger-full-access", "dangerFullAccess"])
+            }
+            _ => None,
+        };
+        let permission_mismatch = expected_sandbox.is_some_and(|expected| {
+            actual_sandbox.is_some()
+                && sandbox_kind.is_none_or(|actual| !expected.contains(&actual))
+                || actual_approval.is_some_and(|actual| actual.as_str() != Some("never"))
+        });
+        if let Some(selection) = &mut self.result.selection {
+            selection.truncated |= approval_truncated || sandbox_truncated;
+            if settings.model.is_some() {
+                selection.verification.model = "session_reported".into();
+            }
+            // Thread config predates the requested turn effort override. Neither
+            // this response nor turn/start certifies the current turn's effort.
+            if permission_mismatch {
+                selection.verification.permission = "mismatch".into();
+            } else if expected_sandbox.is_some()
+                && settings.sandbox.is_some()
+                && settings.approval_policy.is_some()
+            {
+                selection.verification.permission = "session_reported".into();
+            }
+            selection.session_settings = Some(settings);
+        }
+        if permission_mismatch {
+            return Err("native permission mismatch: Codex session reported a different sandbox or approval policy".into());
         }
         Ok(())
     }
@@ -364,6 +477,26 @@ impl Driver {
             self.fail("app-server turn contained no final answer");
         }
         (self.result, self.error)
+    }
+}
+fn reported_setting(value: &Value, key: &str) -> Result<(Option<String>, bool), String> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok((None, false)),
+        Some(Value::String(_)) => optional_string_field(value, key, 256).map(|text| (text, false)),
+        Some(setting) if setting.is_object() => {
+            // Preserve returned policy details independently from the native kind
+            // used for permission comparison. These settings describe the thread,
+            // not effective turn execution or enforced access.
+            let mut text = serde_json::to_string(setting).map_err(|error| error.to_string())?;
+            let truncated = text.len() > MAX_SESSION_POLICY;
+            let mut end = text.len().min(MAX_SESSION_POLICY);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            Ok((Some(text), truncated))
+        }
+        _ => Err(format!("invalid app-server {key} setting")),
     }
 }
 fn valid_id(id: &str) -> Result<(), String> {
@@ -486,6 +619,7 @@ mod tests {
                 prompt: "literal prompt\n✓".into(),
                 model: Some("model".into()),
                 effort: Some("high".into()),
+                native_permission: None,
                 resume: resume.map(str::to_owned),
                 checkpoint: None,
             },
@@ -925,5 +1059,236 @@ mod tests {
             json!({"id":2,"result":{"thread":{"id":"thread-1"}}}),
         );
         assert!(d.finish().1.unwrap().contains("different thread"));
+    }
+
+    fn select_permission(driver: &mut Driver, permission: NativePermission) {
+        driver.start.native_permission = Some(permission);
+        driver
+            .result
+            .selection
+            .as_mut()
+            .unwrap()
+            .requested
+            .native_permission = Some(permission);
+    }
+    fn pending_values(driver: &mut Driver) -> Vec<Value> {
+        String::from_utf8(driver.take_pending())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+    #[test]
+    fn explicit_native_modes_match_thread_and_turn_and_keep_session_evidence_separate() {
+        for resume in [None, Some("thread-1")] {
+            for (mode, thread_mode, turn_mode) in [
+                (
+                    NativePermission::CodexWorkspaceWrite,
+                    "workspace-write",
+                    "workspaceWrite",
+                ),
+                (
+                    NativePermission::CodexFullAccess,
+                    "danger-full-access",
+                    "dangerFullAccess",
+                ),
+            ] {
+                let mut d = driver(resume);
+                select_permission(&mut d, mode);
+                d.take_pending();
+                feed(&mut d, json!({"id":1,"result":{}}));
+                let outgoing = pending_values(&mut d);
+                assert_eq!(outgoing[1]["params"]["sandbox"], thread_mode);
+                assert_eq!(outgoing[1]["params"]["approvalPolicy"], "never");
+                feed(
+                    &mut d,
+                    json!({"id":2,"result":{
+                        "thread":{"id":"thread-1"},"model":"resolved-session-model",
+                        "reasoningEffort":"low","approvalPolicy":"never","sandbox":{"type":turn_mode}
+                    }}),
+                );
+                let outgoing = pending_values(&mut d);
+                assert_eq!(outgoing[0]["method"], "turn/start");
+                assert_eq!(outgoing[0]["params"]["sandboxPolicy"]["type"], turn_mode);
+                assert_eq!(outgoing[0]["params"]["approvalPolicy"], "never");
+                assert_eq!(outgoing[0]["params"]["effort"], "high");
+                if mode == NativePermission::CodexFullAccess {
+                    assert_eq!(
+                        outgoing[0]["params"]["sandboxPolicy"],
+                        json!({"type":"dangerFullAccess"})
+                    );
+                }
+                feed(
+                    &mut d,
+                    json!({"id":3,"result":{"turn":{"id":"turn-1","model":"not-effective","effort":"not-effective"}}}),
+                );
+                answer(&mut d);
+                complete(&mut d, "completed");
+                let (result, error) = d.finish();
+                assert!(error.is_none(), "{error:?}");
+                assert!(result.reported_model.is_none());
+                let evidence = result.selection.unwrap();
+                assert!(evidence.observed.model.is_none());
+                assert_eq!(evidence.verification.model, "session_reported");
+                assert_eq!(evidence.verification.effort, "unknown");
+                assert_eq!(evidence.verification.permission, "session_reported");
+                let settings = evidence.session_settings.unwrap();
+                assert_eq!(settings.model.as_deref(), Some("resolved-session-model"));
+                assert_eq!(settings.effort.as_deref(), Some("low"));
+                assert_eq!(
+                    serde_json::from_str::<Value>(settings.sandbox.as_ref().unwrap()).unwrap(),
+                    json!({"type": turn_mode})
+                );
+            }
+        }
+    }
+    #[test]
+    fn explicit_permission_mismatch_stops_before_turn_and_partial_evidence_stays_unknown() {
+        for settings in [
+            json!({"sandbox":{"type":"dangerFullAccess"},"approvalPolicy":"never"}),
+            json!({"sandbox":{"type":"workspaceWrite"},"approvalPolicy":"on-request"}),
+            json!({"sandbox":"workspace-write","approvalPolicy":{"type":"never"}}),
+        ] {
+            let mut d = driver(None);
+            select_permission(&mut d, NativePermission::CodexWorkspaceWrite);
+            d.take_pending();
+            feed(&mut d, json!({"id":1,"result":{}}));
+            d.take_pending();
+            let mut result = settings;
+            result["thread"] = json!({"id":"thread-1"});
+            feed(&mut d, json!({"id":2,"result":result}));
+            assert!(d.failure().unwrap().contains("native permission mismatch"));
+            assert!(d.stopped());
+            assert!(d.take_pending().is_empty());
+            assert_eq!(
+                d.result.selection.as_ref().unwrap().verification.permission,
+                "mismatch"
+            );
+        }
+        for settings in [
+            json!({}),
+            json!({"sandbox":{"type":"workspaceWrite"}}),
+            json!({"approvalPolicy":"never"}),
+        ] {
+            let mut d = driver(None);
+            select_permission(&mut d, NativePermission::CodexWorkspaceWrite);
+            d.take_pending();
+            feed(&mut d, json!({"id":1,"result":{}}));
+            d.take_pending();
+            let mut result = settings;
+            result["thread"] = json!({"id":"thread-1"});
+            feed(&mut d, json!({"id":2,"result":result}));
+            assert!(d.failure().is_none());
+            assert_eq!(pending_values(&mut d)[0]["method"], "turn/start");
+            assert_eq!(
+                d.result.selection.as_ref().unwrap().verification.permission,
+                "unknown"
+            );
+        }
+    }
+    fn reroute(thread: &str, turn: &str, model: &str) -> Value {
+        json!({"method":"model/rerouted","params":{
+            "threadId":thread,"turnId":turn,"fromModel":"requested-model","toModel":model,"reason":"rateLimit"
+        }})
+    }
+    #[test]
+    fn reroutes_are_exact_turn_evidence_bounded_and_never_main_message_models() {
+        let mut d = driver(None);
+        start(&mut d);
+        for index in 0..10 {
+            feed(
+                &mut d,
+                reroute("thread-1", "turn-1", &format!("route-{index}")),
+            );
+        }
+        assert!(d.failure().is_none());
+        assert!(d.result.reported_model.is_none());
+        let evidence = d.result.selection.as_ref().unwrap();
+        assert_eq!(evidence.verification.model, "rerouted");
+        assert_eq!(evidence.observed.model.as_deref(), Some("route-9"));
+        assert_eq!(evidence.observed.reroutes.len(), 8);
+        assert_eq!(evidence.observed.reroutes[0].to_model, "route-2");
+        assert_eq!(evidence.observed.reroutes[0].from_model, "requested-model");
+        assert!(evidence.truncated);
+        feed(
+            &mut d,
+            json!({"method":"item/completed","params":{
+                "threadId":"thread-1","turnId":"turn-1",
+                "item":{"type":"agentMessage","text":"answer","model":"main-message-model"}
+            }}),
+        );
+        complete(&mut d, "completed");
+        let (result, error) = d.finish();
+        assert!(error.is_none());
+        assert_eq!(result.reported_model.as_deref(), Some("main-message-model"));
+        assert_eq!(
+            result.selection.unwrap().verification.model,
+            "message_reported"
+        );
+        for event in [
+            reroute("other-thread", "turn-1", "model"),
+            reroute("thread-1", "old-turn", "model"),
+        ] {
+            let mut d = driver(Some("thread-1"));
+            start(&mut d);
+            feed(&mut d, event);
+            assert!(d.failure().is_some());
+            assert!(d.result.selection.unwrap().observed.reroutes.is_empty());
+        }
+    }
+    #[test]
+    fn reroutes_cannot_bind_pending_turns_or_accept_unbounded_fields() {
+        let mut d = driver(Some("thread-1"));
+        start_pending(&mut d);
+        feed(&mut d, reroute("thread-1", "old-turn", "model"));
+        assert!(d.failure().is_some());
+        assert!(d.turn.is_none());
+        let mut d = driver(None);
+        start(&mut d);
+        feed(&mut d, reroute("thread-1", "turn-1", &"m".repeat(257)));
+        assert!(d.failure().is_some());
+    }
+
+    #[test]
+    fn thread_sandbox_details_are_preserved_and_bounded_independently_of_kind_checks() {
+        for long in [false, true] {
+            let mut d = driver(None);
+            select_permission(&mut d, NativePermission::CodexWorkspaceWrite);
+            d.take_pending();
+            feed(&mut d, json!({"id":1,"result":{}}));
+            d.take_pending();
+            let policy = json!({"type":"workspaceWrite","networkAccess":true,
+                "writableRoots":[if long { "界".repeat(2000) } else { "/configured/root".into() }]});
+            feed(
+                &mut d,
+                json!({"id":2,"result":{
+                    "thread":{"id":"thread-1"},"sandbox":policy,"approvalPolicy":"never"
+                }}),
+            );
+            assert!(d.failure().is_none());
+            let evidence = d.result.selection.as_ref().unwrap();
+            assert_eq!(evidence.verification.permission, "session_reported");
+            assert_eq!(evidence.truncated, long);
+            let captured = evidence
+                .session_settings
+                .as_ref()
+                .unwrap()
+                .sandbox
+                .as_ref()
+                .unwrap();
+            assert!(captured.len() <= MAX_SESSION_POLICY);
+            assert!(captured.contains("networkAccess"));
+            if !long {
+                assert_eq!(serde_json::from_str::<Value>(captured).unwrap(), policy);
+            }
+            // The server's thread settings are shown as returned, separately
+            // from Relay's subsequent explicit turn policy override.
+            assert_eq!(
+                pending_values(&mut d)[0]["params"]["sandboxPolicy"]["networkAccess"],
+                false
+            );
+            d.result.bound();
+            assert_eq!(d.result.selection.as_ref().unwrap().truncated, long);
+        }
     }
 }

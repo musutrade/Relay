@@ -101,6 +101,11 @@ pub struct HostConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
+    /// Server-owned admission record; external submissions cannot supply this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_binding: Option<crate::selection::RoleBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_selections: Option<crate::selection::RoleSelections>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_quota_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -218,6 +223,7 @@ impl Job {
             }
             (false, None) => {}
         }
+        crate::selection::validate_job(self, config)?;
         Ok(())
     }
 }
@@ -649,6 +655,12 @@ impl Host {
         {
             return RunResult::new(Outcome::Cancelled, None);
         }
+        if job.role_selections.is_some() && job.role_binding.is_none() {
+            return RunResult::new(
+                Outcome::Failure,
+                Some("selected job is missing its server-owned admission binding".into()),
+            );
+        }
         let workspace_state = match crate::workspaces::prepare(&self.config, task, &job) {
             Ok(value) => value,
             Err(result) => return *result,
@@ -764,7 +776,11 @@ impl Host {
                     cancellation: &cancellation,
                 },
                 name,
-                &self.config.workflows[name],
+                &crate::selection::effective_workflow(
+                    job,
+                    &self.config,
+                    &self.config.workflows[name],
+                ),
             );
         }
         // A snapshot needs its own Git boundary even when no reviewed workflow
@@ -835,15 +851,18 @@ impl Host {
                 return result;
             }
         }
-        if let Some(profile) = self.config.native_agents.get(&job.agent) {
-            let command = self.run_native(
-                profile,
+        if let Some(profile) = crate::selection::native_profile(job, &self.config, false)
+            .expect("validated role selection")
+        {
+            let mut command = self.run_native(
+                &profile,
                 &job.requirements,
                 false,
                 &cancellation,
                 (workspace, &repository, false),
                 deadline,
             );
+            crate::selection::annotate(&mut command, job, &self.config, false);
             result.outcome = command.outcome;
             result.agent = Some(command);
             if result.outcome != Outcome::Success {
@@ -1184,6 +1203,7 @@ impl Host {
                     prompt: input.to_owned(),
                     model: profile.model.clone(),
                     effort: profile.effort.clone(),
+                    native_permission: profile.native_permission,
                     resume: session.as_ref().and_then(|s| s.resume.clone()),
                     checkpoint: session.as_ref().map(|s| s.checkpoint()),
                 })
@@ -1958,6 +1978,12 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
             .and_then(|_| errors.drain(&mut stderr))
         {
             error = Some(failure.to_string());
+            break;
+        }
+        if !bidirectional && let Some(failure) = protocol.as_ref().and_then(ProtocolParser::failure)
+        {
+            error = Some(failure.to_owned());
+            outcome = Outcome::Failure;
             break;
         }
         if bidirectional && input_offset == input_bytes.len() {

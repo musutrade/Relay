@@ -202,6 +202,15 @@ pub fn estimate(
     repository: &str,
     workflow: Option<&str>,
 ) -> Result<ResourceEstimate, String> {
+    estimate_with_reviewer(config, repository, workflow, None)
+}
+
+pub fn estimate_with_reviewer(
+    config: &HostConfig,
+    repository: &str,
+    workflow: Option<&str>,
+    reviewer_profile: Option<&str>,
+) -> Result<ResourceEstimate, String> {
     if !valid_name(repository) {
         return Err("repository must be an allowlisted name, not a path".into());
     }
@@ -224,6 +233,30 @@ pub fn estimate(
             Ok(workflow)
         })
         .transpose()?;
+    if let Some(name) = reviewer_profile {
+        let workflow = workflow.ok_or("reviewer_profile requires a workflow")?;
+        if !valid_name(name)
+            || !crate::selection::selectable(
+                &workflow.reviewer,
+                workflow.selectable_reviewers.as_ref(),
+            )
+            .iter()
+            .any(|allowed| allowed == name)
+        {
+            return Err("reviewer_profile is not allowlisted for this workflow".into());
+        }
+        let profile = config
+            .native_agents
+            .get(name)
+            .ok_or("reviewer profile is unavailable")?;
+        if profile.provider != crate::providers::ProviderKind::ClaudeCli
+            || profile
+                .native_permission
+                .is_some_and(|mode| !mode.compatible(profile.provider, true))
+        {
+            return Err("reviewer profile does not meet the fixed reviewer contract".into());
+        }
+    }
     let mut budget = InspectionBudget::new(config);
     let mut notes = vec![
         "Host metadata-only inventory of regular-file logical sizes; no symlinks are followed and no agent claims are used.".into(),
@@ -251,7 +284,7 @@ pub fn estimate(
         .map(|workflow| {
             config
                 .native_agents
-                .get(&workflow.reviewer)
+                .get(reviewer_profile.unwrap_or(&workflow.reviewer))
                 .map(crate::sessions::enabled)
         })
         .unwrap_or(Some(false));

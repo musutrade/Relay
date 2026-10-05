@@ -10,6 +10,7 @@ pub mod http;
 pub mod mcp;
 pub mod providers;
 pub mod resources;
+pub mod selection;
 mod sessions;
 pub mod workflow;
 mod workspaces;
@@ -52,6 +53,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Submission {
+    #[serde(default)]
+    pub permission_challenge: Option<String>,
     pub key: String,
     pub job: Job,
 }
@@ -118,6 +121,7 @@ struct StateData {
     running: Option<(relay::Claim, Arc<AtomicBool>)>,
 }
 pub struct Application {
+    permission_challenges: Mutex<selection::PermissionChallenges>,
     resource_measurements:
         Mutex<std::collections::BTreeMap<(i64, i64), (std::time::Instant, resources::Usage)>>,
     catalogs: Mutex<catalog_cache::CatalogCache>,
@@ -135,6 +139,7 @@ impl Application {
         // Adapter-owned metadata. It does not change the core queue state machine.
         control.execute_batch("CREATE TABLE IF NOT EXISTS app_continuations(predecessor_id INTEGER PRIMARY KEY, key TEXT NOT NULL, payload TEXT NOT NULL, task_id INTEGER); CREATE TABLE IF NOT EXISTS app_cancellations(task_id INTEGER PRIMARY KEY REFERENCES tasks(id)); CREATE TABLE IF NOT EXISTS app_diagnostics(task_id INTEGER PRIMARY KEY, generation INTEGER NOT NULL, result TEXT NOT NULL);")?;
         Ok(Arc::new(Self {
+            permission_challenges: Mutex::new(selection::PermissionChallenges::default()),
             resource_measurements: Mutex::new(std::collections::BTreeMap::new()),
             catalogs: Mutex::new(catalog_cache::CatalogCache::default()),
             state: Mutex::new(StateData {
@@ -147,24 +152,137 @@ impl Application {
             shutdown: AtomicBool::new(false),
         }))
     }
-    pub fn submit(&self, input: Submission) -> Result<Task> {
-        if input.job.continuation.is_some() {
+    pub fn permission_challenge(&self, mut job: Job) -> Result<Value> {
+        if job.continuation.is_some() || job.role_binding.is_some() {
             return Err(Error::Invalid(
-                "use the explicit retry endpoint to continue preserved work".into(),
+                "permission challenges are only for new user-authored selections".into(),
             ));
+        }
+        if job.requirements.trim().is_empty() {
+            job.requirements = "Permission scope preview".into();
+        }
+        // This only previews a scope. The actual submission still requires its
+        // own explicit attestation and the issued, unexpired challenge.
+        if let Some(roles) = &mut job.role_selections {
+            for role in [&mut roles.developer, &mut roles.reviewer]
+                .into_iter()
+                .flatten()
+            {
+                role.confirm_permission_expansion = Some(true);
+            }
+        }
+        job.validate(self.host.config())
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        self.permission_challenges
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .issue(&job, self.host.config())
+            .map_err(Error::Invalid)
+    }
+    pub fn submit(&self, mut input: Submission) -> Result<Task> {
+        if input.job.continuation.is_some() || input.job.role_binding.is_some() {
+            return Err(Error::Invalid(
+                "use explicit continuation endpoints; role_binding is server-owned".into(),
+            ));
+        }
+        let requested =
+            serde_json::to_string(&input.job).map_err(|e| Error::Invalid(e.to_string()))?;
+        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let existing: Option<String> = state
+            .control
+            .query_row(
+                "SELECT payload FROM tasks WHERE key=?1",
+                [&input.key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(payload) = existing {
+            let original_request =
+                serde_json::from_str::<Job>(&payload)
+                    .ok()
+                    .and_then(|mut job| {
+                        if let Some(reference) = job
+                            .role_binding
+                            .as_ref()
+                            .and_then(|binding| binding.acceptance_reference.as_ref())
+                        {
+                            let supplied = input
+                                .permission_challenge
+                                .as_deref()
+                                .and_then(|token| selection::acceptance_reference(token).ok());
+                            if supplied.as_ref() != Some(reference) {
+                                return None;
+                            }
+                        }
+                        job.role_binding = None;
+                        serde_json::to_string(&job).ok()
+                    });
+            if payload == requested || original_request.as_deref() == Some(&requested) {
+                return state.store.submit(&input.key, &payload).map_err(Into::into);
+            }
+            return Err(Error::Core(relay::Error::IdempotencyConflict));
         }
         input
             .job
-            .validate(&self.config)
+            .validate(self.host.config())
             .map_err(|e| Error::Invalid(e.to_string()))?;
+        if let Some(roles) = &input.job.role_selections {
+            let mut cache = self.catalogs.lock().map_err(|_| Error::Poisoned)?;
+            for selection in [&roles.developer, &roles.reviewer].into_iter().flatten() {
+                if let Some(profile) = self.config.native_agents.get(&selection.profile) {
+                    let view = cache.view(&selection.profile, profile);
+                    selection::validate_catalog(selection, &view).map_err(Error::Invalid)?;
+                }
+            }
+        }
+        let expanded = selection::needs_confirmation(&input.job, self.host.config());
+        let mut challenges = self
+            .permission_challenges
+            .lock()
+            .map_err(|_| Error::Poisoned)?;
+        if expanded {
+            challenges
+                .validate(
+                    input.permission_challenge.as_deref(),
+                    &input.job,
+                    self.host.config(),
+                )
+                .map_err(Error::Invalid)?;
+        }
+        if input.job.role_selections.is_some() {
+            input.job.role_binding = Some(
+                selection::binding(&input.job, self.host.config())
+                    .map_err(|e| Error::Invalid(e.to_string()))?,
+            );
+        }
+        if expanded {
+            input
+                .job
+                .role_binding
+                .as_mut()
+                .expect("expanded role binding")
+                .acceptance_reference = Some(
+                selection::acceptance_reference(
+                    input
+                        .permission_challenge
+                        .as_deref()
+                        .expect("validated challenge"),
+                )
+                .map_err(Error::Invalid)?,
+            );
+        }
         let payload =
             serde_json::to_string(&input.job).map_err(|e| Error::Invalid(e.to_string()))?;
-        self.state
-            .lock()
-            .map_err(|_| Error::Poisoned)?
-            .store
-            .submit(&input.key, &payload)
-            .map_err(Into::into)
+        let task = state.store.submit(&input.key, &payload)?;
+        if expanded {
+            challenges.consume(
+                input
+                    .permission_challenge
+                    .as_deref()
+                    .expect("validated challenge"),
+            );
+        }
+        Ok(task)
     }
     /// One explicit successor per predecessor. Reservation precedes core submission,
     /// and its stable key/payload make a crash between the two operations retryable.
@@ -451,7 +569,21 @@ impl Application {
         repository: &str,
         workflow: Option<&str>,
     ) -> Result<resources::ResourceEstimate> {
-        resources::estimate(self.host.config(), repository, workflow).map_err(Error::Invalid)
+        self.resource_estimate_with_reviewer(repository, workflow, None)
+    }
+    pub fn resource_estimate_with_reviewer(
+        &self,
+        repository: &str,
+        workflow: Option<&str>,
+        reviewer_profile: Option<&str>,
+    ) -> Result<resources::ResourceEstimate> {
+        resources::estimate_with_reviewer(
+            self.host.config(),
+            repository,
+            workflow,
+            reviewer_profile,
+        )
+        .map_err(Error::Invalid)
     }
     /// Read a single attempt's operator controls. Filesystem measurements have a
     /// short cache; eligibility and every action are checked independently.
@@ -635,12 +767,16 @@ impl Application {
             .iter()
             .map(|(name, profile)| {
                 json!({"name": name, "provider": profile.provider, "model": profile.model,
-                "effort": profile.effort, "authentication": "unknown"})
+                "effort": profile.effort, "authentication": "unknown",
+                "native_permission":profile.native_permission,"permission_modes":selection::permission_choices(profile),
+                "reviewer_supported":profile.provider == providers::ProviderKind::ClaudeCli && profile.native_permission.is_none_or(|mode|mode.compatible(profile.provider,true))})
             })
             .collect();
         let workflows: Vec<_> = self.config.workflows.iter().map(|(name, workflow)| {
             json!({"name":name,"repository":workflow.repository,"developer":workflow.developer,
-                "reviewer":workflow.reviewer,"test":workflow.test,"max_repairs":workflow.max_repairs})
+                "reviewer":workflow.reviewer,"test":workflow.test,"max_repairs":workflow.max_repairs,
+                "selectable_developers":selection::selectable(&workflow.developer,workflow.selectable_developers.as_ref()),
+                "selectable_reviewers":selection::selectable(&workflow.reviewer,workflow.selectable_reviewers.as_ref())})
         }).collect();
         json!({"repositories":self.config.repositories.keys().collect::<Vec<_>>(),"agents":agents,"native_agents":native_agents,"tests":self.config.tests.keys().collect::<Vec<_>>(),"workflows":workflows})
     }

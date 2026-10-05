@@ -33,6 +33,10 @@ pub struct WorkflowConfig {
     pub repository: String,
     pub developer: String,
     pub reviewer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selectable_developers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selectable_reviewers: Option<Vec<String>>,
     pub test: String,
     /// Trusted acceptance criteria for the reviewer, not developer execution steps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,6 +75,33 @@ impl WorkflowConfig {
         config.native_agents[&self.reviewer]
             .compile(true)
             .map_err(HostError::Config)?;
+        for (reviewer, names) in [
+            (false, &self.selectable_developers),
+            (true, &self.selectable_reviewers),
+        ] {
+            if let Some(names) = names {
+                let unique: std::collections::BTreeSet<_> = names.iter().collect();
+                if names.len() > 64 || unique.len() != names.len() {
+                    return Err(invalid(
+                        "workflow role allowlist must contain at most 64 unique profiles",
+                    ));
+                }
+                for name in names {
+                    if reviewer {
+                        let profile = config.native_agents.get(name).ok_or_else(|| {
+                            invalid("selectable reviewer is not an allowlisted native profile")
+                        })?;
+                        profile.compile(true).map_err(HostError::Config)?;
+                    } else if !config.agents.contains_key(name)
+                        && !config.native_agents.contains_key(name)
+                    {
+                        return Err(invalid(
+                            "selectable developer is not an allowlisted profile",
+                        ));
+                    }
+                }
+            }
+        }
         validate_review_focus(self.review_focus.as_deref()).map_err(HostError::Config)?;
         if !config.tests.contains_key(&self.test) {
             return Err(invalid("workflow requires an allowlisted test profile"));
@@ -101,7 +132,7 @@ impl WorkflowConfig {
     }
     pub fn validate_job(&self, job: &Job) -> Result<(), HostError> {
         if job.repository != self.repository
-            || job.agent != self.developer
+            || (job.agent != self.developer && crate::selection::role(job, false).is_none())
             || job.test.as_ref().is_some_and(|test| test != &self.test)
         {
             return Err(HostError::Job(
@@ -201,6 +232,8 @@ pub struct StageSummary {
     pub outcome: Outcome,
     pub exit_code: Option<i32>,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<crate::providers::SelectionEvidence>,
 }
 impl StageSummary {
     fn from_command(command: &CommandResult) -> Self {
@@ -216,6 +249,10 @@ impl StageSummary {
             outcome: command.outcome,
             exit_code: command.exit_code,
             summary,
+            selection: command
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.selection.clone()),
         }
     }
 }
@@ -332,11 +369,17 @@ impl WorkflowResult {
         let mut changed = false;
         for round in &mut self.rounds {
             changed |= shrink(&mut round.developer.summary);
+            if let Some(selection) = &mut round.developer.selection {
+                changed |= selection.shrink();
+            }
             if let Some(test) = &mut round.tests {
                 changed |= shrink(&mut test.summary);
             }
             if let Some(reviewer) = &mut round.reviewer {
                 changed |= shrink(&mut reviewer.summary);
+                if let Some(selection) = &mut reviewer.selection {
+                    changed |= selection.shrink();
+                }
             }
             if let Some(review) = &mut round.review {
                 changed |= review.shrink();
@@ -439,6 +482,11 @@ pub(crate) struct Execution<'a> {
     pub cancellation: &'a AtomicBool,
 }
 impl Execution<'_> {
+    fn reviewer_profile(&self) -> crate::providers::NativeProfile {
+        crate::selection::native_profile(self.job, self.host.config(), true)
+            .expect("validated role selection")
+            .expect("workflow has native reviewer")
+    }
     fn active(&self) -> Result<(), Stop> {
         if self.cancellation.load(Ordering::Acquire) {
             Err(Stop {
@@ -576,11 +624,13 @@ impl Execution<'_> {
         if let Err(stop) = self.active() {
             return CommandResult::error(stop.outcome, stop.message);
         }
-        if let Some(native) = self.host.config().native_agents.get(name) {
-            let mut native = native.clone();
+        if let Some(mut native) =
+            crate::selection::native_profile(self.job, self.host.config(), read_only)
+                .expect("validated role selection")
+        {
             native.env.extend(self.env(prompt));
             native.env.extend(extra.clone());
-            self.host.run_native(
+            let mut command = self.host.run_native(
                 &native,
                 prompt,
                 read_only,
@@ -596,7 +646,9 @@ impl Execution<'_> {
                             .is_some_and(|c| c.review_only.is_some()),
                 ),
                 self.deadline,
-            )
+            );
+            crate::selection::annotate(&mut command, self.job, self.host.config(), read_only);
+            command
         } else if !read_only {
             self.profile(&self.host.config().agents[name], phase, prompt, extra)
         } else {
@@ -989,12 +1041,11 @@ impl Execution<'_> {
         let base = self.sha(config, source, "HEAD^{commit}")?;
         self.clean(config, source)?;
         let worktree_bytes = self.worktree_bytes(config, source, &base)?;
-        let copies =
-            if crate::sessions::enabled(&self.host.config().native_agents[&config.reviewer]) {
-                2
-            } else {
-                1
-            };
+        let copies = if crate::sessions::enabled(&self.reviewer_profile()) {
+            2
+        } else {
+            1
+        };
         let planned_bytes = worktree_bytes
             .checked_mul(copies)
             .ok_or_else(|| Stop::failure("workspace admission byte count overflow"))?;
@@ -1242,7 +1293,7 @@ fn run(
     context
         .host
         .probe_profile(
-            &context.host.config().native_agents[&config.reviewer],
+            &context.reviewer_profile(),
             true,
             context.cancellation,
             context.workspace,
@@ -1407,7 +1458,7 @@ fn run_review_only(
     }
     let candidate = &continuation.candidate_sha;
     context.verify(config, candidate)?;
-    let reviewer = &context.host.config().native_agents[&config.reviewer];
+    let reviewer = &context.reviewer_profile();
     if crate::sessions::enabled(reviewer) {
         let reviewer_repository = context.workspace.join("reviewer-repository");
         let reviewer_candidate =
@@ -1522,7 +1573,7 @@ fn review_candidate(
     let patch = context.patch(config, base, candidate, round)?;
     // One fixed review checkout, separate from developer files and conversation.
     // Legacy stateless reviewers keep their established guarded cwd contract.
-    let isolated = crate::sessions::enabled(&context.host.config().native_agents[&config.reviewer]);
+    let isolated = crate::sessions::enabled(&context.reviewer_profile());
     let reviewer_repository = if isolated {
         if context
             .job

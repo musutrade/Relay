@@ -387,6 +387,7 @@ fn absent_quota_keeps_legacy_job_bytes_and_old_workspace_record_reusable() {
     assert_eq!(serde_json::to_value(&job).unwrap(), legacy);
     let app = f.open();
     app.submit(Submission {
+        permission_challenge: None,
         key: "legacy".into(),
         job,
     })

@@ -135,7 +135,7 @@ impl ProfileCatalog {
                 )
             } else {
                 Capability::unsupported(
-                    "Relay cannot disable Codex project MCP/hooks under the supported reviewer contract",
+                    "Relay has not verified the complete Codex no-execution, hooks, MCP and configuration-loading reviewer isolation contract",
                     "relay:reviewer_contract",
                 )
             },
@@ -344,7 +344,9 @@ pub fn discover(host: &Host, profile: &NativeProfile) -> ProfileCatalog {
     }
     let cancellation = AtomicBool::new(false);
     let deadline = Instant::now() + Duration::from_secs(10);
-    match host.probe_profile(profile, false, &cancellation, &workspace, deadline) {
+    let reviewer_only =
+        profile.native_permission == Some(crate::providers::NativePermission::ClaudeRestricted);
+    match host.probe_profile(profile, reviewer_only, &cancellation, &workspace, deadline) {
         Ok(probe) => {
             catalog.process_cleanup = Capability::supported(
                 "Version/help subprocess trees stopped and were reaped",
@@ -356,7 +358,7 @@ pub fn discover(host: &Host, profile: &NativeProfile) -> ProfileCatalog {
                 HELP_SOURCE,
             );
             catalog.permission_control = Capability::unknown(
-                "Relay uses fixed non-escalating permission parameters; version/help checks do not prove runtime enforcement; no approval was granted",
+                "Adapter interface checks passed; requested native permission settings, runtime enforcement and mode eligibility remain unverified; no permission was granted",
                 "relay:adapter_contract",
             );
             if profile.provider == ProviderKind::ClaudeCli {
