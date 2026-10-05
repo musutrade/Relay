@@ -30,11 +30,13 @@ pub fn router_with_auth(app: Arc<Application>, auth: Auth) -> Router {
     };
     let api = Router::new()
         .route("/config", get(config))
+        .route("/resources", get(resources))
         .route("/capabilities", get(capabilities))
         .route("/capabilities/{name}/refresh", post(refresh_capabilities))
         .route("/status", get(status))
         .route("/tasks", get(list).post(submit))
         .route("/tasks/{id}", get(detail))
+        .route("/tasks/{id}/operator", get(operator))
         .route("/tasks/{id}/cancel", post(cancel))
         .route("/tasks/{id}/retry", post(retry))
         .route("/tasks/{id}/continue-review", post(continue_review))
@@ -138,6 +140,32 @@ async fn index() -> Response {
 async fn config(State(state): State<Web>) -> Json<Value> {
     Json(state.app.public_config())
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourceQuery {
+    repository: String,
+    workflow: Option<String>,
+}
+async fn resources(
+    State(state): State<Web>,
+    Query(query): Query<ResourceQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || {
+        state
+            .app
+            .resource_estimate(&query.repository, query.workflow.as_deref())
+    })
+    .await
+    .map_err(|_| Error::Poisoned)??;
+    Ok(Json(json!(result)))
+}
+async fn operator(State(state): State<Web>, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        tokio::task::spawn_blocking(move || state.app.operator(id))
+            .await
+            .map_err(|_| Error::Poisoned)??,
+    ))
+}
 async fn capabilities(State(state): State<Web>) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!({"profiles": state.app.capabilities()?})))
 }
@@ -207,7 +235,8 @@ impl IntoResponse for ApiError {
             Error::Core(relay::Error::NotFound) => StatusCode::NOT_FOUND,
             Error::Core(relay::Error::IdempotencyConflict | relay::Error::StaleClaim)
             | Error::RecoveryRequired
-            | Error::DiscoveryUnavailable(_) => StatusCode::CONFLICT,
+            | Error::DiscoveryUnavailable(_)
+            | Error::ActionUnavailable { .. } => StatusCode::CONFLICT,
             Error::Core(relay::Error::Invalid(_)) | Error::Invalid(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -217,6 +246,17 @@ impl IntoResponse for ApiError {
         } else {
             self.0.to_string()
         };
-        (status, Json(json!({"error":message}))).into_response()
+        let failure = match &self.0 {
+            Error::ActionUnavailable { code, cause } => {
+                Some(crate::resources::Failure::new(code, "request", cause))
+            }
+            Error::Invalid(cause) => Some(crate::resources::Failure::new(
+                "invalid_request",
+                "request",
+                cause,
+            )),
+            _ => None,
+        };
+        (status, Json(json!({"error":message,"failure":failure}))).into_response()
     }
 }

@@ -281,12 +281,18 @@ fn explicitly_retried_failed_app_server_turn_resumes_checkpointed_id_and_files()
     app.retry(
         1,
         relay_app::RetryRequest {
+            workspace_quota_bytes: None,
             key: "continue".into(),
             confirm_stopped_and_reconciled: true,
         },
     )
     .unwrap();
-    app.work_once().unwrap();
+    app.work_once().unwrap_or_else(|error| {
+        panic!(
+            "continued execution failed: {error}; application status: {:?}",
+            app.status()
+        )
+    });
     let next: relay_app::host::RunResult =
         serde_json::from_str(app.get(2).unwrap().result.as_ref().unwrap()).unwrap();
     assert_eq!(next.outcome, Outcome::Success, "{next:?}");

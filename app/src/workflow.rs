@@ -369,14 +369,43 @@ fn valid_sha(value: &str) -> bool {
 }
 #[derive(Debug)]
 struct Stop {
+    failure: Box<Option<crate::resources::Failure>>,
     outcome: Outcome,
     message: String,
 }
 impl Stop {
     fn failure(message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
+            failure: Box::new(Some(crate::resources::Failure::new(
+                "workflow_guard_failed",
+                "workflow_guard",
+                message.clone(),
+            ))),
             outcome: Outcome::Failure,
-            message: message.into(),
+            message,
+        }
+    }
+    fn typed(code: &str, stage: &str, message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            failure: Box::new(Some(crate::resources::Failure::new(
+                code,
+                stage,
+                message.clone(),
+            ))),
+            outcome: Outcome::Failure,
+            message,
+        }
+    }
+    fn resource(error: std::io::Error) -> Self {
+        Self {
+            failure: Box::new(Some(crate::resources::failure_from_io(
+                &error,
+                "workspace_admission",
+            ))),
+            outcome: Outcome::Failure,
+            message: error.to_string(),
         }
     }
     fn command(command: &CommandResult, phase: &str) -> Self {
@@ -386,6 +415,13 @@ impl Stop {
             .unwrap_or_else(|| command.stderr.clone());
         truncate(&mut detail, 512);
         Self {
+            failure: Box::new(command.failure.clone().or_else(|| {
+                Some(crate::resources::Failure::new(
+                    "command_failed",
+                    phase,
+                    detail.clone(),
+                ))
+            })),
             outcome: command.outcome,
             message: format!("{phase} stopped: {detail}"),
         }
@@ -406,11 +442,21 @@ impl Execution<'_> {
     fn active(&self) -> Result<(), Stop> {
         if self.cancellation.load(Ordering::Acquire) {
             Err(Stop {
+                failure: Box::new(Some(crate::resources::Failure::new(
+                    "execution_cancelled",
+                    "workflow",
+                    "workflow cancelled",
+                ))),
                 outcome: Outcome::Cancelled,
                 message: "workflow cancelled".into(),
             })
         } else if Instant::now() >= self.deadline {
             Err(Stop {
+                failure: Box::new(Some(crate::resources::Failure::new(
+                    "execution_timed_out",
+                    "workflow",
+                    "workflow total deadline elapsed",
+                ))),
                 outcome: Outcome::TimedOut,
                 message: "workflow total deadline elapsed".into(),
             })
@@ -822,7 +868,7 @@ impl Execution<'_> {
     }
     fn admit_worktree(&self, bytes: u64) -> Result<(), Stop> {
         crate::host::check_workspace_admission(self.workspace, self.host.config(), bytes)
-            .map_err(|error| Stop::failure(error.to_string()))
+            .map_err(Stop::resource)
     }
     fn prepare_reviewer(&self, config: &WorkflowConfig, candidate: &str) -> Result<PathBuf, Stop> {
         let repository = self.workspace.join("reviewer-repository");
@@ -1180,6 +1226,7 @@ pub(crate) fn execute(context: Execution<'_>, name: &str, config: &WorkflowConfi
         Ok(()) => result.outcome = Outcome::Success,
         Err(stop) => {
             result.outcome = stop.outcome;
+            result.failure = *stop.failure;
             result.error = Some(stop.message);
         }
     }
@@ -1305,7 +1352,9 @@ fn run(
         context.verify(config, &candidate)?;
         if ordinary_failure {
             if round == config.max_repairs {
-                return Err(Stop::failure(
+                return Err(Stop::typed(
+                    "tests_failed",
+                    "tests",
                     "tests failed; workflow repair budget exhausted",
                 ));
             }
@@ -1325,7 +1374,9 @@ fn run(
             return finish_approved(context, config, result, workflow, &base, &candidate);
         }
         if round == config.max_repairs {
-            return Err(Stop::failure(
+            return Err(Stop::typed(
+                "review_changes_requested",
+                "review",
                 "review requested changes; workflow repair budget exhausted",
             ));
         }
@@ -1433,7 +1484,9 @@ fn run_review_only(
     if verdict == ReviewVerdict::Approved {
         finish_approved(context, config, result, workflow, base, candidate)
     } else {
-        Err(Stop::failure(
+        Err(Stop::typed(
+            "review_changes_requested",
+            "review",
             "review requested changes; review-only continuation never runs development or repairs; use normal continuation to change code",
         ))
     }
@@ -1536,14 +1589,22 @@ fn review_candidate(
     if reviewer.outcome != Outcome::Success {
         return Err(Stop::command(&reviewer, "reviewer"));
     }
-    let provider = reviewer
-        .provider
-        .as_ref()
-        .ok_or_else(|| Stop::failure("native reviewer did not produce normalized output"))?;
+    let provider = reviewer.provider.as_ref().ok_or_else(|| {
+        Stop::typed(
+            "review_verdict_invalid",
+            "review",
+            "native reviewer did not produce normalized output",
+        )
+    })?;
     if provider.summary_truncated {
-        return Err(Stop::failure("reviewer verdict was truncated"));
+        return Err(Stop::typed(
+            "review_verdict_invalid",
+            "review",
+            "reviewer verdict was truncated",
+        ));
     }
-    let review = ReviewResult::parse(&provider.summary, candidate)?;
+    let review = ReviewResult::parse(&provider.summary, candidate)
+        .map_err(|stop| Stop::typed("review_verdict_invalid", "review", stop.message))?;
     let verdict = review.verdict;
     workflow.rounds.last_mut().expect("round recorded").review = Some(review);
     Ok(verdict)
@@ -1718,6 +1779,11 @@ fn publish(
     {
         workflow.reconciliation_required = true;
         return Err(Stop {
+            failure: Box::new(Some(crate::resources::Failure::new(
+                "publication_reconciliation_required",
+                "publication",
+                "publication outcome requires remote reconciliation; do not retry automatically",
+            ))),
             outcome: if outcome == Outcome::Unknown {
                 Outcome::Unknown
             } else {
