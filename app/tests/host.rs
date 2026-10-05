@@ -487,9 +487,10 @@ fn pre_cancelled_job_creates_no_workspace() {
 #[test]
 fn workspace_growth_and_retention_limits_fail_closed() {
     let mut fixture = Fixture::new("head -c 65536 /dev/zero > large.bin; sleep 60");
-    fixture.config.max_snapshot_bytes = 1024;
+    fixture.config.max_snapshot_bytes = 16 * 1024;
     let result = fixture.run(&fixture.task(1));
     assert_eq!(result.outcome, Outcome::Failure, "{}", result.to_json());
+    assert!(fixture.workspace(1).join("large.bin").exists());
     assert!(
         result
             .agent
@@ -881,4 +882,88 @@ fn native_codex_item_failure_can_recover_but_fatal_errors_cannot() {
             assert!(command.error.is_none());
         }
     }
+}
+
+#[test]
+fn trusted_storage_limits_are_finite_and_legacy_defaults_are_preserved() {
+    let fixture = Fixture::new("true");
+    assert_eq!(fixture.config.max_snapshot_bytes, 50 * 1024 * 1024);
+    assert_eq!(fixture.config.max_workspace_bytes, None);
+    assert_eq!(
+        fixture.config.workspace_byte_limit(),
+        fixture.config.max_snapshot_bytes
+    );
+    let mut config = fixture.config.clone();
+    config.max_snapshot_bytes = 2 * 1024 * 1024 * 1024;
+    assert!(Host::new(config.clone()).is_ok());
+    config.max_workspace_bytes = Some(4 * 1024 * 1024 * 1024);
+    assert!(Host::new(config.clone()).is_ok());
+    for invalid in [0, 1024u64.pow(4) + 1, u64::MAX] {
+        config.max_workspace_bytes = Some(invalid);
+        assert!(Host::new(config.clone()).is_err());
+        config.max_workspace_bytes = None;
+        config.max_snapshot_bytes = invalid;
+        assert!(Host::new(config.clone()).is_err());
+        config.max_snapshot_bytes = fixture.config.max_snapshot_bytes;
+    }
+    let serialized = serde_json::to_string(&fixture.config).unwrap();
+    for invalid in ["-1", "1.5", "18446744073709551616", "\"2000000000\""] {
+        let text = format!("{{\"max_workspace_bytes\":{invalid},{}", &serialized[1..]);
+        assert!(serde_json::from_str::<HostConfig>(&text).is_err());
+    }
+    let text = format!("{{\"max_workspace_bytes\":null,{}", &serialized[1..]);
+    let null: HostConfig = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        null.workspace_byte_limit(),
+        fixture.config.max_snapshot_bytes
+    );
+}
+
+#[test]
+fn sparse_running_files_above_one_gib_use_explicit_whole_task_quota() {
+    let mut fixture = Fixture::new("truncate -s 1280M sparse; printf finished");
+    fixture.config.max_snapshot_bytes = 1024 * 1024;
+    fixture.config.max_workspace_bytes = Some(2 * 1024 * 1024 * 1024);
+    let result = fixture.run(&fixture.task(1));
+    assert_eq!(result.outcome, Outcome::Success, "{}", result.to_json());
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(fixture.workspace(1).join("sparse")).unwrap();
+    assert_eq!(metadata.len(), 1280 * 1024 * 1024);
+    assert!(metadata.blocks() * 512 < 1024 * 1024);
+    fixture.config.max_workspace_bytes = Some(1024 * 1024 * 1024);
+    let result = fixture.run(&fixture.task(2));
+    assert_eq!(result.outcome, Outcome::Failure, "{}", result.to_json());
+    assert!(
+        result
+            .agent
+            .unwrap()
+            .error
+            .unwrap()
+            .contains("max_workspace_bytes=1073741824")
+    );
+}
+
+#[test]
+fn snapshot_admission_rejects_sparse_oversize_before_copy_and_agent() {
+    let mut fixture = Fixture::new("touch agent-started");
+    let source = &fixture.config.repositories["fixture"];
+    let file = fs::File::create(source.join("large")).unwrap();
+    file.set_len(1280 * 1024 * 1024).unwrap();
+    fixture.config.max_snapshot_bytes = 2 * 1024 * 1024 * 1024;
+    fixture.config.max_workspace_bytes = Some(1024 * 1024 * 1024);
+    let result = fixture.run(&fixture.task(1));
+    assert_eq!(result.outcome, Outcome::Failure, "{}", result.to_json());
+    assert!(result.error.unwrap().contains("workspace admission"));
+    assert!(!fixture.workspace(1).join("large").exists());
+    assert!(!fixture.workspace(1).join("agent-started").exists());
+    fixture.config.max_snapshot_bytes = 1024;
+    fixture.config.max_workspace_bytes = Some(2 * 1024 * 1024 * 1024);
+    let result = fixture.run(&fixture.task(2));
+    assert!(
+        result
+            .error
+            .unwrap()
+            .contains("snapshot byte limit exceeded")
+    );
+    assert!(!fixture.workspace(2).join("large").exists());
 }

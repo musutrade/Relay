@@ -24,6 +24,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+// Trusted-host logical-byte budgets stay finite, independently of disk capacity.
+const MAX_STORAGE_BYTES: u64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
 const MAX_REQUIREMENTS: usize = 32 * 1024;
 pub(crate) const MAX_PHASE_INPUT: usize = 64 * 1024;
 const MAX_CONFIG_BYTES: usize = 256 * 1024;
@@ -80,6 +82,9 @@ pub struct HostConfig {
     pub output_limit_bytes: usize,
     #[serde(default = "default_snapshot_bytes")]
     pub max_snapshot_bytes: u64,
+    /// Whole task tree, including Git and reviewer copies. Omission preserves legacy behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_workspace_bytes: Option<u64>,
     #[serde(default = "default_snapshot_entries")]
     pub max_snapshot_entries: usize,
     #[serde(default = "default_retained_workspaces")]
@@ -123,6 +128,10 @@ pub enum HostError {
 }
 
 impl HostConfig {
+    pub fn workspace_byte_limit(&self) -> u64 {
+        self.max_workspace_bytes.unwrap_or(self.max_snapshot_bytes)
+    }
+
     pub fn load(path: impl AsRef<Path>) -> Result<Self, HostError> {
         let mut bytes = Vec::new();
         File::open(path)?
@@ -358,11 +367,17 @@ impl Host {
                 "output_limit_bytes must be between 1 and 8192".into(),
             ));
         }
-        if config.max_snapshot_bytes == 0
-            || config.max_snapshot_bytes > 1024 * 1024 * 1024
-            || config.max_snapshot_entries == 0
-            || config.max_snapshot_entries > 100_000
-        {
+        for (name, bytes) in [
+            ("max_snapshot_bytes", config.max_snapshot_bytes),
+            ("max_workspace_bytes", config.workspace_byte_limit()),
+        ] {
+            if !(1..=MAX_STORAGE_BYTES).contains(&bytes) {
+                return Err(HostError::Config(format!(
+                    "{name} must be between 1 and {MAX_STORAGE_BYTES} bytes (1 TiB)"
+                )));
+            }
+        }
+        if config.max_snapshot_entries == 0 || config.max_snapshot_entries > 100_000 {
             return Err(HostError::Config(
                 "snapshot limit is outside supported bounds".into(),
             ));
@@ -568,6 +583,15 @@ impl Host {
                 cancellation: &cancellation,
             };
             if job.workflow.is_none() {
+                inspect_snapshot(&self.config.repositories[&job.repository], &mut budget)?;
+                let additional = budget
+                    .bytes
+                    .checked_add(job.requirements.len() as u64)
+                    .and_then(|bytes| bytes.checked_add(serde_json::to_vec(job).ok()?.len() as u64))
+                    .ok_or_else(|| io::Error::other("snapshot admission byte count overflow"))?;
+                check_workspace_admission(workspace, &self.config, additional)?;
+                budget.bytes = 0;
+                budget.entries = 0;
                 copy_snapshot(
                     &self.config.repositories[&job.repository],
                     &repository,
@@ -1054,6 +1078,10 @@ impl Host {
         workspace: &Path,
         phase: &str,
     ) -> CommandResult {
+        // Reject an already oversized task before starting any command or model.
+        if let Err(error) = check_workspace_budget(workspace, &self.config) {
+            return CommandResult::error(Outcome::Failure, error.to_string());
+        }
         let lease = match self.leases.lock() {
             Ok(leases) => leases.get(workspace).cloned(),
             Err(_) => {
@@ -1319,6 +1347,46 @@ impl SnapshotBudget<'_> {
         Ok(())
     }
 }
+// Metadata-only lower-bound admission; copy_snapshot still checks changing inputs.
+fn inspect_snapshot(source: &Path, budget: &mut SnapshotBudget<'_>) -> io::Result<()> {
+    for entry in fs::read_dir(source)? {
+        budget.check()?;
+        let entry = entry?;
+        if snapshot_excluded(&entry.file_name()) {
+            continue;
+        }
+        budget.entries += 1;
+        if budget.entries > budget.config.max_snapshot_entries {
+            return Err(io::Error::other("snapshot entry limit exceeded"));
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.is_dir() {
+            inspect_snapshot(&entry.path(), budget)?;
+        } else if metadata.is_file() {
+            budget.bytes = budget
+                .bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| io::Error::other("snapshot admission byte count overflow"))?;
+            if budget.bytes > budget.config.max_snapshot_bytes {
+                return Err(io::Error::other(format!(
+                    "snapshot byte limit exceeded: at least {} logical bytes, max_snapshot_bytes={}",
+                    budget.bytes, budget.config.max_snapshot_bytes
+                )));
+            }
+        } else {
+            return Err(io::Error::other(
+                "snapshot rejects symlink or special files",
+            ));
+        }
+    }
+    Ok(())
+}
+fn snapshot_excluded(name: &std::ffi::OsStr) -> bool {
+    [".git", "target", "node_modules"]
+        .iter()
+        .any(|excluded| name == *excluded)
+}
+
 fn copy_snapshot(
     source: &Path,
     destination: &Path,
@@ -1328,10 +1396,7 @@ fn copy_snapshot(
         budget.check()?;
         let entry = entry?;
         let name = entry.file_name();
-        if [".git", "target", "node_modules"]
-            .iter()
-            .any(|excluded| name == *excluded)
-        {
+        if snapshot_excluded(&name) {
             continue;
         }
         budget.entries += 1;
@@ -1389,6 +1454,29 @@ fn copy_snapshot(
 
 /// Best-effort admission/running limit, not a disk quota or a filesystem sandbox.
 fn check_workspace_budget(root: &Path, config: &HostConfig) -> io::Result<()> {
+    workspace_bytes(root, config).map(|_| ())
+}
+
+/// Includes the whole task tree; callers can check an estimated additional copy.
+pub(crate) fn check_workspace_admission(
+    root: &Path,
+    config: &HostConfig,
+    additional_bytes: u64,
+) -> io::Result<()> {
+    let present = workspace_bytes(root, config)?;
+    let required = present
+        .checked_add(additional_bytes)
+        .ok_or_else(|| io::Error::other("workspace admission byte count overflow"))?;
+    if required > config.workspace_byte_limit() {
+        return Err(io::Error::other(format!(
+            "workspace admission estimate is {required} logical bytes ({present} present + {additional_bytes} planned file bytes), exceeding max_workspace_bytes={} (omitted: max_snapshot_bytes); Git objects, checkpoints and build growth may require more",
+            config.workspace_byte_limit()
+        )));
+    }
+    Ok(())
+}
+
+fn workspace_bytes(root: &Path, config: &HostConfig) -> io::Result<u64> {
     let mut directories = vec![root.to_path_buf()];
     let mut entries = 0usize;
     let mut bytes = 0u64;
@@ -1419,12 +1507,15 @@ fn check_workspace_budget(root: &Path, config: &HostConfig) -> io::Result<()> {
                 bytes = bytes.saturating_add(metadata.len());
             }
             // Never follow new symlinks while inspecting a running workspace.
-            if bytes > config.max_snapshot_bytes {
-                return Err(io::Error::other("running workspace byte limit exceeded"));
+            if bytes > config.workspace_byte_limit() {
+                return Err(io::Error::other(format!(
+                    "running workspace byte limit exceeded: at least {bytes} logical bytes, max_workspace_bytes={} (omitted: max_snapshot_bytes); includes Git metadata, reviewer copies and task control files",
+                    config.workspace_byte_limit()
+                )));
             }
         }
     }
-    Ok(())
+    Ok(bytes)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2030,5 +2121,51 @@ mod capture_tests {
         assert!(output.eof);
         assert!(output.truncated);
         assert!(parser.finish().1.unwrap().contains("error"));
+    }
+}
+
+#[cfg(test)]
+mod workspace_budget_tests {
+    use super::*;
+    #[test]
+    fn logical_accounting_includes_git_reviewers_controls_and_no_symlink_targets() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config: HostConfig = serde_json::from_value(serde_json::json!({
+            "workspace_root":temp.path(), "repositories":{},
+            "max_snapshot_bytes":1, "max_workspace_bytes": 2 * 1024u64.pow(3)
+        }))
+        .unwrap();
+        let sizes = [
+            ("repository/source", 600 * 1024u64.pow(2)),
+            ("repository/.git/objects/pack", 100 * 1024u64.pow(2)),
+            ("reviewer-repository/source", 600 * 1024u64.pow(2)),
+            (
+                "reviewer-repository/.git/objects/pack",
+                100 * 1024u64.pow(2),
+            ),
+            ("last-result.json", 16 * 1024),
+        ];
+        for (name, bytes) in sizes {
+            let path = temp.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            File::create(path).unwrap().set_len(bytes).unwrap();
+        }
+        std::os::unix::fs::symlink("/", temp.path().join("link")).unwrap();
+        let total: u64 = sizes.iter().map(|(_, bytes)| bytes).sum();
+        assert_eq!(workspace_bytes(temp.path(), &config).unwrap(), total);
+        config.max_workspace_bytes = Some(total);
+        check_workspace_admission(temp.path(), &config, 0).unwrap();
+        assert!(check_workspace_admission(temp.path(), &config, 1).is_err());
+        assert!(check_workspace_admission(temp.path(), &config, u64::MAX).is_err());
+        config.max_workspace_bytes = Some(total - 1);
+        assert!(check_workspace_budget(temp.path(), &config).is_err());
+        config.max_workspace_bytes = Some(2 * 1024u64.pow(3));
+        config.max_snapshot_entries = 1;
+        assert!(
+            check_workspace_budget(temp.path(), &config)
+                .unwrap_err()
+                .to_string()
+                .contains("entry limit")
+        );
     }
 }

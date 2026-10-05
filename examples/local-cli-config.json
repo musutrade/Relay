@@ -56,6 +56,7 @@
   "timeout_seconds": 300,
   "output_limit_bytes": 2048,
   "max_snapshot_bytes": 52428800,
+  "max_workspace_bytes": 4294967296,
   "max_snapshot_entries": 20000,
   "max_retained_workspaces": 20
 }
