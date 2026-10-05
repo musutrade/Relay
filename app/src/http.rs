@@ -40,6 +40,10 @@ pub fn router_with_auth(app: Arc<Application>, auth: Auth) -> Router {
         .route("/tasks/{id}/operator", get(operator))
         .route("/tasks/{id}/cancel", post(cancel))
         .route("/tasks/{id}/retry", post(retry))
+        .route(
+            "/tasks/{id}/replacement-challenge",
+            post(replacement_challenge),
+        )
         .route("/tasks/{id}/continue-review", post(continue_review))
         .layer(DefaultBodyLimit::max(96 * 1024))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
@@ -217,6 +221,13 @@ async fn submit(
     Json(input): Json<Submission>,
 ) -> Result<(StatusCode, Json<relay::Task>), ApiError> {
     Ok((StatusCode::CREATED, Json(state.app.submit(input)?)))
+}
+async fn replacement_challenge(
+    State(state): State<Web>,
+    Path(id): Path<i64>,
+    Json(input): Json<crate::ReplacementChallengeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(state.app.replacement_challenge(id, input)?))
 }
 async fn retry(
     State(state): State<Web>,

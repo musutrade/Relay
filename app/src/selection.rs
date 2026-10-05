@@ -397,7 +397,7 @@ fn frozen_role(
         native_permission: native.as_ref().and_then(|p| p.native_permission),
     }))
 }
-fn secure_fingerprint(value: &impl Serialize) -> Result<String, String> {
+pub(crate) fn secure_fingerprint(value: &impl Serialize) -> Result<String, String> {
     use blake2::{Blake2s256, Digest};
     let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     let digest = Blake2s256::digest(bytes);
@@ -485,6 +485,11 @@ fn challenge_scope(job: &Job) -> Result<String, String> {
         }
     }
     serde_json::to_string(&json!({"repository":job.repository,"workflow":job.workflow,"agent":job.agent,"roles":roles})).map_err(|e|e.to_string())
+}
+fn replacement_scope(job: &Job, predecessor: i64, reviewer: bool) -> Result<String, String> {
+    secure_fingerprint(
+        &json!({"predecessor_task_id":predecessor,"action":if reviewer {"continue_review"} else {"retry"},"role":if reviewer {"reviewer"} else {"developer"},"selection":challenge_scope(job)?}),
+    )
 }
 const CHALLENGE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 #[derive(Default)]
@@ -574,6 +579,50 @@ impl PermissionChallenges {
         }
         Ok(())
     }
+    pub(crate) fn issue_replacement(
+        &mut self,
+        job: &Job,
+        config: &HostConfig,
+        predecessor: i64,
+        reviewer: bool,
+    ) -> Result<Value, String> {
+        let mut response = self.issue(job, config)?;
+        let token = response["challenge"]
+            .as_str()
+            .expect("issued challenge")
+            .to_owned();
+        self.entries
+            .get_mut(&token)
+            .expect("issued challenge")
+            .scope = replacement_scope(job, predecessor, reviewer)?;
+        response["scope"]["predecessor_task_id"] = json!(predecessor);
+        response["scope"]["action"] = json!(if reviewer { "continue_review" } else { "retry" });
+        response["scope"]["role"] = json!(if reviewer { "reviewer" } else { "developer" });
+        Ok(response)
+    }
+    pub(crate) fn validate_replacement(
+        &self,
+        token: Option<&str>,
+        job: &Job,
+        config: &HostConfig,
+        predecessor: i64,
+        reviewer: bool,
+    ) -> Result<(), String> {
+        let token = token
+            .filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or("replacement permission expansion requires a current server-issued challenge")?;
+        let entry = self
+            .entries
+            .get(token)
+            .ok_or("replacement permission challenge is missing, consumed, or expired")?;
+        if entry.expires <= std::time::Instant::now()
+            || entry.scope != replacement_scope(job, predecessor, reviewer)?
+            || entry.policy != binding(job, config).map_err(|e| e.to_string())?
+        {
+            return Err("replacement permission challenge differs from predecessor, action, role selection, or composed host policy".into());
+        }
+        Ok(())
+    }
     pub(crate) fn consume(&mut self, token: &str) {
         self.entries.remove(token);
     }
@@ -617,5 +666,28 @@ mod challenge_tests {
         cache.entries.get_mut(token).unwrap().expires =
             std::time::Instant::now() - std::time::Duration::from_secs(1);
         assert!(cache.validate(Some(token), &job, &config).is_err());
+        let response = cache.issue_replacement(&job, &config, 1, false).unwrap();
+        let token = response["challenge"].as_str().unwrap();
+        cache
+            .validate_replacement(Some(token), &job, &config, 1, false)
+            .unwrap();
+        assert!(cache.validate(Some(token), &job, &config).is_err());
+        assert!(
+            cache
+                .validate_replacement(Some(token), &job, &config, 2, false)
+                .is_err()
+        );
+        assert!(
+            cache
+                .validate_replacement(Some(token), &job, &config, 1, true)
+                .is_err()
+        );
+        cache.entries.get_mut(token).unwrap().expires =
+            std::time::Instant::now() - std::time::Duration::from_secs(1);
+        assert!(
+            cache
+                .validate_replacement(Some(token), &job, &config, 1, false)
+                .is_err()
+        );
     }
 }

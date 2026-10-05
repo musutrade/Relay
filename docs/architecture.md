@@ -114,3 +114,7 @@ HTTP worker 遇到 host Unknown 或落库失败仍保留 claimed，不按时间�
 `app/src/selection.rs` 管理有界的 developer/reviewer 选择、一次配置的宿主 profile/mode allowlist、新鲜目录来源核对和未验证手工模型回退。每个角色独立克隆原生 profile 后执行，不能改程序、环境或审查隔离。新增权限扩大须先取得绑定精确角色/当前策略的短期一次 challenge，再显式确认；challenge 不等于人类同意或访问授权。服务端把非敏感解析值与策略/程序身份摘要封入所选 job，排队后漂移拒绝启动，目录缓存不授予访问权。旧字段省略时保持 payload/profile/工作区/会话指纹；已接受任务的精确重放不依赖瞬时目录状态，后续继续仅继承不可变选择。资源估算使用被选中的 reviewer。供应商结果把请求、服务端会话设置、主消息/作用域 reroute 证据分开保存，缺失遥测保持未知；不增加核心业务状态，见[角色选择](native-role-selection.md)。
 
 新的权限范围/准入记录用 BLAKE2s-256 摘要，不存凭据值或原 challenge；`blake2` 原已是 Argon2 的锁定传递依赖，应用新增直接引用，不引入新下载包。旧工作区/会话 FNV 漂移指纹保持不变。Challenge 只在核心提交成功后消费；精确已接受重放先核对原始请求与原确认 reference，再检查当前临时目录/挑战状态，不产生第二个任务。
+
+## 已停止阶段的显式角色替换
+
+`app/src/replacement.rs` 将宿主停止阶段、原轮次/剩余修复预算、独立前置结果/工作区证明与新选择接纳分开。唯一后继预留在 immediate transaction 及工作区 lease 内冻结有界交接、紧邻前置摘要与新角色 epoch；执行前再次检查，未改变角色的接纳和会话继续继承。Job 的持久 role_epochs 不随 continuation 规范化删除，旧会话文件不覆盖；首次会话创建允许标记在 provider 启动前消费。缺少阶段证明、无法完整保留反馈、原策略漂移或 reviewer checkout 拓扑转换均明确拒绝，不修改队列内核或初始化备用目录。详见[阶段替换](adapter-stage-continuation.md)。

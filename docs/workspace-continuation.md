@@ -74,3 +74,7 @@ MCP 使用 `relay_continue_review`，参数同上并增加 `id`。`review_focus`
 启用会话续接时使用原来兼容的 reviewer session；不静默换新会话或放宽 max_turns、费用、模型和工具权限。每次显式操作是新的有界 CLI invocation，继续沿用配置中的单次预算。会话 ID 缺失、profile/path/role 绑定不兼容时明确失败。旧任务即使没有新的测试证据记录也可使用复验路径，但仍须已有有效的固定工作区 claim、base/candidate checkpoint、已停止结果和需要续接的会话 ID。仅凭上传日志不能保证实际宿主现场已就绪。
 
 普通继续和仅继续审查共享每个前置任务的唯一预留。并发点击不同模式时首个成功预留决定操作；其他请求返回已有后继，不改变其模式或审查重点。刷新、双标签页和不确定请求重发不会产生第二个任务。
+
+## 同一停止阶段更换角色
+
+新版宿主记录包含权威停止阶段时，可在上述入口附加单个 `replacement`，显式更换当前 developer 或 reviewer；未提供时仍按原配置和会话继续。它保留工作区与候选，失败修复不重置轮次；新角色创建独立 epoch，旧会话不覆盖。细节、权限 challenge 与不支持情况见[在已停止阶段显式更换 Agent](adapter-stage-continuation.md)。

@@ -49,7 +49,7 @@ def operator_fixture(value, reservation=None, saved=None):
         return {'id':name,'quota_increase_allowed':quota<cap,'quota_increase_required':False,'min_quota_bytes':quota+1 if quota<cap else None,'max_quota_bytes':cap,'requires_test_revalidation':name=='continue_review'}
     frozen=None
     if saved:
-        body=saved['body'];frozen={'action_id':'continue_review' if saved['path'].endswith('/continue-review') else 'retry','key':body['key'],'workspace_quota_bytes':body.get('workspace_quota_bytes'),'revalidate_tests':body.get('revalidate_tests',False),'review_focus':body.get('review_focus')}
+        body=saved['body'];frozen={'action_id':'continue_review' if saved['path'].endswith('/continue-review') else 'retry','key':body['key'],'workspace_quota_bytes':body.get('workspace_quota_bytes'),'revalidate_tests':body.get('revalidate_tests',False),'review_focus':body.get('review_focus'),'replacement':body.get('replacement')}
     actions=[action('retry')] if retry else []
     if review: actions.append(action('continue_review'))
     if frozen and successor is None: actions=[action(frozen['action_id'])]
@@ -98,6 +98,18 @@ with sync_playwright() as p:
         if path=='/api/config': result=data['config']
         elif path=='/api/status': result=data['status']
         elif path.startswith('/api/resources?'): result=data['resources']
+        elif path.endswith('/replacement-challenge'):
+            assert req.method=='POST'
+            body=req.post_data_json;old_id=int(path.split('/')[-2]);choice=body['replacement']
+            assert 'confirm_permission_expansion' not in choice
+            data.setdefault('replacement_challenges',[]).append((old_id,body))
+            role='reviewer' if body['action']=='continue_review' else 'developer'
+            profile=next(p for p in data['config']['native_agents'] if p['name']==choice['profile'])
+            result={'challenge':f"{len(data['replacement_challenges'])+100:064x}",'expires_at_unix_ms':int(time.time()*1000)+data.get('replacement_expiry_ms',300000),
+                'confirmation_text':'Confirm this stopped-stage replacement <img src=x>',
+                'scope':{'predecessor_task_id':old_id,'action':body['action'],'role':role,'repository':'relay-demo','workflow':'reviewed',
+                    role:{'profile':choice['profile'],'provider':profile['provider'],'model':choice.get('model',{}).get('value',profile['model']),
+                        'effort':choice.get('effort',profile['effort']),'native_permission':choice.get('native_permission',profile['native_permission'])}}}
         elif path=='/api/permission-challenge':
             assert req.method=='POST'
             job=req.post_data_json['job'];data.setdefault('permission_challenges',[]).append(job)
@@ -141,13 +153,14 @@ with sync_playwright() as p:
             assert req.method=='POST'
             review=path.endswith('/continue-review')
             if review:
-                assert set(body)-{'workspace_quota_bytes'}=={'key','confirm_stopped_and_reconciled','revalidate_tests','review_focus'}
+                assert set(body)-{'workspace_quota_bytes','replacement','permission_challenge'}=={'key','confirm_stopped_and_reconciled','revalidate_tests','review_focus'}
                 assert body['revalidate_tests'] is True
                 assert body['review_focus'] is None or 0<len(body['review_focus'].encode('utf-8'))<=8192
             else:
-                assert set(body)-{'workspace_quota_bytes'}=={'key','confirm_stopped_and_reconciled'}
+                assert set(body)-{'workspace_quota_bytes','replacement','permission_challenge'}=={'key','confirm_stopped_and_reconciled'}
             data['review_requests' if review else 'retry_requests'].append((old_id,body))
             if data['continuation_post']=='abort': r.abort();return
+            if data['continuation_post']=='401': r.fulfill(status=401,content_type='application/json',body=json.dumps({'error':'Unauthorized'}));return
             old=next(t for t in data['tasks'] if t['id']==old_id)
             reservation=data['continuations'].setdefault(old_id,{'successor_id':None})
             # One persisted intent per predecessor, shared by both endpoints.
@@ -164,6 +177,11 @@ with sync_playwright() as p:
                     job['continuation']['review_only']={'base_sha':workflow['base_sha'],'candidate_sha':workflow['candidate_sha'],'round':workflow['rounds'][-1]['round']}
                     if original['body']['review_focus'] is not None:
                         job['continuation']['review_only']['review_focus']=original['body']['review_focus']
+                if original['body'].get('replacement'):
+                    role='reviewer' if original['path'].endswith('/continue-review') else 'developer'
+                    choice=original['body']['replacement'];job.setdefault('role_selections',{})[role]=choice
+                    if role=='developer': job['agent']=choice['profile']
+                    job['continuation']['replacement']={'role':role,'session_epoch':1}
                 result=task(max(t['id'] for t in data['tasks'])+1);result['key']=original['body']['key'];result['payload']=json.dumps(job)
                 data['tasks'].append(result)
                 reservation['successor_id']=result['id']
@@ -795,6 +813,89 @@ with sync_playwright() as p:
         page.set_viewport_size({'width':width,'height':1000})
         assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'role evidence overflow at {width}'
         page.screenshot(path=str(SCREENSHOTS / f'relay-native-role-evidence-{width}.png'),full_page=True)
+    # Phase 4: optional same-stage replacement, exact consent and frozen first-winner replay.
+    replacement_request_start=len(requests)
+    page.locator('#logout').click()
+    data['config']={'repositories':['relay-demo'],'agents':['codex','claude','other-review'],'tests':['unit'],
+        'native_agents':[native_profile('codex','codex_app_server'),native_profile('claude'),native_profile('other-review')],
+        'workflows':[{'name':'reviewed','repository':'relay-demo','developer':'codex','reviewer':'claude','test':'unit','max_repairs':2,
+            'selectable_developers':['codex','claude'],'selectable_reviewers':['claude','other-review','codex']}]}
+    data['catalogs']=[{'name':name,'cache_epoch':'d'*32,'generation':1,'stale':False,'refreshing':False,'catalog':role_catalog} for name in ['codex','claude','other-review']]
+    def replacement_operator(value,role):
+        result=operator_fixture(value)
+        action=next(a for a in result['recovery']['actions'] if a['id']==('continue_review' if role=='reviewer' else 'retry'))
+        action.update(ordinary_allowed=True,replacement={'allowed':True,'role':role,'reason':None,
+            'profiles':['claude','other-review','codex'] if role=='reviewer' else ['codex','claude'],
+            'stopped_stage':{'role':role,'round':1,'base_sha':'b'*40,'candidate_sha':'a'*40,'max_repairs':2,'remaining_repairs':1}})
+        result['recovery']['actions']=[action]
+        return result
+    for task_id,role in [(220,'developer'),(221,'reviewer'),(222,'developer'),(223,'developer')]:
+        value=review_task(task_id);data['tasks'].append(value);data['operator_overrides'][task_id]=replacement_operator(value,role)
+    connect(page);select_task(page,220)
+    page.locator('#retry-task').click();expect(page.locator('#retry-replace')).not_to_be_checked()
+    page.locator('#retry-replace').check();page.locator('#replacement-profile').select_option('codex')
+    page.locator('#replacement-model-source').select_option('catalog');page.locator('#replacement-model').select_option('fixture-model');page.locator('#replacement-effort').select_option('high')
+    expect(page.locator('#replacement-stage')).to_contain_text('保留原轮次 1 与剩余修复预算 1')
+    expect(page.locator('#retry-dialog-description')).to_contain_text('在已停止的开发阶段继续，保留原轮次和剩余修复预算')
+    expect(page.locator('#replacement-session')).to_contain_text('旧原生历史不能跨供应商兼容恢复')
+    page.locator('#replacement-permission').select_option('codex_full_access')
+    expect(page.locator('#replacement-confirm-text')).to_contain_text('expanded filesystem AND network access')
+    expect(page.locator('#replacement-confirm-text')).to_contain_text('no native approval prompts')
+    count=len(data['retry_requests']);page.locator('#retry-confirm').click();expect(page.locator('#retry-dialog-error')).to_contain_text('精确权限范围');assert len(data['retry_requests'])==count
+    def confirm_replacement():
+        page.locator('#replacement-challenge').click();expect(page.locator('#replacement-confirm')).to_be_enabled()
+        expect(page.locator('#replacement-challenge-scope')).to_contain_text('前置任务 #220')
+        expect(page.locator('#replacement-confirm-text')).to_contain_text('<img src=x>')
+        assert page.locator('#replacement-confirm-text img, #replacement-mode-reasons img').count()==0
+        page.locator('#replacement-confirm').check()
+        expect(page.locator('#retry-dialog-error')).to_be_hidden()
+    data['replacement_expiry_ms']=-1;page.locator('#replacement-challenge').click()
+    expect(page.locator('#replacement-challenge-status')).to_contain_text('读取失败');expect(page.locator('#replacement-confirm')).to_be_disabled()
+    data['replacement_expiry_ms']=300000;confirm_replacement()
+    page.locator('#replacement-model-source').select_option('manual');expect(page.locator('#replacement-confirm')).not_to_be_checked();expect(page.locator('#replacement-confirm')).to_be_disabled()
+    page.locator('#replacement-manual-model').fill('replacement-unverified');expect(page.locator('#replacement-effort')).to_be_disabled();expect(page.locator('#replacement-model-note')).to_contain_text('未验证')
+    confirm_replacement()
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':1000})
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'replacement dialog overflow at {width}'
+        assert page.locator('#retry-dialog').evaluate('(node) => node.scrollWidth <= node.clientWidth'),f'replacement content overflow at {width}'
+        page.locator('#retry-dialog').evaluate('(node) => { node.scrollTop = 0; }')
+        page.screenshot(path=str(SCREENSHOTS / f'relay-stage-replacement-{width}.png'),full_page=True)
+        page.locator('#replacement-confirm').scroll_into_view_if_needed()
+        page.screenshot(path=str(SCREENSHOTS / f'relay-stage-replacement-consent-{width}.png'),full_page=True)
+    data['continuation_post']='abort';page.locator('#retry-confirm').click();expect(page.locator('#detail-error')).to_contain_text('续接未确认')
+    frozen=json.loads(json.dumps(data['retry_requests'][-1]));assert frozen[1]['replacement']['confirm_permission_expansion'] is True
+    page.locator('#retry-task').click();expect(page.locator('#replacement-profile')).to_be_disabled();expect(page.locator('#replacement-manual-model')).to_have_value('replacement-unverified')
+    data['continuation_post']='401';page.locator('#retry-confirm').click();expect(page.locator('#auth-panel')).to_be_visible();assert json.loads(json.dumps(data['retry_requests'][-1]))==frozen
+    for item in data['catalogs']: item.update(cache_epoch='e'*32,generation=1,stale=True)
+    connect(page);select_task(page,220);page.locator('#retry-task').click();expect(page.locator('#replacement-confirm')).to_be_disabled()
+    data['continuation_post']='success';page.locator('#retry-confirm').click();expect(page.locator('#continuation-choice')).to_contain_text('replacement-unverified');assert json.loads(json.dumps(data['retry_requests'][-1]))==frozen
+    # Reviewer replacement never asks for developer expansion consent and retains the exact candidate.
+    select_task(page,221);page.locator('#review-task').click();page.locator('#retry-replace').check();page.locator('#replacement-profile').select_option('other-review')
+    expect(page.locator('#replacement-profile option[value="codex"]')).to_be_disabled()
+    expect(page.locator('#replacement-stage')).to_contain_text('a'*40)
+    expect(page.locator('#replacement-stage')).to_contain_text('原配置测试只运行一次，通过后仅审查，不开发、不修复')
+    page.locator('#replacement-permission').select_option('claude_restricted');expect(page.locator('#replacement-confirm-field')).to_be_hidden()
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':1000});assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        page.screenshot(path=str(SCREENSHOTS / f'relay-reviewer-replacement-{width}.png'),full_page=True)
+    before_challenges=len(data['replacement_challenges']);page.locator('#retry-confirm').click();expect(page.locator('#continuation-choice')).to_contain_text('配置 other-review')
+    assert len(data['replacement_challenges'])==before_challenges;assert data['review_requests'][-1][1]['revalidate_tests'] is True
+    # A second tab may win with a different replacement; the frozen server choice is visible.
+    select_task(page,222);page.locator('#retry-task').click();page.locator('#retry-replace').check();page.locator('#replacement-profile').select_option('codex')
+    stale_page=context.new_page();instrument(stale_page);stale_page.goto(base);connect(stale_page);select_task(stale_page,222)
+    data['frozen_lists'][page]=json.loads(json.dumps(visible_tasks()))
+    stale_page.locator('#retry-task').click();stale_page.locator('#retry-replace').check();stale_page.locator('#replacement-profile').select_option('claude')
+    stale_page.locator('#replacement-model-source').select_option('manual');stale_page.locator('#replacement-manual-model').fill('other-tab-winner');stale_page.locator('#retry-confirm').click()
+    expect(stale_page.locator('#continuation-choice')).to_contain_text('other-tab-winner')
+    page.locator('#retry-confirm').click();expect(page.locator('#continuation-choice')).to_contain_text('other-tab-winner');expect(page.locator('#continuation-choice')).to_contain_text('其他页面的预留已获确认')
+    assert data['continuation_payloads'][222]['body']['replacement']['profile']=='claude';stale_page.close()
+    # Missing legacy stage proof and explicit publication ambiguity remain unavailable.
+    select_task(page,223)
+    unavailable=data['operator_overrides'][223]['recovery']['actions'][0]['replacement'];unavailable.update(allowed=False,reason='Missing stopped-stage proof; publication or unknown execution requires reconciliation',stopped_stage=None)
+    page.locator('#operator-read').click();expect(page.locator('#operator-replacement')).to_contain_text('Missing stopped-stage proof')
+    page.locator('#retry-task').click();expect(page.locator('#retry-replace')).to_be_disabled();expect(page.locator('#retry-replacement-status')).to_contain_text('requires reconciliation');page.locator('#retry-dismiss').click()
+    assert not any(path.endswith('/refresh') for _,path,_ in requests[replacement_request_start:]), 'Replacement must not start catalog discovery'
     page.locator('#logout').click();after_logout=len(requests);page.wait_for_timeout(2400)
     assert len(requests)==after_logout
     assert page.locator('#auth-panel').is_visible()

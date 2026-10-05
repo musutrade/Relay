@@ -77,7 +77,7 @@ Codex reviewer 仍保持 `review_profile_unsupported`：完整的版本验证、
 
 每个带角色选择的已接受 job 增加服务器专用 `role_binding`，固定解析后的非敏感请求设置，以及宿主 profile/权限策略/可执行文件身份的 BLAKE2s-256 摘要。扩大权限还保存原 challenge 的单向 acceptance reference，不保存 challenge 原文、程序环境或凭据值；客户端不能填写该字段。排队之后宿主 profile、默认模型/effort、策略或可执行文件发生变化时，启动及继续检查会拒绝，不采用新默认值。供应商内部设置和真正执行值仍只能按实际返回证据解释。
 
-两个角色独立解析到可信 profile 的克隆，允许同一 profile 的两个角色选不同模型而互不覆盖。解析后的模型、effort、权限与原程序/环境一起进入工作区和会话绑定。`retry` / `continue-review` 只继承原选择；本阶段不增加失败后替换适配器的接口。候选 SHA、测试复验、独立 reviewer 会话、未知进程、发布核对与资源配额门禁不改变。
+两个角色独立解析到可信 profile 的克隆，允许同一 profile 的两个角色选不同模型而互不覆盖。解析后的模型、effort、权限与原程序/环境一起进入工作区和会话绑定。`retry` / `continue-review` 默认只继承原选择；可在服务端证明的停止阶段显式[更换当前角色](adapter-stage-continuation.md)，保持原工作区、原轮次和独立会话 epoch。候选 SHA、测试复验、独立 reviewer 会话、未知进程、发布核对与资源配额门禁不改变。
 
 `GET /api/resources` 和 MCP `relay_resources` 可带 `reviewer_profile`，必须属于所选 workflow 的允许项。估算使用该 reviewer 的会话/独立副本要求；界面切换 reviewer 时应使旧估算失效。
 

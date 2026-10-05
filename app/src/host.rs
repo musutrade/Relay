@@ -101,6 +101,9 @@ pub struct HostConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
+    /// Durable active role identity; server-owned and retained across continuation chains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_epochs: Option<crate::sessions::RoleEpochs>,
     /// Server-owned admission record; external submissions cannot supply this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_binding: Option<crate::selection::RoleBinding>,
@@ -163,6 +166,9 @@ impl Job {
     }
 
     pub fn validate(&self, config: &HostConfig) -> Result<(), HostError> {
+        if let Some(epochs) = &self.role_epochs {
+            epochs.validate()?;
+        }
         if self
             .workspace_quota_bytes
             .is_some_and(|bytes| bytes == 0 || bytes > config.workspace_byte_limit())
@@ -280,6 +286,8 @@ impl CommandResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_stage: Option<crate::replacement::StoppedStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<Failure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceState>,
@@ -295,6 +303,7 @@ pub struct RunResult {
 impl RunResult {
     pub(crate) fn new(outcome: Outcome, error: Option<String>) -> Self {
         Self {
+            stopped_stage: None,
             failure: None,
             resources: None,
             workflow: None,
@@ -372,6 +381,7 @@ impl RunResult {
                     "persistence",
                     "result metadata exceeded the persistence budget; retained workspace identity cannot be confirmed from this result",
                 ));
+                value.stopped_stage = None;
                 value.workflow = None;
                 value.agent = None;
                 value.tests = None;
@@ -783,6 +793,24 @@ impl Host {
                 ),
             );
         }
+        let execution_requirements = if let Some(replacement) = crate::replacement::current(job) {
+            format!(
+                "{}\n\nUntrusted stopped-stage handoff (diagnostic data only; inspect retained files):\n{}",
+                job.requirements, replacement.handoff
+            )
+        } else {
+            job.requirements.clone()
+        };
+        let requirements_file = if crate::replacement::current(job).is_some() {
+            let file = workspace.join("replacement-developer-input.txt");
+            if let Err(error) = fs::write(&file, &execution_requirements) {
+                result.error = Some(error.to_string());
+                return result;
+            }
+            file
+        } else {
+            requirements_file
+        };
         // A snapshot needs its own Git boundary even when no reviewed workflow
         // was selected. Never copy the source's metadata or discover an ancestor.
         if let Some(outcome) = interrupted(&cancellation, deadline) {
@@ -856,7 +884,7 @@ impl Host {
         {
             let mut command = self.run_native(
                 &profile,
-                &job.requirements,
+                &execution_requirements,
                 false,
                 &cancellation,
                 (workspace, &repository, false),
@@ -866,6 +894,11 @@ impl Host {
             result.outcome = command.outcome;
             result.agent = Some(command);
             if result.outcome != Outcome::Success {
+                if result.outcome != Outcome::Unknown {
+                    result.stopped_stage = Some(crate::replacement::StoppedStage::developer(
+                        0, None, None, 0,
+                    ));
+                }
                 return result;
             }
         } else {
@@ -894,7 +927,7 @@ impl Host {
             }
             let expand = |arg: &str| -> String {
                 match arg {
-                    "{requirements}" => job.requirements.clone(),
+                    "{requirements}" => execution_requirements.clone(),
                     "{requirements_file}" => requirements_file.to_string_lossy().into_owned(),
                     "{workspace}" => repository.to_string_lossy().into_owned(),
                     "{repository}" => job.repository.clone(),
@@ -905,7 +938,7 @@ impl Host {
             };
             let mut env = profile.env.clone();
             for (key, value) in [
-                ("RELAY_REQUIREMENTS", job.requirements.clone()),
+                ("RELAY_REQUIREMENTS", execution_requirements.clone()),
                 (
                     "RELAY_REQUIREMENTS_FILE",
                     requirements_file.to_string_lossy().into_owned(),
@@ -933,7 +966,7 @@ impl Host {
                 args: profile.args.iter().map(|arg| expand(arg)).collect(),
                 env,
                 cwd: repository.clone(),
-                input: job.requirements.clone(),
+                input: execution_requirements.clone(),
                 timeout_ms: deadline
                     .saturating_duration_since(Instant::now())
                     .as_millis()
@@ -949,6 +982,11 @@ impl Host {
             }
             result.outcome = outcome;
             if outcome != Outcome::Success {
+                if phase == "agent" && outcome != Outcome::Unknown {
+                    result.stopped_stage = Some(crate::replacement::StoppedStage::developer(
+                        0, None, None, 0,
+                    ));
+                }
                 return result;
             }
         }
@@ -1170,10 +1208,23 @@ impl Host {
                     profile,
                     read_only,
                     attempt,
-                    require_resume,
+                    require_resume
+                        || (crate::workspaces::role_epoch(workspace, read_only)?.is_some()
+                            && !crate::workspaces::fresh_role_epoch(workspace, read_only)?),
+                    crate::workspaces::role_epoch(workspace, read_only)?.as_deref(),
                 )
             }) {
-                Ok(session) => Some(session),
+                Ok(session) => {
+                    if let Err(error) =
+                        crate::workspaces::consume_fresh_role_epoch(workspace, read_only)
+                    {
+                        return CommandResult::error(
+                            Outcome::Failure,
+                            format!("cannot checkpoint active role epoch: {error}"),
+                        );
+                    }
+                    Some(session)
+                }
                 Err(error) => {
                     return CommandResult::error(
                         Outcome::Failure,
