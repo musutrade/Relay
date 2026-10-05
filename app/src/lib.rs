@@ -56,6 +56,16 @@ pub struct RetryRequest {
     pub confirm_stopped_and_reconciled: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewContinuationRequest {
+    pub key: String,
+    pub confirm_stopped_and_reconciled: bool,
+    pub revalidate_tests: bool,
+    #[serde(default)]
+    pub review_focus: Option<String>,
+}
+
 /// Adapter-owned continuation metadata; the core task and result stay immutable.
 #[derive(Serialize)]
 pub struct TaskView {
@@ -143,6 +153,30 @@ impl Application {
     /// One explicit successor per predecessor. Reservation precedes core submission,
     /// and its stable key/payload make a crash between the two operations retryable.
     pub fn retry(&self, id: i64, input: RetryRequest) -> Result<Task> {
+        self.continue_task(id, input, None)
+    }
+    /// Explicit operator action: preserve the candidate, revalidate host tests once,
+    /// and resume only the compatible reviewer. No developer or repair phase runs.
+    pub fn continue_review(&self, id: i64, input: ReviewContinuationRequest) -> Result<Task> {
+        if !input.revalidate_tests {
+            return Err(Error::Invalid("review-only continuation requires revalidate_tests=true: prior results do not bind all external test inputs; rerun the configured host tests once without redevelopment".into()));
+        }
+        workflow::validate_review_focus(input.review_focus.as_deref()).map_err(Error::Invalid)?;
+        self.continue_task(
+            id,
+            RetryRequest {
+                key: input.key,
+                confirm_stopped_and_reconciled: input.confirm_stopped_and_reconciled,
+            },
+            Some(input.review_focus),
+        )
+    }
+    fn continue_task(
+        &self,
+        id: i64,
+        input: RetryRequest,
+        review_focus: Option<Option<String>>,
+    ) -> Result<Task> {
         if !input.confirm_stopped_and_reconciled {
             return Err(Error::Invalid("confirm inspection of the stopped run and its possible side effects before continuing".into()));
         }
@@ -185,10 +219,28 @@ impl Application {
             }
             let mut job = Job::from_payload(&predecessor.payload, self.host.config())
                 .map_err(|e| Error::Invalid(e.to_string()))?;
+            let prior_review_focus = job
+                .continuation
+                .as_ref()
+                .and_then(|c| c.review_only.as_ref())
+                .and_then(|c| c.review_focus.clone());
             job.continuation = Some(
                 workspaces::continuation(self.host.config(), &predecessor, &job)
                     .map_err(|e| Error::Invalid(e.to_string()))?,
             );
+            if let Some(focus) = review_focus {
+                let review = workflow::review_continuation(&result, focus.or(prior_review_focus))
+                    .map_err(Error::Invalid)?;
+                if job.workflow.is_none() {
+                    return Err(Error::Invalid(
+                        "review-only continuation requires a workflow".into(),
+                    ));
+                }
+                job.continuation
+                    .as_mut()
+                    .expect("continuation recorded")
+                    .review_only = Some(review);
+            }
             let payload = serde_json::to_string(&job).map_err(|e| Error::Invalid(e.to_string()))?;
             let conflicting: Option<String> = tx
                 .query_row(

@@ -228,6 +228,69 @@ pub struct RoundResult {
     pub review: Option<ReviewResult>,
     pub reviewer: Option<StageSummary>,
 }
+/// Pinned by the application from the immutable predecessor host result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewContinuation {
+    pub base_sha: String,
+    pub candidate_sha: String,
+    pub round: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_focus: Option<String>,
+}
+pub(crate) fn review_continuation(
+    result: &RunResult,
+    review_focus: Option<String>,
+) -> Result<ReviewContinuation, String> {
+    validate_review_focus(review_focus.as_deref())?;
+    let invalid = || {
+        "review-only continuation requires a stopped failed review with a verified candidate and successful host tests; use normal continuation for developer/test failures or requested code changes".to_string()
+    };
+    if !matches!(
+        result.outcome,
+        Outcome::Failure | Outcome::TimedOut | Outcome::Cancelled
+    ) || result.draft_pr.is_some()
+    {
+        return Err(invalid());
+    }
+    let workflow = result.workflow.as_ref().ok_or_else(invalid)?;
+    let round = workflow.rounds.last().ok_or_else(invalid)?;
+    let base = workflow
+        .base_sha
+        .as_ref()
+        .filter(|sha| valid_sha(sha))
+        .ok_or_else(invalid)?;
+    let candidate = workflow
+        .candidate_sha
+        .as_ref()
+        .filter(|sha| valid_sha(sha))
+        .ok_or_else(invalid)?;
+    let tests = result.tests.as_ref().ok_or_else(invalid)?;
+    if workflow.reviewed_sha.is_some()
+        || workflow.publication.is_some()
+        || workflow.reconciliation_required
+        || round.candidate_sha != *candidate
+        || round.review.is_some()
+        || round.reviewer.is_none()
+        || !round
+            .tests
+            .as_ref()
+            .is_some_and(|test| test.outcome == Outcome::Success && test.exit_code == Some(0))
+        || tests.outcome != Outcome::Success
+        || tests.exit_code != Some(0)
+        || tests.signal.is_some()
+        || tests.error.is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(ReviewContinuation {
+        base_sha: base.clone(),
+        candidate_sha: candidate.clone(),
+        round: round.round,
+        review_focus,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicationResult {
     pub dry_run: bool,
@@ -240,6 +303,8 @@ pub struct PublicationResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowResult {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_continuation: Option<i64>,
     pub base_sha: Option<String>,
     pub candidate_sha: Option<String>,
     pub reviewed_sha: Option<String>,
@@ -253,6 +318,7 @@ impl WorkflowResult {
     fn new(name: &str) -> Self {
         Self {
             name: name.into(),
+            review_continuation: None,
             base_sha: None,
             candidate_sha: None,
             reviewed_sha: None,
@@ -472,7 +538,16 @@ impl Execution<'_> {
                 prompt,
                 read_only,
                 self.cancellation,
-                (self.workspace, self.repository),
+                (
+                    self.workspace,
+                    self.repository,
+                    read_only
+                        && self
+                            .job
+                            .continuation
+                            .as_ref()
+                            .is_some_and(|c| c.review_only.is_some()),
+                ),
                 self.deadline,
             )
         } else if !read_only {
@@ -1127,6 +1202,14 @@ fn run(
         .map_err(|command| Stop::command(&command, "reviewer compatibility probe"))?;
     let base = context.prepare(config)?;
     workflow.base_sha = Some(base.clone());
+    if let Some(review) = context
+        .job
+        .continuation
+        .as_ref()
+        .and_then(|c| c.review_only.as_ref())
+    {
+        return run_review_only(context, config, result, workflow, &base, review);
+    }
     let mut prior = context.sha(config, context.repository, "HEAD^{commit}")?;
     let mut feedback = if crate::workspaces::attempt(context.workspace)
         .map_err(|e| Stop::failure(e.to_string()))?
@@ -1233,81 +1316,11 @@ fn run(
             prior = candidate;
             continue;
         }
-        let patch = context.patch(config, &base, &candidate, round)?;
-        // One fixed review checkout, separate from developer files and conversation.
-        // Legacy stateless reviewers keep their established guarded cwd contract.
-        let isolated =
-            crate::sessions::enabled(&context.host.config().native_agents[&config.reviewer]);
-        let reviewer_repository = if isolated {
-            context.prepare_reviewer(config, &candidate)?
-        } else {
-            context.repository.to_owned()
-        };
-        let review_context = Execution {
-            host: context.host,
-            task: context.task,
-            job: context.job,
-            workspace: context.workspace,
-            repository: &reviewer_repository,
-            requirements_file: context.requirements_file,
-            deadline: context.deadline,
-            cancellation: context.cancellation,
-        };
-        let patch = if isolated {
-            let destination = reviewer_repository.join(".git/relay-review.patch");
-            fs::copy(&patch, &destination).map_err(|error| Stop::failure(error.to_string()))?;
-            destination
-        } else {
-            patch
-        };
-        let prompt = review_prompt(
-            config.review_focus.as_deref(),
-            &context.job.requirements,
-            &base,
-            &candidate,
-            &patch,
-            &config.test,
-            result.tests.as_ref().expect("successful test recorded"),
-        );
-        let reviewer = review_context.agent(
-            &config.reviewer,
-            true,
-            &format!("reviewer-{round}"),
-            &prompt,
-            &extra,
-        );
-        workflow.rounds.last_mut().expect("round recorded").reviewer =
-            Some(StageSummary::from_command(&reviewer));
-        if reviewer.outcome != Outcome::Success {
-            return Err(Stop::command(&reviewer, "reviewer"));
-        }
-        context.verify(config, &candidate)?;
-        review_context.verify(config, &candidate)?;
-        let provider = reviewer
-            .provider
-            .as_ref()
-            .ok_or_else(|| Stop::failure("native reviewer did not produce normalized output"))?;
-        if provider.summary_truncated {
-            return Err(Stop::failure("reviewer verdict was truncated"));
-        }
-        let review = ReviewResult::parse(&provider.summary, &candidate)?;
-        let verdict = review.verdict;
-        feedback = serde_json::to_string(&review).expect("serializable review");
-        workflow.rounds.last_mut().expect("round recorded").review = Some(review);
+        let verdict = review_candidate(context, config, result, workflow, round)?;
+        feedback = serde_json::to_string(&workflow.rounds.last().expect("round recorded").review)
+            .expect("serializable review");
         if verdict == ReviewVerdict::Approved {
-            workflow.reviewed_sha = Some(candidate.clone());
-            context.verify(config, &candidate)?;
-            if context.job.publish {
-                if context.sha(config, context.repository, &format!("{base}^{{tree}}"))?
-                    == context.sha(config, context.repository, &format!("{candidate}^{{tree}}"))?
-                {
-                    return Err(Stop::failure(
-                        "approved candidate has no changes to publish",
-                    ));
-                }
-                publish(context, config, result, workflow, &base, &candidate)?;
-            }
-            return Ok(());
+            return finish_approved(context, config, result, workflow, &base, &candidate);
         }
         if round == config.max_repairs {
             return Err(Stop::failure(
@@ -1320,6 +1333,242 @@ fn run(
         "workflow stopped without an approved candidate",
     ))
 }
+fn run_review_only(
+    context: &Execution<'_>,
+    config: &WorkflowConfig,
+    result: &mut RunResult,
+    workflow: &mut WorkflowResult,
+    base: &str,
+    continuation: &ReviewContinuation,
+) -> Result<(), Stop> {
+    // Re-read the host record after acquiring ownership. Never synthesize old test
+    // proof from model prose, and never rewrite the immutable predecessor result.
+    let previous = crate::workspaces::read_stopped_result(context.workspace)
+        .map_err(|e| Stop::failure(format!("missing or invalid stopped review evidence: {e}")))?;
+    let pinned =
+        review_continuation(&previous, continuation.review_focus.clone()).map_err(Stop::failure)?;
+    if &pinned != continuation || base != continuation.base_sha {
+        return Err(Stop::failure(
+            "preserved review evidence differs from the selected predecessor",
+        ));
+    }
+    let candidate = &continuation.candidate_sha;
+    context.verify(config, candidate)?;
+    let reviewer = &context.host.config().native_agents[&config.reviewer];
+    if crate::sessions::enabled(reviewer) {
+        let reviewer_repository = context.workspace.join("reviewer-repository");
+        let reviewer_candidate =
+            crate::workspaces::read_marker(&context.workspace.join("reviewer-candidate.txt"))
+                .map_err(|e| {
+                    Stop::failure(format!("missing reviewer candidate checkpoint: {e}"))
+                })?;
+        if reviewer_candidate != *candidate {
+            return Err(Stop::failure(
+                "reviewer candidate checkpoint differs from the preserved candidate",
+            ));
+        }
+        let review_context = Execution {
+            repository: &reviewer_repository,
+            ..*context
+        };
+        review_context.verify(config, candidate)?;
+        crate::sessions::Session::verify_reviewer_resume(
+            context.workspace,
+            &context.workspace.join("reviewer-repository"),
+            reviewer,
+            crate::workspaces::attempt(context.workspace)
+                .map_err(|e| Stop::failure(e.to_string()))?,
+        )
+        .map_err(|e| Stop::failure(format!("cannot resume original reviewer session: {e}")))?;
+    }
+    workflow.candidate_sha = Some(candidate.clone());
+    workflow.review_continuation = context
+        .job
+        .continuation
+        .as_ref()
+        .map(|c| c.predecessor_task_id);
+    let prior_round = previous
+        .workflow
+        .as_ref()
+        .expect("validated workflow")
+        .rounds
+        .last()
+        .expect("validated round");
+    workflow.rounds.push(RoundResult {
+        round: continuation.round,
+        candidate_sha: candidate.clone(),
+        developer: prior_round.developer.clone(),
+        tests: None,
+        review: None,
+        reviewer: None,
+    });
+    let extra = phase_candidate_env(base, candidate, continuation.round);
+    let test = context.profile(
+        &context.host.config().tests[&config.test],
+        &format!("tests-review-continuation-{}", context.task.id),
+        &context.job.requirements,
+        &extra,
+    );
+    workflow.rounds.last_mut().expect("round recorded").tests =
+        Some(StageSummary::from_command(&test));
+    result.tests = Some(test);
+    let test = result.tests.as_ref().expect("test recorded");
+    if test.outcome == Outcome::Unknown {
+        // Process safety is unknown: do not run Git or downgrade the live claim.
+        return Err(Stop::command(test, "review-only test revalidation"));
+    }
+    context.verify(config, candidate)?;
+    let test = result.tests.as_ref().expect("test recorded");
+    if test.outcome != Outcome::Success {
+        return Err(Stop::command(test, "review-only test revalidation"));
+    }
+    if test.exit_code != Some(0) || test.signal.is_some() || test.error.is_some() {
+        return Err(Stop::failure(
+            "review-only test revalidation has inconsistent success evidence",
+        ));
+    }
+    let verdict = review_candidate(context, config, result, workflow, continuation.round)?;
+    if verdict == ReviewVerdict::Approved {
+        finish_approved(context, config, result, workflow, base, candidate)
+    } else {
+        Err(Stop::failure(
+            "review requested changes; review-only continuation never runs development or repairs; use normal continuation to change code",
+        ))
+    }
+}
+fn phase_candidate_env(base: &str, candidate: &str, round: u8) -> BTreeMap<String, String> {
+    [
+        ("RELAY_BASE_SHA".into(), base.into()),
+        ("RELAY_CANDIDATE_SHA".into(), candidate.into()),
+        ("RELAY_WORKFLOW_ROUND".into(), round.to_string()),
+    ]
+    .into_iter()
+    .collect()
+}
+fn review_candidate(
+    context: &Execution<'_>,
+    config: &WorkflowConfig,
+    result: &mut RunResult,
+    workflow: &mut WorkflowResult,
+    round: u8,
+) -> Result<ReviewVerdict, Stop> {
+    let base = workflow.base_sha.clone().expect("baseline recorded");
+    let candidate = workflow.candidate_sha.clone().expect("candidate recorded");
+    let base = base.as_str();
+    let candidate = candidate.as_str();
+    let extra = phase_candidate_env(base, candidate, round);
+    let focus = context
+        .job
+        .continuation
+        .as_ref()
+        .and_then(|c| c.review_only.as_ref())
+        .and_then(|c| c.review_focus.as_deref())
+        .or(config.review_focus.as_deref());
+    let patch = context.patch(config, base, candidate, round)?;
+    // One fixed review checkout, separate from developer files and conversation.
+    // Legacy stateless reviewers keep their established guarded cwd contract.
+    let isolated = crate::sessions::enabled(&context.host.config().native_agents[&config.reviewer]);
+    let reviewer_repository = if isolated {
+        if context
+            .job
+            .continuation
+            .as_ref()
+            .is_some_and(|c| c.review_only.is_some())
+        {
+            // A review-only attempt must not fetch/reset an existing checkout.
+            let repository = context.workspace.join("reviewer-repository");
+            Execution {
+                repository: &repository,
+                ..*context
+            }
+            .verify(config, candidate)?;
+            repository
+        } else {
+            context.prepare_reviewer(config, candidate)?
+        }
+    } else {
+        context.repository.to_owned()
+    };
+    let review_context = Execution {
+        host: context.host,
+        task: context.task,
+        job: context.job,
+        workspace: context.workspace,
+        repository: &reviewer_repository,
+        requirements_file: context.requirements_file,
+        deadline: context.deadline,
+        cancellation: context.cancellation,
+    };
+    let patch = if isolated {
+        let destination = reviewer_repository.join(".git/relay-review.patch");
+        fs::copy(&patch, &destination).map_err(|error| Stop::failure(error.to_string()))?;
+        destination
+    } else {
+        patch
+    };
+    let prompt = review_prompt(
+        focus,
+        &context.job.requirements,
+        base,
+        candidate,
+        &patch,
+        &config.test,
+        result.tests.as_ref().expect("successful test recorded"),
+    );
+    let reviewer = review_context.agent(
+        &config.reviewer,
+        true,
+        &format!("reviewer-{round}"),
+        &prompt,
+        &extra,
+    );
+    workflow.rounds.last_mut().expect("round recorded").reviewer =
+        Some(StageSummary::from_command(&reviewer));
+    if reviewer.outcome == Outcome::Unknown {
+        // Unknown supervisor completion must keep the queue claim fenced, even
+        // if cancellation, timeout or candidate mutation would fail verification.
+        return Err(Stop::command(&reviewer, "reviewer"));
+    }
+    context.verify(config, candidate)?;
+    review_context.verify(config, candidate)?;
+    if reviewer.outcome != Outcome::Success {
+        return Err(Stop::command(&reviewer, "reviewer"));
+    }
+    let provider = reviewer
+        .provider
+        .as_ref()
+        .ok_or_else(|| Stop::failure("native reviewer did not produce normalized output"))?;
+    if provider.summary_truncated {
+        return Err(Stop::failure("reviewer verdict was truncated"));
+    }
+    let review = ReviewResult::parse(&provider.summary, candidate)?;
+    let verdict = review.verdict;
+    workflow.rounds.last_mut().expect("round recorded").review = Some(review);
+    Ok(verdict)
+}
+fn finish_approved(
+    context: &Execution<'_>,
+    config: &WorkflowConfig,
+    result: &mut RunResult,
+    workflow: &mut WorkflowResult,
+    base: &str,
+    candidate: &str,
+) -> Result<(), Stop> {
+    workflow.reviewed_sha = Some(candidate.into());
+    context.verify(config, candidate)?;
+    if context.job.publish {
+        if context.sha(config, context.repository, &format!("{base}^{{tree}}"))?
+            == context.sha(config, context.repository, &format!("{candidate}^{{tree}}"))?
+        {
+            return Err(Stop::failure(
+                "approved candidate has no changes to publish",
+            ));
+        }
+        publish(context, config, result, workflow, base, candidate)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_review_focus(focus: Option<&str>) -> Result<(), String> {
     if focus.is_some_and(|text| text.trim().is_empty() || text.len() > 8192) {
         return Err("review_focus must contain 1-8192 UTF-8 bytes".into());

@@ -35,6 +35,7 @@ pub fn router_with_auth(app: Arc<Application>, auth: Auth) -> Router {
         .route("/tasks/{id}", get(detail))
         .route("/tasks/{id}/cancel", post(cancel))
         .route("/tasks/{id}/retry", post(retry))
+        .route("/tasks/{id}/continue-review", post(continue_review))
         .layer(DefaultBodyLimit::max(96 * 1024))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
@@ -169,6 +170,16 @@ async fn retry(
 }
 async fn cancel(State(state): State<Web>, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
     Ok(Json(state.app.cancel(id)?))
+}
+async fn continue_review(
+    State(state): State<Web>,
+    Path(id): Path<i64>,
+    Json(input): Json<crate::ReviewContinuationRequest>,
+) -> Result<(StatusCode, Json<relay::Task>), ApiError> {
+    Ok((
+        StatusCode::CREATED,
+        Json(state.app.continue_review(id, input)?),
+    ))
 }
 struct ApiError(Error);
 impl From<Error> for ApiError {

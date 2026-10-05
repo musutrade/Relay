@@ -99,3 +99,5 @@ HTTP worker 遇到 host Unknown 或落库失败仍保留 claimed，不按时间�
 `app/src/workspaces.rs` 管理固定根、带 task/generation/owner 的绑定、跨父进程寿命的 supervisor 独占锁及可选成功 TTL。应用在自己的 SQLite 表预留每个失败前置任务的唯一后继，复用核心 submit 幂等性，不增加核心状态。HTTP/MCP 的显式继续校验已结束失败及现场，直接提交不能注入续接元数据。未知 claim 仍走原人工确认停止流程；发布尝试标记阻止盲目重放。所有代码、未提交工作和旧代目录都不因恢复而重新复制或清空。详见 [固定工作区与继续](workspace-continuation.md)。
 
 可信宿主的 `max_workspace_bytes` 可独立配置整项任务的有界逻辑容量；省略沿用输入快照预算。候选、Git 元数据、独立 reviewer 与控制文件共同计费；准入估算和命令前/运行期/结束检查不构成 OS 硬配额或主机全局磁盘预留。详细容量选择见 [应用运行说明](application.md#工作区容量选择)。
+
+审查失败的显式后继仍使用应用层唯一 continuation 预留和原 workspace claim，不向内核增加状态。调用者只能提供确认与有界审查重点，候选/base/round 从已结束的宿主结果固定；执行时再次核对现场。由于任意测试命令的外部输入无法自动完整证明，审查后继始终显式复验原测试一次，不建立通用缓存/来源平台，不运行开发或修复阶段。审查提示和验收输入不放宽只读工具、精确 SHA、verdict 或发布门禁。

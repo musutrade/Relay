@@ -20,11 +20,23 @@ threading.Thread(target=server.serve_forever,daemon=True).start()
 base=f'http://127.0.0.1:{server.server_port}'
 def task(i, state='queued', requirement=None, outcome=None):
     return {'id':i,'key':f'key-{i}','payload':json.dumps({'repository':'relay-demo','requirements':requirement or f'改进工作台的任务体验 #{i}','agent':'codex','test':'unit','publish':False},ensure_ascii=False),'state':state,'generation':1 if state!='queued' else 0,'owner':'worker-1' if state!='queued' else None,'result':json.dumps({'outcome':outcome,'summary':'完成结果需要人工审阅'},ensure_ascii=False) if outcome else None,'continuation_status':None}
+def review_task(i, outcome='failure'):
+    value=task(i,'finished',outcome=outcome)
+    job=json.loads(value['payload']);job['workflow']='reviewed'
+    value['payload']=json.dumps(job,ensure_ascii=False)
+    passed={'outcome':'success','exit_code':0,'summary':'测试通过'}
+    value['result']=json.dumps({'outcome':outcome,'workspace':f'/fixture/task-{i}',
+        'tests':dict(passed,signal=None,error=None),'draft_pr':None,'workflow':{'name':'reviewed','base_sha':'b'*40,
+        'candidate_sha':'a'*40,'reviewed_sha':None,'publication':None,
+        'reconciliation_required':False,'rounds':[{'round':0,'candidate_sha':'a'*40,
+        'developer':passed,'tests':passed,'review':None,
+        'reviewer':{'outcome':'failure','exit_code':1,'summary':'审查连接中断'}}]}},ensure_ascii=False)
+    return value
 with sync_playwright() as p:
     browser=p.chromium.launch(executable_path=os.environ.get('CHROMIUM_PATH'),headless=True,args=['--no-sandbox'])
     context=browser.new_context(viewport={'width':1440,'height':1150},locale='zh-CN')
     page=context.new_page(); errors=[]; requests=[]; submissions=[]
-    data={'tasks':[task(3,'queued'),task(2,'claimed'),task(1,'finished',outcome='success')], 'status':{'active':task(2,'claimed'),'recovery_required':False,'diagnostic':None},'post':'success','list_error':False,'continuations':{},'hidden_task_ids':set(),'frozen_lists':{},'retry_requests':[],'config':{'repositories':['relay-demo','api-service'],'agents':['codex','reviewer'],'tests':['unit','full']}}
+    data={'tasks':[task(3,'queued'),task(2,'claimed'),task(1,'finished',outcome='success')], 'status':{'active':task(2,'claimed'),'recovery_required':False,'diagnostic':None},'post':'success','list_error':False,'continuations':{},'continuation_payloads':{},'continuation_post':'success','hidden_task_ids':set(),'frozen_lists':{},'retry_requests':[],'review_requests':[],'config':{'repositories':['relay-demo','api-service'],'agents':['codex','reviewer'],'tests':['unit','full']}}
     # Model persisted reservations separately from visible task payloads. A child
     # outside the recent page must not make its predecessor appear retryable.
     def task_response(value):
@@ -46,18 +58,35 @@ with sync_playwright() as p:
             if data['post']=='401': r.fulfill(status=401,content_type='application/json',body=json.dumps({'error':'Unauthorized'}));return
             result={'id':max(t['id'] for t in data['tasks'])+1,'key':body['key'],'payload':json.dumps(body['job'],ensure_ascii=False),'state':'queued','generation':0,'owner':None,'result':None,'continuation_status':None}
             data['tasks'].append(result)
-        elif path.endswith('/retry'):
+        elif path.endswith(('/retry','/continue-review')):
             old_id=int(path.split('/')[-2]);body=req.post_data_json
             assert body['confirm_stopped_and_reconciled'] is True
             assert req.method=='POST'
-            data['retry_requests'].append((old_id,body))
+            review=path.endswith('/continue-review')
+            if review:
+                assert set(body)=={'key','confirm_stopped_and_reconciled','revalidate_tests','review_focus'}
+                assert body['revalidate_tests'] is True
+                assert body['review_focus'] is None or 0<len(body['review_focus'].encode('utf-8'))<=8192
+            else:
+                assert set(body)=={'key','confirm_stopped_and_reconciled'}
+            data['review_requests' if review else 'retry_requests'].append((old_id,body))
+            if data['continuation_post']=='abort': r.abort();return
             old=next(t for t in data['tasks'] if t['id']==old_id)
             reservation=data['continuations'].setdefault(old_id,{'successor_id':None})
+            # One persisted intent per predecessor, shared by both endpoints.
+            # A later mode or key cannot rewrite the first accepted request.
+            data['continuation_payloads'].setdefault(old_id,{'path':path,'body':body})
             if reservation['successor_id'] is None:
                 job=json.loads(old['payload'])
                 workspace_id=job.get('continuation',{}).get('workspace_task_id',old_id)
                 job['continuation']={'workspace_task_id':workspace_id,'predecessor_task_id':old_id,'predecessor_generation':old['generation']}
-                result=task(max(t['id'] for t in data['tasks'])+1);result['key']=body['key'];result['payload']=json.dumps(job)
+                original=data['continuation_payloads'][old_id]
+                if original['path'].endswith('/continue-review'):
+                    workflow=json.loads(old['result'])['workflow']
+                    job['continuation']['review_only']={'base_sha':workflow['base_sha'],'candidate_sha':workflow['candidate_sha'],'round':workflow['rounds'][-1]['round']}
+                    if original['body']['review_focus'] is not None:
+                        job['continuation']['review_only']['review_focus']=original['body']['review_focus']
+                result=task(max(t['id'] for t in data['tasks'])+1);result['key']=original['body']['key'];result['payload']=json.dumps(job)
                 data['tasks'].append(result)
                 reservation['successor_id']=result['id']
             else:
@@ -84,6 +113,7 @@ with sync_playwright() as p:
     def assert_successor(target,predecessor_id,successor_id):
         expect(target.locator('#detail-title')).to_have_text('任务 #'+str(predecessor_id))
         expect(target.locator('#retry-task')).to_be_hidden()
+        expect(target.locator('#review-task')).to_be_hidden()
         expect(target.locator('#continuation-next')).to_have_text('已续接至任务 #'+str(successor_id))
         expect(target.locator('#continuation-next')).to_be_visible()
         expect(target.locator('#continuation-next')).to_be_enabled()
@@ -338,6 +368,143 @@ with sync_playwright() as p:
     assert data['continuations'][130]=={'successor_id':131}
     select_task(page,130);assert_successor(page,130,131)
     assert len(data['retry_requests'])==4
+    # Review continuation is offered only for an interrupted reviewer on a
+    # tested, unchanged candidate, with no recorded review/publication effects.
+    interrupted=review_task(140);data['tasks'].append(interrupted)
+    original_interrupted=json.loads(json.dumps(interrupted))
+    with page.expect_response(lambda response: response.url==base+'/api/tasks'):
+        page.locator('#refresh').click()
+    select_task(page,140)
+    expect(page.locator('#review-task')).to_have_text('仅继续审查（先复验测试）')
+    expect(page.locator('#review-task')).to_be_enabled()
+    pristine_result=json.loads(interrupted['result'])
+    for outcome in ['failure','timed_out','cancelled']:
+        interrupted['result']=json.dumps(dict(pristine_result,outcome=outcome))
+        select_task(page,140);expect(page.locator('#review-task')).to_be_enabled()
+    invalid_results=[]
+    for field,value in [('outcome','unknown'),('workspace',None),('tests',{'outcome':'failure'}),('draft_pr',{'outcome':'failure'})]:
+        invalid_results.append(dict(pristine_result,**{field:value}))
+    for field,value in [('base_sha',None),('candidate_sha',None),('reviewed_sha','a'*40),('publication',{'dry_run':True}),('reconciliation_required',True),('rounds',[])]:
+        invalid_results.append(dict(pristine_result,workflow=dict(pristine_result['workflow'],**{field:value})))
+    for field,value in [('candidate_sha','c'*40),('tests',{'outcome':'failure'}),('reviewer',None),('review',{'verdict':'approved'})]:
+        invalid_results.append(dict(pristine_result,workflow=dict(pristine_result['workflow'],rounds=[dict(pristine_result['workflow']['rounds'][0],**{field:value})])))
+    for invalid in invalid_results:
+        interrupted['result']=json.dumps(invalid);select_task(page,140)
+        expect(page.locator('#review-task')).to_be_hidden()
+    interrupted['result']=original_interrupted['result']
+    without_workflow=json.loads(interrupted['payload']);without_workflow.pop('workflow')
+    interrupted['payload']=json.dumps(without_workflow);select_task(page,140)
+    expect(page.locator('#review-task')).to_be_hidden()
+    interrupted['payload']=original_interrupted['payload'];select_task(page,140)
+    # Dismissing either way has no side effect; the shared ordinary dialog must
+    # not retain a discarded review focus or review-only explanatory text.
+    before_reviews=len(data['review_requests']);before_retries=len(data['retry_requests'])
+    page.locator('#review-task').click()
+    expect(page.locator('#retry-dialog')).to_be_visible()
+    expect(page.locator('#review-focus-field')).to_be_visible()
+    expect(page.locator('#review-focus')).to_be_enabled()
+    expect(page.locator('#retry-dialog-description')).to_contain_text('先重新运行配置的测试')
+    expect(page.locator('#retry-dialog-description')).to_contain_text('不调用开发者')
+    expect(page.locator('#retry-dialog-description')).to_contain_text('同一候选提交')
+    expect(page.locator('#review-focus-hint')).to_contain_text('留空沿用原审查重点')
+    page.locator('#review-focus').fill('此次重点不应因取消而提交')
+    page.screenshot(path=str(SCREENSHOTS / 'relay-review-continue-mobile.png'),full_page=True)
+    assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+    page.locator('#retry-dismiss').click();expect(page.locator('#retry-dialog')).to_be_hidden()
+    page.locator('#retry-task').click()
+    expect(page.locator('#review-focus-field')).to_be_hidden()
+    expect(page.locator('#retry-dialog-description')).to_contain_text('重新执行开发')
+    page.keyboard.press('Escape');expect(page.locator('#retry-dialog')).to_be_hidden()
+    page.locator('#review-task').click();expect(page.locator('#review-focus')).to_have_value('')
+    page.keyboard.press('Escape');expect(page.locator('#retry-dialog')).to_be_hidden()
+    assert len(data['review_requests'])==before_reviews and len(data['retry_requests'])==before_retries
+    # A stale second tab chooses ordinary continuation before the first tab
+    # reserves review-only. Both modes still share one authoritative successor.
+    stale_page=context.new_page();instrument(stale_page);stale_page.goto(base);connect(stale_page)
+    select_task(stale_page,140)
+    data['frozen_lists'][stale_page]=json.loads(json.dumps(visible_tasks()))
+    stale_page.locator('#retry-task').click();expect(stale_page.locator('#retry-dialog')).to_be_visible()
+    page.locator('#review-task').click()
+    for invalid_focus in [' \n\t','界'*2731]:
+        page.locator('#review-focus').fill(invalid_focus);page.locator('#retry-confirm').click()
+        expect(page.locator('#retry-dialog')).to_be_visible()
+        expect(page.locator('#retry-dialog-error')).to_contain_text('8192 UTF-8 字节')
+        assert len(data['review_requests'])==before_reviews
+    exact_focus='界'*2730+'ab'
+    assert len(exact_focus.encode('utf-8'))==8192
+    page.locator('#review-focus').fill(exact_focus)
+    data['continuation_post']='abort';page.locator('#retry-confirm').click()
+    expect(page.locator('#detail-error')).to_contain_text('续接未确认')
+    assert len(data['review_requests'])==before_reviews+1
+    original_review=data['review_requests'][-1]
+    assert original_review[0]==140 and original_review[1]['review_focus']==exact_focus
+    assert original_review[1]['revalidate_tests'] is True
+    assert 140 not in data['continuations']
+    expect(page.locator('#retry-task')).to_be_disabled()
+    page.locator('#review-task').click()
+    expect(page.locator('#review-focus')).to_have_value(exact_focus)
+    expect(page.locator('#review-focus')).to_be_disabled()
+    data['continuation_post']='success'
+    # Synchronous synthetic clicks exercise the in-flight guard even if the
+    # first handler closes the modal before the browser can deliver a second.
+    page.evaluate("""() => {
+        document.getElementById('review-focus').value = '不得替换未确认请求';
+        const confirm = document.getElementById('retry-confirm');
+        confirm.dispatchEvent(new MouseEvent('click', {bubbles:true}));
+        confirm.dispatchEvent(new MouseEvent('click', {bubbles:true}));
+    }""")
+    expect(page.locator('#detail-title')).to_have_text('任务 #141')
+    assert len(data['review_requests'])==before_reviews+2
+    assert data['review_requests'][-1]==original_review
+    expect(page.locator('#detail-meta')).to_contain_text('仅审查（先复验测试）')
+    assert data['continuations'][140]=={'successor_id':141}
+    accepted_review=json.loads(json.dumps(data['continuation_payloads'][140]))
+    expect(stale_page.locator('#retry-dialog')).to_be_visible()
+    stale_page.locator('#retry-confirm').click()
+    expect(stale_page.locator('#detail-title')).to_have_text('任务 #141')
+    assert len(data['retry_requests'])==before_retries+1
+    assert data['retry_requests'][-1][1]['key']!=original_review[1]['key']
+    assert data['continuation_payloads'][140]==accepted_review
+    assert [value['id'] for value in data['tasks'] if value['id']>140]==[141]
+    select_task(stale_page,140);assert_successor(stale_page,140,141);stale_page.close()
+    select_task(page,140);assert_successor(page,140,141)
+    for _ in range(2):
+        page.locator('#continuation-next').click();expect(page.locator('#detail-title')).to_have_text('任务 #141')
+        select_task(page,140);assert_successor(page,140,141)
+    assert len(data['review_requests'])==before_reviews+2
+    assert interrupted==original_interrupted, 'Review continuation must preserve the predecessor exactly'
+    # Reload and off-page successors resolve from persistent status, with no
+    # additional POST and without keeping credentials or state in web storage.
+    data['hidden_task_ids'].add(141)
+    page.reload();expect(page.locator('#auth-panel')).to_be_visible();connect(page)
+    assert page.locator('[data-task-id="141"]').count()==0
+    assert page.evaluate('localStorage.length + sessionStorage.length')==0
+    select_task(page,140);assert_successor(page,140,141)
+    page.locator('#continuation-next').click();expect(page.locator('#detail-title')).to_have_text('任务 #141')
+    assert len(data['review_requests'])==before_reviews+2
+    data['hidden_task_ids'].clear()
+    # Reverse the race: a review-only confirmation opened before ordinary
+    # continuation must return that original ordinary successor, not replace it.
+    reverse=review_task(150);data['tasks'].append(reverse)
+    with page.expect_response(lambda response: response.url==base+'/api/tasks'):
+        page.locator('#refresh').click()
+    select_task(page,150)
+    stale_page=context.new_page();instrument(stale_page);stale_page.goto(base);connect(stale_page)
+    select_task(stale_page,150)
+    data['frozen_lists'][stale_page]=json.loads(json.dumps(visible_tasks()))
+    stale_page.locator('#review-task').click();expect(stale_page.locator('#review-focus')).to_have_value('')
+    page.locator('#retry-task').click();page.locator('#retry-confirm').click()
+    expect(page.locator('#detail-title')).to_have_text('任务 #151')
+    accepted_full=json.loads(json.dumps(data['continuation_payloads'][150]))
+    assert accepted_full['path'].endswith('/retry')
+    stale_page.locator('#retry-confirm').click()
+    expect(stale_page.locator('#detail-title')).to_have_text('任务 #151')
+    assert data['review_requests'][-1][0]==150
+    assert data['review_requests'][-1][1]['review_focus'] is None
+    assert data['continuation_payloads'][150]==accepted_full
+    assert [value['id'] for value in data['tasks'] if value['id']>150]==[151]
+    select_task(stale_page,150);assert_successor(stale_page,150,151);stale_page.close()
+    select_task(page,150);assert_successor(page,150,151)
     # Logout clears sensitive task content and stops polling.
     page.locator('#logout').click();after_logout=len(requests);page.wait_for_timeout(2400)
     assert len(requests)==after_logout
@@ -351,6 +518,6 @@ with sync_playwright() as p:
     assert not page.locator('#workflow-field').is_visible()
     assert page.locator('#workflow-hint').inner_text()==''
     assert not errors, errors
-    print('PASS: optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, persisted continuation status, repeated successor navigation, stale two-tab confirmation, reload/new-context recovery, off-page successor detail/refresh, continuation chains, reserved-submit recovery, logout; no browser errors')
+    print('PASS: optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, persisted continuation status, repeated successor navigation, stale two-tab confirmation, reload/new-context recovery, off-page successor detail/refresh, continuation chains, reserved-submit recovery, review-only eligibility and dismissal, review focus UTF-8 boundary, immutable unknown-request retry, duplicate review confirmation, bidirectional cross-mode stale confirmations, review successor reload, logout; no browser errors')
     browser.close()
 server.shutdown()
