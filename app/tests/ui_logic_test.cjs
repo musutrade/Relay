@@ -6,6 +6,7 @@ const nodes=new Map(),windowEvents=new Map();let active=null;
 class Element{
  constructor(tag='div',id=''){this.tagName=tag.toUpperCase();this.id=id;this.children=[];this.attrs={};this.dataset={};this.hidden=false;this.disabled=false;this._text='';this._value='';this.className='';this.events=new Map();this.open=false;this.classList={toggle:(name,on)=>{let set=new Set(this.className.split(' ').filter(Boolean));on?set.add(name):set.delete(name);this.className=[...set].join(' ')}};}
  get value(){return this._value}set value(v){this._value=String(v)}
+ set innerHTML(_){throw Error('HTML must be rendered as text')}
  get textContent(){return this._text+this.children.map(x=>x.textContent||'').join('')}set textContent(v){this._text=String(v);this.children=[]}
  append(...items){for(const item of items){this.children.push(item);if(this.tagName==='SELECT'&&this.children.length===1)this.value=item.value;}}
  replaceChildren(...items){this.children=[];this._text='';this.append(...items)}
@@ -98,6 +99,40 @@ vm.runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1],ctx);
  const buttons=()=>$('task-list').querySelectorAll('button');const select=id=>buttons().find(e=>e.dataset.taskId===String(id)).emit('click');
  // Fixture detail endpoint must contain active too.
  db.push(status.active);await select(2);assert.equal($('detail-title').textContent,'任务 #2');assert(!$('detail-warning').hidden);assert(!$('detail-diagnostic').hidden);assert.match($('detail-diagnostic-text').textContent,/<script>/);await select(110);assert($('detail-diagnostic').hidden);
+ // Usage comes from persisted stage.provider.usage, never arbitrary nested data or log text.
+ const usageTask=db.find(t=>t.id===110),originalUsageTask={state:usageTask.state,result:usageTask.result};usageTask.state='finished';
+ const providerResult=(usage,provider='codex_app_server')=>({provider,summary:'provider summary',usage});
+ const showUsage=async result=>{usageTask.result=JSON.stringify(result);await select(110)};
+ const showProvider=async provider=>showUsage({outcome:'success',agent:{outcome:'success',provider},tests:null,draft_pr:null});
+ const usageStage=()=>$('usage-stages').children[0],counts=node=>node.children.map(group=>group.children[1].textContent),primaryCounts=()=>counts(usageStage().children[2]);
+ const lastSnapshot=()=>usageStage().children.find(child=>child.className==='usage-snapshot'),unknownCounts=['未知','未知','未知','未知'];
+ const snapshotUsage={input_tokens:100,cached_input_tokens:80,output_tokens:10,reasoning_output_tokens:4};
+ await showProvider(providerResult({...snapshotUsage,usage_scope:'last_snapshot',turn_total:{input_tokens:350,cached_input_tokens:240,output_tokens:35,reasoning_output_tokens:15}}));
+ assert(!$('detail-usage').hidden);assert.equal($('usage-stages').children.length,1);assert.match(usageStage().children[1].textContent,/本轮累计/);assert.deepEqual(primaryCounts(),['350','35','240','15']);
+ assert.match(lastSnapshot().children[0].textContent,/最后一次快照/);assert.deepEqual(counts(lastSnapshot().children[1]),['100','10','80','4']);assert(!usageStage().textContent.includes('供应商报告费用'));
+ assert.equal($('detail-result').textContent,JSON.stringify(JSON.parse(usageTask.result),null,2));
+ // No turn baseline means unknown, even when a last snapshot exists. Partial fields stay unknown.
+ await showProvider(providerResult({...snapshotUsage,usage_scope:'last_snapshot'}));assert.deepEqual(primaryCounts(),unknownCounts);assert.deepEqual(counts(lastSnapshot().children[1]),['100','10','80','4']);
+ await showProvider(providerResult({...snapshotUsage,usage_scope:'last_snapshot',turn_total:null}));assert.deepEqual(primaryCounts(),unknownCounts);
+ await showProvider(providerResult({usage_scope:'last_snapshot',turn_total:{input_tokens:0,output_tokens:7,cached_input_tokens:null}}));assert.deepEqual(primaryCounts(),['0','7','未知','未知']);assert.deepEqual(counts(lastSnapshot().children[1]),unknownCounts);
+ // Actual zeros are retained, including optional reported cost and provider counters.
+ const zeros={input_tokens:0,output_tokens:0,cached_input_tokens:0,reasoning_output_tokens:0};
+ await showProvider(providerResult({...zeros,usage_scope:'last_snapshot',turn_total:zeros,total_cost_usd:0,num_turns:0,cache_creation_input_tokens:0}));
+ assert.deepEqual(primaryCounts(),['0','0','0','0']);assert.deepEqual(counts(lastSnapshot().children[1]),['0','0','0','0']);assert.match(usageStage().textContent,/供应商报告费用：0 USD（非实际账单/);assert.match(usageStage().textContent,/缓存写入 token：0/);assert.match(usageStage().textContent,/turn 数：0/);
+ // Legacy app-server results cannot be silently relabeled as verified turn totals.
+ await showProvider(providerResult(snapshotUsage));assert.match(usageStage().children[1].textContent,/供应商报告的 token（统计范围未确认）/);assert.deepEqual(primaryCounts(),['100','10','80','4']);assert.equal(lastSnapshot(),undefined);assert(!usageStage().textContent.includes('本轮累计'));
+ // Other providers retain their own semantics: Claude input excludes cached/write tokens.
+ await showProvider(providerResult({input_tokens:60,cached_input_tokens:40,cache_creation_input_tokens:100,output_tokens:12,total_cost_usd:0.012345},'claude_cli'));
+ assert.deepEqual(primaryCounts(),['60','12','40','未知']);assert.match(usageStage().textContent,/统计范围未确认/);assert.match(usageStage().textContent,/缓存写入 token：100/);assert.match(usageStage().textContent,/供应商报告费用：0.012345 USD/);assert(!usageStage().textContent.includes('包含于'));
+ await showProvider(providerResult({...snapshotUsage,usage_scope:'future_scope',turn_total:zeros},'codex_cli'));assert.deepEqual(primaryCounts(),['100','10','80','4']);assert.equal(lastSnapshot(),undefined);assert.match(usageStage().textContent,/统计范围未确认/);
+ // Missing, malformed, unsafe or negative counts never coerce to zero or an invented total.
+ for(const usage of [undefined,null,{},[],{input_tokens:'0',output_tokens:-1,cached_input_tokens:1.5,reasoning_output_tokens:Number.MAX_SAFE_INTEGER+1,total_cost_usd:'0'}]){await showProvider(providerResult(usage));assert.deepEqual(primaryCounts(),unknownCounts);assert(!usageStage().textContent.includes('供应商报告费用'))}
+ // Names stay text, numerical fields reject injected strings, and only known stages are inspected.
+ const attack='<img src=x onerror=alert(1)>';
+ await showUsage({outcome:'success',agent:{provider:providerResult({input_tokens:attack,total_cost_usd:attack},attack),stdout:JSON.stringify({provider:providerResult(snapshotUsage)})},tests:{provider:providerResult(zeros,'test-provider')},draft_pr:{provider:providerResult(snapshotUsage,'publish-provider')},workflow:{rounds:[{developer:{provider:providerResult(snapshotUsage)}}]}});
+ assert.equal($('usage-stages').children.length,3);assert.match(usageStage().children[0].textContent,/<img/);assert.equal(usageStage().children[0].children.length,0);assert.deepEqual(primaryCounts(),unknownCounts);assert.equal($('usage-stages').querySelectorAll('img').length,0);assert.match($('usage-stages').children[1].children[0].textContent,/测试阶段/);assert.match($('usage-stages').children[2].children[0].textContent,/发布阶段/);
+ for(const result of [{outcome:'success',agent:null},{outcome:'success',provider:providerResult(snapshotUsage),agent:{stdout:JSON.stringify({provider:providerResult(snapshotUsage)})}},{agent:{provider:[]}},[],null,'plain result']){await showUsage(result);assert($('detail-usage').hidden);assert.equal($('usage-stages').children.length,0)}
+ Object.assign(usageTask,originalUsageTask);await select(110);assert($('detail-usage').hidden);assert.equal($('usage-stages').children.length,0);
  // A stale detail response cannot replace a newer selection.
  status={active:null,recovery_required:false,diagnostic:null};await $('refresh').emit('click');await tick();delayDetail=true;const oldSelection=select(109);await tick();const newSelection=select(110);await tick();const responses=pendingFetch;pendingFetch=[];responses.find(x=>x.url.endsWith('/110')).resolve();await tick();responses.find(x=>x.url.endsWith('/109')).resolve();await tick();await Promise.all([oldSelection,newSelection]);assert.equal($('detail-title').textContent,'任务 #110');delayDetail=false;
  // Network failure retains prior task list and recovers on successful sync.
@@ -119,5 +154,5 @@ vm.runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1],ctx);
  // Rejection of a formerly configured workflow returns to an editable ordinary form.
  $('token').value='test-token';await $('auth-form').emit('submit');await chooseWorkflow('reviewed');$('requirements').value='被移除的工作流';mode='401';await $('task-form').emit('submit');config={repositories:[],agents:[],tests:[],workflows:[]};mode='422';$('token').value='test-token';await $('auth-form').emit('submit');const rejectedOriginal=submissions.at(-1);assert(!$('submit-task').disabled);await $('task-form').emit('submit');await tick();assert.deepEqual(submissions.at(-1),rejectedOriginal);assert.equal($('workflow').value,'');assert($('workflow-field').hidden);assert(!$('requirements').disabled);assert(!$('repository').disabled);assert.equal($('requirements').value,'被移除的工作流');assert.match($('form-message').textContent,/提交被拒绝/);assert($('submit-task').disabled);
  for(const args of [['--session'],['--session','--restore'],['--hybrid'],['--hybrid','--restore']]){const result=require('node:child_process').spawnSync(process.execPath,[__filename,...args],{stdio:'inherit'});assert.equal(result.status,0,'session UI subprocess failed')}
- console.log('PASS: UI logic groups: stale config response; rejected workflow reset; optional workflow config; locked metadata and ordinary restoration; invalid selection; safe workflow text; workflow payload; workflow auth retry after config changes; back/forward session reset; no unauthenticated polling; token memory only; double-click submit; exact-key retry; 32-KiB UTF-8 validation; active-task merge; matched unknown diagnostic; selection race; network recovery; auth-expiry retry; logout abort/stale response/poll stop');
+ console.log('PASS: UI logic groups: per-stage token usage; verified turn totals and separate snapshots; legacy unverified scope; missing/zero/malformed counts; provider cache semantics; optional reported cost; safe usage text; stale config response; rejected workflow reset; optional workflow config; locked metadata and ordinary restoration; invalid selection; safe workflow text; workflow payload; workflow auth retry after config changes; back/forward session reset; no unauthenticated polling; token memory only; double-click submit; exact-key retry; 32-KiB UTF-8 validation; active-task merge; matched unknown diagnostic; selection race; network recovery; auth-expiry retry; logout abort/stale response/poll stop');
 })().catch(e=>{console.error(e);process.exitCode=1}).finally(()=>{windowEvents.get('pagehide')()});

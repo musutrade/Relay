@@ -20,7 +20,15 @@
 
 app-server 每轮有一个受监管进程。收到成功终态后，宿主结束并回收进程树，下一轮重新启动进程并恢复同一线程；测试期间不保留空闲进程。收到 approval、用户输入或动态工具请求时返回不支持并停止，不自动授权。每个 thread/turn 都设置原有 workspace-write 边界，网络保持关闭；不修改用户配置或凭据。自定义端点、认证、模型接受参数及服务端缓存收益，必须经单独授权的真实烟测确认，离线 fixture 不证明这些能力。
 
-Codex 冷恢复可在 `thread/resume` 响应后回放旧 turn 的 `thread/tokenUsage/updated`，即使设置了 `excludeTurns:true`。仅在恢复已确认且新 turn ID 尚未确定的窗口，适配器保留最新的一条有界用量快照；随后只将与新 turn ID 匹配的用量计入本轮，旧用量直接丢弃。用量通知不能确定 turn ID 或证明成功；跨线程通知、已确定 turn 后的错误 ID，以及旧 turn 的正文或终态仍失败关闭。对应上游测试见 [冷恢复用量回放](https://github.com/openai/codex/blob/main/codex-rs/app-server/tests/suite/v2/thread_resume.rs)。
+Codex 冷恢复可在 `thread/resume` 响应后回放旧 turn 的 `thread/tokenUsage/updated`，即使设置了 `excludeTurns:true`。仅在恢复已确认且新 turn ID 尚未确定的窗口，适配器保留至多 32 条有界用量快照。用量不能确定 turn ID 或证明成功；跨线程通知、已确定 turn 后的错误 ID，以及旧 turn 的正文或终态仍失败关闭。对应上游测试见 [冷恢复用量回放](https://github.com/openai/codex/blob/main/codex-rs/app-server/tests/suite/v2/thread_resume.rs)。
+
+### Token 用量口径
+
+Codex app-server 的 `usage` 旧字段继续保留 `tokenUsage.last`（最后一次快照），新增 `usage_scope: "last_snapshot"` 与可选 `turn_total`（本轮累计）。`turn_total` 从当前 `tokenUsage.total` 减去恢复窗口内已确认属于旧 turn 的累计基线；新建线程的基线为零。重复累计快照不相加，旧线程历史不算进本轮。缺少恢复基线、缺失某项计数时显示未知，不用最后一次快照冒充累计；计数下降（包括重置或无法区分的乱序）后，本次累计保持未知。失败/中断任务可保留停止前观察到的用量，但它不证明完整账单。协议没有可靠请求次数，`num_turns` 不解释为 API 请求数。
+
+输入/输出 token 是主要指标；Codex 缓存输入与推理输出分别是输入/输出的子集，不再重复相加。旧记录及其他 provider 维持原字段与原始口径，不推断它们一定是本轮累计；尤其 Claude 的缓存读取/创建字段不按 Codex 子集规则处理。费用仅保存 provider 明确报告的可选值，并标为报告费用，不表示订阅实际扣款；未知时不套用 API 单价估算。多轮工作流此处显示所保留阶段的用量，不声称整个任务累计。
+
+累计与缓存字段口径参考 [Codex TokenUsageInfo](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/protocol.rs) 和 [Claude 缓存说明](https://platform.claude.com/docs/zh-CN/build-with-claude/prompt-caching)。字段定义参考 [ThreadTokenUsage](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/typescript/v2/ThreadTokenUsage.ts) 和 [TokenUsageBreakdown](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/typescript/v2/TokenUsageBreakdown.ts)。
 
 ## 工作区与绑定
 
