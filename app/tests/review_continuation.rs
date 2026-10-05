@@ -993,6 +993,9 @@ impl Fixture {
             );
         executable(&path, &script);
         self.config.supervisor_program = Some(path);
+        // This protocol fixture adds a forwarding process to every Git phase;
+        // reserve headroom for a loaded aggregate test run, not production work.
+        self.config.timeout_seconds = 90;
     }
 
     fn make_phase_unknown(&self, phase: &str, cancel: bool) {
@@ -1008,12 +1011,29 @@ impl Fixture {
         let worker = std::thread::spawn(move || running.work_once());
         if cancel {
             let marker = self.temp.path().join("audit/unknown-started");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             while !marker.exists() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "unknown fixture phase never started"
-                );
+                if worker.is_finished() {
+                    let completed = worker.join();
+                    panic!(
+                        "worker exited before unknown fixture phase: result={completed:?}; task={:?}; status={:?}; last supervisor={:?}",
+                        app.get(id),
+                        app.status(),
+                        self.events("supervisor").last(),
+                    );
+                }
+                if std::time::Instant::now() >= deadline {
+                    let before = app.status();
+                    let cancellation = app.cancel(id);
+                    // Never detach a running fixture when synchronization fails.
+                    let completed = worker.join();
+                    panic!(
+                        "unknown fixture phase did not start within 60 seconds: status before cancel={before:?}; cancellation={cancellation:?}; result={completed:?}; task={:?}; status={:?}; last supervisor={:?}",
+                        app.get(id),
+                        app.status(),
+                        self.events("supervisor").last(),
+                    );
+                }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             assert_eq!(app.cancel(id).unwrap()["requested"], true);
