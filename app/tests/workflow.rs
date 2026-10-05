@@ -1147,3 +1147,48 @@ fn workflow_admission_plans_reviewer_copy_before_fetch_without_snapshot_exclusio
         }
     }
 }
+
+#[test]
+fn reviewer_gets_scoped_acceptance_and_host_observations() {
+    let mut fixture = Fixture::new();
+    fixture
+        .config
+        .workflows
+        .get_mut("checked")
+        .unwrap()
+        .review_focus = Some("Check changed.txt has the intended candidate content".into());
+    let reviewer = fixture.config.native_agents["reviewer"].program.clone();
+    let script = fs::read_to_string(&reviewer).unwrap().replace(
+        "prompt=sys.stdin.read()",
+        "prompt=sys.stdin.read()\nassert 'Check changed.txt has the intended candidate content' in prompt\nassert 'Implement the fixture' not in prompt\nassert '\"exit_code\":0' in prompt\nassert '\"outcome\":\"success\"' in prompt\nassert 'not independently attested' in prompt\nassert 'Do not read external test directories' in prompt",
+    );
+    write_executable(&reviewer, &script);
+    let result = fixture.run(false);
+    assert_eq!(result.outcome, Outcome::Success, "{result:?}");
+    assert!(
+        fs::read_to_string(fixture.repository().join(".git/developer-0"))
+            .unwrap()
+            .contains("Implement the fixture")
+    );
+}
+
+#[test]
+fn absent_review_focus_preserves_legacy_serialization_and_bounds() {
+    let mut fixture = Fixture::new();
+    let workflow = fixture.config.workflows.get_mut("checked").unwrap();
+    assert!(
+        serde_json::to_value(&*workflow)
+            .unwrap()
+            .get("review_focus")
+            .is_none()
+    );
+    workflow.review_focus = Some("x".repeat(8193));
+    assert!(Host::new(fixture.config.clone()).is_err());
+    fixture
+        .config
+        .workflows
+        .get_mut("checked")
+        .unwrap()
+        .review_focus = Some(" ".into());
+    assert!(Host::new(fixture.config).is_err());
+}
