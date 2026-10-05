@@ -16,6 +16,8 @@ pub struct Continuation {
     pub workspace_task_id: i64,
     pub predecessor_task_id: i64,
     pub predecessor_generation: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_only: Option<crate::workflow::ReviewContinuation>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -273,6 +275,7 @@ pub(crate) fn continuation(
         workspace_task_id: record.workspace_task_id,
         predecessor_task_id: task.id,
         predecessor_generation: task.generation,
+        review_only: None,
     })
 }
 pub(crate) fn attempt(path: &Path) -> io::Result<u64> {
@@ -410,6 +413,16 @@ pub(crate) fn cleanup(config: &HostConfig, store: &relay::Store) -> io::Result<u
 }
 
 pub(crate) fn read_marker(path: &Path) -> io::Result<String> {
+    read_bounded_record(path, 1024)
+}
+pub(crate) fn read_stopped_result(path: &Path) -> io::Result<RunResult> {
+    serde_json::from_str(&read_bounded_record(
+        &path.join("last-result.json"),
+        16 * 1024,
+    )?)
+    .map_err(io::Error::other)
+}
+fn read_bounded_record(path: &Path, limit: u64) -> io::Result<String> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -418,8 +431,8 @@ pub(crate) fn read_marker(path: &Path) -> io::Result<String> {
         return Err(io::Error::other("checkpoint must be a regular file"));
     }
     let mut text = String::new();
-    file.take(1025).read_to_string(&mut text)?;
-    if text.len() > 1024 {
+    file.take(limit + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > limit {
         return Err(io::Error::other("checkpoint exceeds its bound"));
     }
     Ok(text)

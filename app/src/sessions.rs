@@ -35,6 +35,7 @@ impl Session {
         profile: &NativeProfile,
         read_only: bool,
         attempt: u64,
+        require_resume: bool,
     ) -> io::Result<Self> {
         let role = if read_only { "reviewer" } else { "developer" };
         let root = workspace.join("sessions");
@@ -65,6 +66,11 @@ impl Session {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
+        if require_resume && existing.is_none() {
+            return Err(io::Error::other(
+                "review-only continuation requires the original reviewer session record; refusing a fresh session",
+            ));
+        }
         let resume = if let Some(record) = existing {
             if record.version != 1
                 || record.role != role
@@ -110,6 +116,52 @@ impl Session {
         };
         session.save()?; // Persist in-flight before a process can perform external effects.
         Ok(session)
+    }
+    pub(crate) fn verify_reviewer_resume(
+        workspace: &Path,
+        cwd: &Path,
+        profile: &NativeProfile,
+        attempt: u64,
+    ) -> io::Result<()> {
+        let root = workspace.join("sessions");
+        if !fs::symlink_metadata(&root)?.is_dir() || root.canonicalize()? != root {
+            return Err(io::Error::other(
+                "reviewer session directory missing or redirected",
+            ));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(root.join("reviewer.json"))?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other(
+                "reviewer session record must be a regular file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(LIMIT + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > LIMIT {
+            return Err(io::Error::other(
+                "reviewer session record exceeds its bound",
+            ));
+        }
+        let record: Record = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        if record.version != 1
+            || record.role != "reviewer"
+            || record.cwd != cwd.canonicalize()?
+            || record.profile_binding != binding(profile)?
+            || (!record.ready && record.attempt >= attempt)
+        {
+            return Err(io::Error::other(
+                "reviewer session binding changed or prior turn is not confirmed complete",
+            ));
+        }
+        validate_id(
+            record
+                .session_id
+                .as_deref()
+                .ok_or_else(|| io::Error::other("reviewer session ID checkpoint is missing"))?,
+        )
     }
     pub fn checkpoint(&self) -> Checkpoint {
         Checkpoint {
@@ -235,22 +287,22 @@ mod tests {
         let profile: NativeProfile =
             serde_json::from_value(json!({"provider":"codex_app_server","program":"/bin/true"}))
                 .unwrap();
-        let session = Session::begin(tmp.path(), &cwd, &profile, false, 1).unwrap();
-        assert!(Session::begin(tmp.path(), &cwd, &profile, false, 1).is_err());
+        let session = Session::begin(tmp.path(), &cwd, &profile, false, 1, false).unwrap();
+        assert!(Session::begin(tmp.path(), &cwd, &profile, false, 1, false).is_err());
         session.complete(Some("thread-1")).unwrap();
         let mut changed = profile.clone();
         changed.model = Some("different".into());
-        assert!(Session::begin(tmp.path(), &cwd, &changed, false, 1).is_err());
+        assert!(Session::begin(tmp.path(), &cwd, &changed, false, 1, false).is_err());
         let other = tmp.path().join("other");
         fs::create_dir(&other).unwrap();
-        assert!(Session::begin(tmp.path(), &other, &profile, false, 1).is_err());
+        assert!(Session::begin(tmp.path(), &other, &profile, false, 1, false).is_err());
         fs::copy(
             tmp.path().join("sessions/developer.json"),
             tmp.path().join("sessions/reviewer.json"),
         )
         .unwrap();
-        assert!(Session::begin(tmp.path(), &cwd, &profile, true, 1).is_err());
-        let resumed = Session::begin(tmp.path(), &cwd, &profile, false, 1).unwrap();
+        assert!(Session::begin(tmp.path(), &cwd, &profile, true, 1, false).is_err());
+        let resumed = Session::begin(tmp.path(), &cwd, &profile, false, 1, false).unwrap();
         assert_eq!(resumed.resume.as_deref(), Some("thread-1"));
         assert!(resumed.complete(Some("wrong-thread")).is_err());
     }

@@ -696,7 +696,7 @@ impl Host {
                 &job.requirements,
                 false,
                 &cancellation,
-                (workspace, &repository),
+                (workspace, &repository, false),
                 deadline,
             );
             result.outcome = command.outcome;
@@ -969,10 +969,10 @@ impl Host {
         input: &str,
         read_only: bool,
         cancellation: &AtomicBool,
-        paths: (&Path, &Path),
+        paths: (&Path, &Path, bool),
         deadline: Instant,
     ) -> CommandResult {
-        let (workspace, repository) = paths;
+        let (workspace, repository, require_resume) = paths;
         let mut compiled = match profile.compile(read_only) {
             Ok(compiled) => compiled,
             Err(error) => {
@@ -998,7 +998,14 @@ impl Host {
         }
         let session = if crate::sessions::enabled(profile) {
             match crate::workspaces::attempt(workspace).and_then(|attempt| {
-                crate::sessions::Session::begin(workspace, repository, profile, read_only, attempt)
+                crate::sessions::Session::begin(
+                    workspace,
+                    repository,
+                    profile,
+                    read_only,
+                    attempt,
+                    require_resume,
+                )
             }) {
                 Ok(session) => Some(session),
                 Err(error) => {

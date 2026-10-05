@@ -37,6 +37,7 @@ POST /api/tasks                 # {key,job:{repository,requirements,agent,test,p
 GET  /api/tasks/<id>
 POST /api/tasks/<id>/cancel
 POST /api/tasks/<id>/retry      # 显式核对后继续已停止失败任务，复用原工作区
+POST /api/tasks/<id>/continue-review # 同一候选复验一次测试后只继续审查，不重新开发
 ```
 
 同一 key 与相同规范化 job 返回原任务；同 key 配不同 job 返回 409。发送超时后应保留原 key 重试，避免重复执行。身份口令不是任务 owner；owner 仅是数据库一致性标识。
