@@ -641,6 +641,8 @@ with sync_playwright() as p:
     resource_task['result']=json.dumps({'outcome':'failure','workspace':'/fixture/task-180','draft_pr':None,'failure':{'code':'workspace_quota_exceeded','stage':'test','cause':'<img src=x onerror=alert(1)> logical capacity exceeded','required_bytes':20971520,'limit_bytes':10485760}})
     data['tasks'].append(resource_task)
     planned_operator=operator_fixture(resource_task)
+    assert planned_operator['resources']['quota_bytes']==resource_job['workspace_quota_bytes']
+    assert planned_operator['recovery']['inherited_quota_bytes']==resource_job['workspace_quota_bytes']
     planned_operator['recovery']['actions'][0].update(quota_increase_required=True,min_quota_bytes=20971520)
     data['operator_overrides'][180]=planned_operator
     with page.expect_response(lambda response: response.url==base+'/api/tasks'):
@@ -650,10 +652,13 @@ with sync_playwright() as p:
     expect(page.locator('#operator-failure')).to_contain_text('<img src=x onerror=alert(1)>')
     assert page.locator('#operator-failure img').count()==0
     expect(page.locator('#operator-retained')).to_contain_text('已保留且不可改写')
+    for label in ['已记录任务容量','无覆盖续接容量']:
+        expect(page.locator('#operator-resources > div').filter(has_text=label)).to_contain_text('10.00 MiB（10485760 字节）')
     page.locator('#retry-task').click();page.locator('#retry-confirm').click()
     expect(page.locator('#retry-dialog')).to_be_visible()
     expect(page.locator('#retry-dialog-error')).to_contain_text('宿主要求显式提高容量')
     page.locator('#retry-quota').fill('20971520')
+    expect(page.locator('#retry-dialog-error')).to_be_hidden()
     expect(page.locator('#retry-quota-summary')).to_contain_text('10485760 字节） → 20.00 MiB（20971520 字节）')
     for width in [1440,390,320]:
         page.set_viewport_size({'width':width,'height':900})

@@ -727,7 +727,10 @@
       const task = state.tasks.find(task => task.id === state.retryTarget), data = operatorFor(task), action = recoveryAction(task, state.retryMode), quota = $('retry-quota').value.trim();
       $('retry-quota-summary').textContent = data ? '本次确认容量：' + bytesText(data.resources.quota_bytes) + ' → ' + (quota ? bytesText(Number(quota)) : action?.quota_increase_required ? '必须显式提高（尚未选择）' : '无覆盖续接 ' + bytesText(data.recovery.inherited_quota_bytes)) + '；宿主上限 ' + bytesText(data.resources.host_policy_cap_bytes) : '';
     }
-    $('retry-quota').addEventListener('input', updateRetryQuotaSummary);
+    $('retry-quota').addEventListener('input', () => {
+      if (!$('retry-quota').disabled && !state.retryRequests.has(state.retryTarget)) showMessage('retry-dialog-error', '');
+      updateRetryQuotaSummary();
+    });
     $('retry-task').addEventListener('click', () => openContinuation('full'));
     $('review-task').addEventListener('click', () => openContinuation('review'));
     $('retry-dismiss').addEventListener('click', () => $('retry-dialog').close());
