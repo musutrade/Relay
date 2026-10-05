@@ -913,3 +913,220 @@ fn completed_provider_turn_with_malformed_verdict_can_resume_review_only() {
             .contains("Check changed.txt contains the intended fixture change")
     );
 }
+
+// Forward the ordinary private supervisor protocol unchanged. The selected
+// phase deliberately cannot attest cleanup, even though this local fixture has
+// no escaped process. Unknown must remain authoritative over later Git guards.
+const UNKNOWN_SUPERVISOR: &str = r#"#!/usr/bin/python3
+import json, os, pathlib, select, subprocess, sys
+root = pathlib.Path(__AUDIT__)
+line = sys.stdin.buffer.readline()
+spec = json.loads(line)
+event = {'program': spec['program'], 'args': spec['args'], 'cwd': spec['cwd']}
+with (root / 'supervisor.jsonl').open('a') as log:
+    log.write(json.dumps(event) + '\n')
+if (root / 'unknown-returned').exists():
+    with (root / 'post-unknown.jsonl').open('a') as log:
+        log.write(json.dumps(event) + '\n')
+control = root / 'unknown-control.json'
+selected = json.loads(control.read_text()) if control.exists() else {}
+is_reviewer = spec['program'] == __REVIEWER__ and spec.get('provider') is not None and spec.get('read_only') is True
+is_test = spec['program'] == __TEST__
+if (selected.get('phase') == 'reviewer' and is_reviewer) or (selected.get('phase') == 'test' and is_test):
+    cwd = pathlib.Path(spec['cwd'])
+    workspace = cwd.parent
+    (cwd / 'original.txt').write_text('mutation while cleanup is unknown\n')
+    (workspace / 'repository' / 'original.txt').write_text('mutation while cleanup is unknown\n')
+    (root / 'unknown-started').write_text(json.dumps(event))
+    if selected.get('cancel'):
+        # The test calls Application.cancel after observing unknown-started.
+        # Host cancellation closes this existing supervisor control pipe.
+        while os.read(sys.stdin.fileno(), 4096):
+            pass
+    (root / 'unknown-returned').write_text('yes')
+    print(json.dumps({'outcome': 'unknown', 'exit_code': None, 'signal': None,
+        'stdout': '', 'stderr': '', 'stdout_truncated': False, 'stderr_truncated': False,
+        'duration_ms': 0, 'supervisor_pid': os.getpid(), 'error': 'fixture cleanup remains unknown'}), flush=True)
+    sys.exit(0)
+child = subprocess.Popen([__SUPERVISOR__, '__relay_host_supervisor'], stdin=subprocess.PIPE,
+    pass_fds=(198,) if spec.get('workspace_lease') else ())
+child.stdin.write(line)
+child.stdin.flush()
+control_open = True
+while child.poll() is None:
+    if control_open:
+        ready, _, _ = select.select([sys.stdin], [], [], 0.01)
+        if ready:
+            data = os.read(sys.stdin.fileno(), 4096)
+            if data:
+                child.stdin.write(data)
+                child.stdin.flush()
+            else:
+                child.stdin.close()
+                control_open = False
+    else:
+        child.wait()
+if control_open:
+    child.stdin.close()
+sys.exit(child.returncode)
+"#;
+
+impl Fixture {
+    fn unknown_supervisor(&mut self) {
+        let path = self.temp.path().join("unknown-supervisor");
+        let script = UNKNOWN_SUPERVISOR
+            .replace(
+                "__AUDIT__",
+                &json!(self.temp.path().join("audit")).to_string(),
+            )
+            .replace(
+                "__REVIEWER__",
+                &json!(self.config.native_agents["reviewer"].program).to_string(),
+            )
+            .replace(
+                "__TEST__",
+                &json!(self.config.tests["check"].program).to_string(),
+            )
+            .replace(
+                "__SUPERVISOR__",
+                &json!(env!("CARGO_BIN_EXE_relay-app")).to_string(),
+            );
+        executable(&path, &script);
+        self.config.supervisor_program = Some(path);
+    }
+
+    fn make_phase_unknown(&self, phase: &str, cancel: bool) {
+        fs::write(
+            self.temp.path().join("audit/unknown-control.json"),
+            json!({"phase": phase, "cancel": cancel}).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn execute_unknown(&self, app: &Arc<Application>, id: i64, cancel: bool) -> RunResult {
+        let running = Arc::clone(app);
+        let worker = std::thread::spawn(move || running.work_once());
+        if cancel {
+            let marker = self.temp.path().join("audit/unknown-started");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !marker.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "unknown fixture phase never started"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(app.cancel(id).unwrap()["requested"], true);
+        }
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(relay_app::Error::RecoveryRequired)
+        ));
+        let task = app.get(id).unwrap();
+        assert_eq!(task.state, relay::State::Claimed);
+        assert!(task.result.is_none());
+        let status = app.status().unwrap();
+        assert_eq!(status["active"]["id"], id);
+        assert_eq!(status["recovery_required"], true);
+        let diagnostic: RunResult =
+            serde_json::from_str(status["diagnostic"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            diagnostic.outcome,
+            Outcome::Unknown,
+            "{}",
+            diagnostic.to_json()
+        );
+        assert!(diagnostic.draft_pr.is_none());
+        let workflow = diagnostic.workflow.as_ref().unwrap();
+        assert!(workflow.publication.is_none());
+        assert!(workflow.reviewed_sha.is_none());
+        assert!(self.temp.path().join("audit/unknown-returned").is_file());
+        assert!(
+            self.events("post-unknown").is_empty(),
+            "host started a process after Unknown"
+        );
+        let workspace = diagnostic.workspace.as_ref().unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.join("repository/original.txt")).unwrap(),
+            "mutation while cleanup is unknown\n"
+        );
+        assert!(!workspace.join("publication-attempt.json").exists());
+        assert!(
+            app.continue_review(id, request("cannot-continue-unknown"))
+                .is_err()
+        );
+        assert!(
+            app.retry(
+                id,
+                RetryRequest {
+                    key: "cannot-retry-unknown".into(),
+                    confirm_stopped_and_reconciled: true
+                }
+            )
+            .is_err()
+        );
+        assert!(app.get_view(id).unwrap().continuation_status.is_none());
+        diagnostic
+    }
+}
+
+#[test]
+fn unknown_normal_reviewer_retains_claim_despite_candidate_mutation_and_cancellation() {
+    for cancel in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.unknown_supervisor();
+        fixture.make_phase_unknown("reviewer", cancel);
+        let app = fixture.open();
+        app.submit(fixture.input()).unwrap();
+        let diagnostic = fixture.execute_unknown(&app, 1, cancel);
+        assert_eq!(
+            diagnostic
+                .workflow
+                .as_ref()
+                .unwrap()
+                .rounds
+                .last()
+                .unwrap()
+                .reviewer
+                .as_ref()
+                .unwrap()
+                .outcome,
+            Outcome::Unknown
+        );
+        fixture.assert_calls(1, 1, 0);
+        assert_eq!(app.list(None).unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn unknown_review_only_tests_or_reviewer_never_downgrade_or_release_claim() {
+    for (phase, cancel) in [
+        ("test", false),
+        ("test", true),
+        ("reviewer", false),
+        ("reviewer", true),
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.unknown_supervisor();
+        let (app, _) = fixture.failed_review();
+        let original = app.get(1).unwrap();
+        let child = app
+            .continue_review(1, request("review-may-be-unknown"))
+            .unwrap();
+        fixture.make_phase_unknown(phase, cancel);
+        let diagnostic = fixture.execute_unknown(&app, child.id, cancel);
+        assert!(diagnostic.agent.is_none());
+        let round = diagnostic.workflow.as_ref().unwrap().rounds.last().unwrap();
+        if phase == "test" {
+            assert_eq!(diagnostic.tests.as_ref().unwrap().outcome, Outcome::Unknown);
+            assert!(round.reviewer.is_none());
+            fixture.assert_calls(1, 1, 1);
+        } else {
+            assert_eq!(diagnostic.tests.as_ref().unwrap().outcome, Outcome::Success);
+            assert_eq!(round.reviewer.as_ref().unwrap().outcome, Outcome::Unknown);
+            fixture.assert_calls(1, 2, 1);
+        }
+        assert_eq!(app.get(1).unwrap(), original);
+        assert_eq!(app.list(None).unwrap().len(), 2);
+    }
+}

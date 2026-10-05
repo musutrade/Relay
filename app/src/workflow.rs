@@ -1412,14 +1412,20 @@ fn run_review_only(
     workflow.rounds.last_mut().expect("round recorded").tests =
         Some(StageSummary::from_command(&test));
     result.tests = Some(test);
+    let test = result.tests.as_ref().expect("test recorded");
+    if test.outcome == Outcome::Unknown {
+        // Process safety is unknown: do not run Git or downgrade the live claim.
+        return Err(Stop::command(test, "review-only test revalidation"));
+    }
     context.verify(config, candidate)?;
     let test = result.tests.as_ref().expect("test recorded");
-    if test.outcome != Outcome::Success
-        || test.exit_code != Some(0)
-        || test.signal.is_some()
-        || test.error.is_some()
-    {
+    if test.outcome != Outcome::Success {
         return Err(Stop::command(test, "review-only test revalidation"));
+    }
+    if test.exit_code != Some(0) || test.signal.is_some() || test.error.is_some() {
+        return Err(Stop::failure(
+            "review-only test revalidation has inconsistent success evidence",
+        ));
     }
     let verdict = review_candidate(context, config, result, workflow, continuation.round)?;
     if verdict == ReviewVerdict::Approved {
@@ -1518,6 +1524,11 @@ fn review_candidate(
     );
     workflow.rounds.last_mut().expect("round recorded").reviewer =
         Some(StageSummary::from_command(&reviewer));
+    if reviewer.outcome == Outcome::Unknown {
+        // Unknown supervisor completion must keep the queue claim fenced, even
+        // if cancellation, timeout or candidate mutation would fail verification.
+        return Err(Stop::command(&reviewer, "reviewer"));
+    }
     context.verify(config, candidate)?;
     review_context.verify(config, candidate)?;
     if reviewer.outcome != Outcome::Success {
