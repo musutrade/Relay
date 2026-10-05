@@ -357,23 +357,27 @@ with sync_playwright() as p:
     page.locator('#requirements').fill('')
     # Recovery disables further submission and exposes diagnostic as inert text.
     data['status']['recovery_required']=True;data['status']['diagnostic']=json.dumps({'outcome':'unknown','reason':'进程组状态待人工核对 <b>safe</b>'})
-    page.locator('#refresh').click();page.wait_for_timeout(150)
-    assert page.locator('#recovery-banner').is_visible()
-    assert page.locator('#submit-task').is_disabled()
-    page.locator('.task-button[data-task-id="2"]').click()
-    assert page.locator('#detail-warning').is_visible()
-    assert '<b>safe</b>' in page.locator('#detail-diagnostic-text').inner_text()
-    page.locator('.task-button[data-task-id="4"]').click()
-    assert not page.locator('#detail-diagnostic').is_visible()
+    page.locator('#refresh').click()
+    # Refresh waits for both reads and may discard an overlapping stale revision.
+    # Assert the rendered state, rather than assuming a 150 ms completion window.
+    expect(page.locator('#recovery-banner')).to_be_visible()
+    expect(page.locator('#submit-task')).to_be_disabled()
+    select_task(page,2)
+    expect(page.locator('#detail-warning')).to_be_visible()
+    expect(page.locator('#detail-diagnostic-text')).to_contain_text('<b>safe</b>')
+    select_task(page,4)
+    expect(page.locator('#detail-diagnostic')).to_be_hidden()
     page.screenshot(path=str(SCREENSHOTS / 'relay-recovery-desktop.png'),full_page=True)
     # Network banner with last-known data.
-    data['list_error']=True;page.locator('#refresh').click();page.wait_for_timeout(150)
-    assert page.locator('#network-banner').is_visible()
-    assert page.locator('.task-button').count()==4
-    data['list_error']=False;page.locator('#refresh-error').click();page.wait_for_timeout(150)
-    assert not page.locator('#network-banner').is_visible()
+    data['list_error']=True;page.locator('#refresh').click()
+    expect(page.locator('#network-banner')).to_be_visible()
+    expect(page.locator('.task-button')).to_have_count(4)
+    data['list_error']=False;page.locator('#refresh-error').click()
+    expect(page.locator('#network-banner')).to_be_hidden()
     # Mobile / dark / zoom-like narrow viewport: no horizontal scrolling.
-    data['status']['recovery_required']=False;data['status']['diagnostic']=None;page.locator('#refresh').click();page.wait_for_timeout(150)
+    data['status']['recovery_required']=False;data['status']['diagnostic']=None;page.locator('#refresh').click()
+    expect(page.locator('#recovery-banner')).to_be_hidden()
+    expect(page.locator('#submit-task')).to_be_enabled()
     for width in [390,320,768,1024,1440]:
         page.set_viewport_size({'width':width,'height':900})
         assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'overflow at {width}'
