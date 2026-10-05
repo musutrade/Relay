@@ -22,6 +22,9 @@ assert a['method']==('thread/resume' if n else 'thread/start')
 assert a['params']['sandbox']=='workspace-write' and a['params']['approvalPolicy']=='never'
 if n: assert a['params']['threadId']=='developer-thread' and a['params']['excludeTurns'] is True
 send({'id':a['id'],'result':{'thread':{'id':'developer-thread'},'model':'fixture-model'}})
+if n:
+    # Cold resume restores historical usage before the new turn starts.
+    send({'method':'thread/tokenUsage/updated','params':{'threadId':'developer-thread','turnId':'turn-'+str(n-1),'tokenUsage':{'last':{'inputTokens':900}}}})
 a=recv(); assert a['method']=='turn/start'; p=a['params']; assert p['sandboxPolicy']['networkAccess'] is False
 assert p['cwd']==os.getcwd() and p['approvalPolicy']=='never'
 turn='turn-'+str(n);send({'id':a['id'],'result':{'turn':{'id':turn}}})

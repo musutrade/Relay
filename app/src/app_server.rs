@@ -1,6 +1,6 @@
 //! Bounded Codex app-server stdio client. The supervisor owns the process tree;
 //! this driver owns only request correlation and one explicitly identified turn.
-use crate::providers::{MAX_PROTOCOL_LINE, ProviderResult};
+use crate::providers::{MAX_PROTOCOL_LINE, ProviderResult, ProviderUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -24,6 +24,7 @@ pub(crate) struct Driver {
     pending: Vec<u8>,
     request: u64,
     turn: Option<String>,
+    resume_usage: Option<(String, ProviderUsage)>,
     terminal: bool,
     answer_seen: bool,
     error: Option<String>,
@@ -37,6 +38,7 @@ impl Driver {
             pending: Vec::new(),
             request: 1,
             turn: None,
+            resume_usage: None,
             terminal: false,
             answer_seen: false,
             error: None,
@@ -69,6 +71,14 @@ impl Driver {
         if self.error.is_none() {
             self.error = Some(text.to_owned());
         }
+    }
+    fn bind_turn(&mut self, id: String) {
+        if let Some((usage_turn, usage)) = self.resume_usage.take()
+            && usage_turn == id
+        {
+            self.result.usage = usage;
+        }
+        self.turn = Some(id);
     }
     pub fn feed(&mut self, bytes: &[u8]) {
         for &byte in bytes {
@@ -164,7 +174,7 @@ impl Driver {
                     if self.turn.as_ref().is_some_and(|expected| expected != &id) {
                         return Err("app-server turn response changed the active turn".into());
                     }
-                    self.turn = Some(id);
+                    self.bind_turn(id);
                 }
                 _ => unreachable!(),
             }
@@ -206,8 +216,20 @@ impl Driver {
             } else {
                 id_field(params, "turnId")?
             };
+            if method == "thread/tokenUsage/updated"
+                && self.start.resume.is_some()
+                && self.request == 3
+                && self.turn.is_none()
+            {
+                // Cold resume replays historical usage after its response, even
+                // with excludeTurns. Keep only the latest bounded snapshot until
+                // turn/start or turn/started identifies our turn. Historical
+                // usage must neither bind that turn nor count as this run's usage.
+                self.resume_usage = Some((turn, token_usage(params)?));
+                return Ok(());
+            }
             if self.turn.is_none() && method == "turn/started" && self.request == 3 {
-                self.turn = Some(turn.clone());
+                self.bind_turn(turn.clone());
             }
             if self.turn.as_ref() != Some(&turn) {
                 return Err("app-server notification belongs to another turn".into());
@@ -253,11 +275,7 @@ impl Driver {
                 }
             }
             "thread/tokenUsage/updated" => {
-                let usage = &params["tokenUsage"]["last"];
-                self.result.usage.input_tokens = number(usage, "inputTokens")?;
-                self.result.usage.cached_input_tokens = number(usage, "cachedInputTokens")?;
-                self.result.usage.output_tokens = number(usage, "outputTokens")?;
-                self.result.usage.reasoning_output_tokens = number(usage, "reasoningOutputTokens")?;
+                self.result.usage = token_usage(params)?;
             }
             "turn/started"
             | "turn/diff/updated"
@@ -312,6 +330,16 @@ fn number(value: &Value, key: &str) -> Result<Option<u64>, String> {
             .ok_or_else(|| "invalid app-server usage count".into()),
     }
 }
+fn token_usage(params: &Value) -> Result<ProviderUsage, String> {
+    let usage = &params["tokenUsage"]["last"];
+    Ok(ProviderUsage {
+        input_tokens: number(usage, "inputTokens")?,
+        cached_input_tokens: number(usage, "cachedInputTokens")?,
+        output_tokens: number(usage, "outputTokens")?,
+        reasoning_output_tokens: number(usage, "reasoningOutputTokens")?,
+        ..ProviderUsage::default()
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -340,7 +368,7 @@ mod tests {
             driver.feed(chunk);
         }
     }
-    fn start(driver: &mut Driver) {
+    fn start_pending(driver: &mut Driver) {
         assert!(
             String::from_utf8(driver.take_pending())
                 .unwrap()
@@ -361,7 +389,145 @@ mod tests {
         assert!(request.contains("turn/start"));
         assert!(request.contains("\"networkAccess\":false"));
         assert!(request.contains("\"approvalPolicy\":\"never\""));
+    }
+    fn start(driver: &mut Driver) {
+        start_pending(driver);
         feed(driver, json!({"id":3,"result":{"turn":{"id":"turn-1"}}}));
+    }
+    fn usage(thread: &str, turn: &str, input: u64) -> Value {
+        json!({"method":"thread/tokenUsage/updated","params":{
+            "threadId":thread,"turnId":turn,"tokenUsage":{"last":{"inputTokens":input}}
+        }})
+    }
+    #[test]
+    fn resume_usage_replay_does_not_bind_or_charge_the_new_turn() {
+        for started_first in [false, true] {
+            let mut d = driver(Some("thread-1"));
+            // The turn/start request is already sent, but its response is pending.
+            start_pending(&mut d);
+            feed(&mut d, usage("thread-1", "previous-turn", 900));
+            assert!(d.failure().is_none(), "{:?}", d.failure());
+            assert!(d.turn.is_none());
+            assert!(d.result.usage.input_tokens.is_none());
+            if started_first {
+                feed(
+                    &mut d,
+                    json!({"method":"turn/started","params":{
+                        "threadId":"thread-1","turn":{"id":"turn-1"}
+                    }}),
+                );
+                assert!(d.result.usage.input_tokens.is_none());
+                // Live usage before the response must still be retained.
+                feed(&mut d, usage("thread-1", "turn-1", 12));
+            }
+            feed(&mut d, json!({"id":3,"result":{"turn":{"id":"turn-1"}}}));
+            if !started_first {
+                assert!(d.result.usage.input_tokens.is_none());
+                feed(&mut d, usage("thread-1", "turn-1", 12));
+            }
+            answer(&mut d);
+            complete(&mut d, "completed");
+            let (result, error) = d.finish();
+            assert!(error.is_none(), "{error:?}");
+            assert_eq!(result.usage.input_tokens, Some(12));
+        }
+    }
+    #[test]
+    fn pending_current_usage_is_retained_only_after_matching_turn_identity() {
+        for started_first in [false, true] {
+            let mut d = driver(Some("thread-1"));
+            start_pending(&mut d);
+            feed(&mut d, usage("thread-1", "previous-turn", 900));
+            feed(&mut d, usage("thread-1", "turn-1", 12));
+            assert!(d.turn.is_none());
+            assert!(d.result.usage.input_tokens.is_none());
+            if started_first {
+                feed(
+                    &mut d,
+                    json!({"method":"turn/started","params":{
+                        "threadId":"thread-1","turn":{"id":"turn-1"}
+                    }}),
+                );
+            }
+            feed(&mut d, json!({"id":3,"result":{"turn":{"id":"turn-1"}}}));
+            answer(&mut d);
+            complete(&mut d, "completed");
+            let (result, error) = d.finish();
+            assert!(error.is_none(), "{error:?}");
+            assert_eq!(result.usage.input_tokens, Some(12));
+        }
+        let mut d = driver(Some("thread-1"));
+        start_pending(&mut d);
+        feed(&mut d, usage("thread-1", "previous-turn", 900));
+        assert!(d.finish().1.is_some()); // Usage alone cannot complete a turn.
+    }
+    #[test]
+    fn resume_usage_window_does_not_relax_thread_or_turn_fencing() {
+        let bad = [
+            usage("other-thread", "previous-turn", 900),
+            usage("thread-1", "", 900),
+            json!({"method":"thread/tokenUsage/updated","params":{
+                "threadId":"thread-1","turnId":"previous-turn",
+                "tokenUsage":{"last":{"inputTokens":-1}}
+            }}),
+            json!({"method":"turn/completed","params":{
+                "threadId":"thread-1","turn":{"id":"previous-turn","status":"completed"}
+            }}),
+            json!({"method":"item/completed","params":{
+                "threadId":"thread-1","turnId":"previous-turn",
+                "item":{"type":"agentMessage","text":"old answer"}
+            }}),
+        ];
+        for event in bad {
+            let mut d = driver(Some("thread-1"));
+            start_pending(&mut d);
+            feed(&mut d, event);
+            assert!(d.failure().is_some());
+        }
+        let mut fresh = driver(None);
+        start_pending(&mut fresh);
+        feed(&mut fresh, usage("thread-1", "previous-turn", 900));
+        assert!(fresh.failure().is_some());
+
+        let mut before_resume = driver(Some("thread-1"));
+        before_resume.take_pending();
+        feed(&mut before_resume, json!({"id":1,"result":{}}));
+        feed(&mut before_resume, usage("thread-1", "previous-turn", 900));
+        assert!(before_resume.failure().is_some());
+
+        for started_first in [false, true] {
+            let mut active = driver(Some("thread-1"));
+            start_pending(&mut active);
+            if started_first {
+                feed(
+                    &mut active,
+                    json!({"method":"turn/started","params":{
+                        "threadId":"thread-1","turn":{"id":"turn-1"}
+                    }}),
+                );
+            } else {
+                feed(
+                    &mut active,
+                    json!({"id":3,"result":{"turn":{"id":"turn-1"}}}),
+                );
+            }
+            feed(&mut active, usage("thread-1", "previous-turn", 900));
+            assert!(active.failure().is_some());
+        }
+        let mut changed = driver(Some("thread-1"));
+        start_pending(&mut changed);
+        feed(&mut changed, usage("thread-1", "turn-1", 12));
+        feed(
+            &mut changed,
+            json!({"method":"turn/started","params":{
+                "threadId":"thread-1","turn":{"id":"turn-1"}
+            }}),
+        );
+        feed(
+            &mut changed,
+            json!({"id":3,"result":{"turn":{"id":"other-turn"}}}),
+        );
+        assert!(changed.failure().is_some());
     }
     fn answer(driver: &mut Driver) {
         feed(
