@@ -14,7 +14,7 @@ mod workspaces;
 use host::{Host, HostConfig, Job};
 use relay::{Store, Task};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     path::Path,
@@ -54,6 +54,41 @@ pub struct Submission {
 pub struct RetryRequest {
     pub key: String,
     pub confirm_stopped_and_reconciled: bool,
+}
+
+/// Adapter-owned continuation metadata; the core task and result stay immutable.
+#[derive(Serialize)]
+pub struct TaskView {
+    #[serde(flatten)]
+    pub task: Task,
+    pub continuation_status: Option<ContinuationStatus>,
+}
+#[derive(Serialize)]
+pub struct ContinuationStatus {
+    /// None means a durable reservation still needs its idempotent submission retried.
+    pub successor_id: Option<i64>,
+}
+
+fn task_view(control: &Connection, task: Task) -> Result<TaskView> {
+    // Resolve a submission committed before the task_id checkpoint without writing
+    // on reads. Match both immutable key and payload, never just a caller's key.
+    let continuation_status = control
+        .query_row(
+            "SELECT COALESCE(c.task_id, t.id) FROM app_continuations c
+             LEFT JOIN tasks t ON t.key=c.key AND t.payload=c.payload
+             WHERE c.predecessor_id=?1",
+            [task.id],
+            |row| {
+                Ok(ContinuationStatus {
+                    successor_id: row.get(0)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(TaskView {
+        task,
+        continuation_status,
+    })
 }
 
 struct StateData {
@@ -205,6 +240,19 @@ impl Application {
             .map_err(|_| Error::Poisoned)?
             .store
             .list(before, 100)?)
+    }
+    pub fn get_view(&self, id: i64) -> Result<TaskView> {
+        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        task_view(&state.control, state.store.get(id)?)
+    }
+    pub fn list_views(&self, before: Option<i64>) -> Result<Vec<TaskView>> {
+        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        state
+            .store
+            .list(before, 100)?
+            .into_iter()
+            .map(|task| task_view(&state.control, task))
+            .collect()
     }
     pub fn status(&self) -> Result<Value> {
         let state = self.state.lock().map_err(|_| Error::Poisoned)?;

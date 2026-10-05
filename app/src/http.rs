@@ -145,14 +145,14 @@ struct Page {
 async fn list(
     State(state): State<Web>,
     Query(page): Query<Page>,
-) -> Result<Json<Vec<relay::Task>>, ApiError> {
-    Ok(Json(state.app.list(page.before)?))
+) -> Result<Json<Vec<crate::TaskView>>, ApiError> {
+    Ok(Json(state.app.list_views(page.before)?))
 }
 async fn detail(
     State(state): State<Web>,
     Path(id): Path<i64>,
-) -> Result<Json<relay::Task>, ApiError> {
-    Ok(Json(state.app.get(id)?))
+) -> Result<Json<crate::TaskView>, ApiError> {
+    Ok(Json(state.app.get_view(id)?))
 }
 async fn submit(
     State(state): State<Web>,
