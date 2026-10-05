@@ -296,3 +296,41 @@ fn explicitly_retried_failed_app_server_turn_resumes_checkpointed_id_and_files()
         "2"
     );
 }
+
+#[test]
+fn reviewer_copy_shares_budget_and_reused_checkout_is_not_counted_twice() {
+    let mut f = Fixture::new("codex_app_server", true);
+    let source = &f.config.repositories["source"];
+    fs::write(source.join("large"), vec![b'x'; 1024 * 1024]).unwrap();
+    for args in [
+        vec!["add", "large"],
+        vec![
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-m",
+            "sized baseline",
+        ],
+    ] {
+        assert!(
+            Command::new("/usr/bin/git")
+                .args(args)
+                .current_dir(source)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    f.config.max_workspace_bytes = Some(2560 * 1024);
+    let result = Host::new(f.config.clone())
+        .unwrap()
+        .execute(&f.task(1), Arc::new(AtomicBool::new(false)));
+    assert_eq!(result.outcome, Outcome::Success, "{result:?}");
+    assert_eq!(result.workflow.unwrap().rounds.len(), 2);
+    let workspace = result.workspace.unwrap();
+    assert!(workspace.join("repository/large").exists());
+    assert!(workspace.join("reviewer-repository/large").exists());
+}

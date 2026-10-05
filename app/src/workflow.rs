@@ -719,6 +719,30 @@ impl Execution<'_> {
         }
         Ok(())
     }
+    // A cheap estimate from the already materialized, clean tracked files.
+    // Filters may change checkout size; Git packs and future growth remain unknown.
+    fn worktree_bytes(&self, config: &WorkflowConfig, cwd: &Path, sha: &str) -> Result<u64, Stop> {
+        let manifest = self.git(config, cwd, &["ls-tree", "-r", "-z", sha, "--"])?;
+        let mut bytes = 0u64;
+        for file in parse_manifest(&manifest)? {
+            self.active()?;
+            let metadata = fs::symlink_metadata(cwd.join(file.path))
+                .map_err(|error| Stop::failure(error.to_string()))?;
+            if !metadata.is_file() {
+                return Err(Stop::failure(
+                    "workspace admission requires regular tracked files",
+                ));
+            }
+            bytes = bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| Stop::failure("workspace admission byte count overflow"))?;
+        }
+        Ok(bytes)
+    }
+    fn admit_worktree(&self, bytes: u64) -> Result<(), Stop> {
+        crate::host::check_workspace_admission(self.workspace, self.host.config(), bytes)
+            .map_err(|error| Stop::failure(error.to_string()))
+    }
     fn prepare_reviewer(&self, config: &WorkflowConfig, candidate: &str) -> Result<PathBuf, Stop> {
         let repository = self.workspace.join("reviewer-repository");
         let marker = self.workspace.join("reviewer-candidate.txt");
@@ -732,6 +756,8 @@ impl Execution<'_> {
             deadline: self.deadline,
             cancellation: self.cancellation,
         };
+        let candidate_bytes = self.worktree_bytes(config, self.repository, candidate)?;
+        let mut existing_bytes = 0;
         if repository.exists() {
             let previous = crate::workspaces::read_marker(&marker)
                 .map_err(|error| Stop::failure(error.to_string()))?;
@@ -739,7 +765,9 @@ impl Execution<'_> {
                 return Err(Stop::failure("invalid prior reviewer candidate"));
             }
             review.verify(config, &previous)?;
+            existing_bytes = review.worktree_bytes(config, &repository, &previous)?;
         } else {
+            self.admit_worktree(candidate_bytes)?;
             fs::create_dir(&repository).map_err(|error| Stop::failure(error.to_string()))?;
             let format = self.git(
                 config,
@@ -773,6 +801,8 @@ impl Execution<'_> {
                 candidate,
             ],
         )?;
+        // The fetched objects now count in the same task budget as both checkouts.
+        self.admit_worktree(candidate_bytes.saturating_sub(existing_bytes))?;
         review.git(
             config,
             &repository,
@@ -831,6 +861,17 @@ impl Execution<'_> {
         }
         let base = self.sha(config, source, "HEAD^{commit}")?;
         self.clean(config, source)?;
+        let worktree_bytes = self.worktree_bytes(config, source, &base)?;
+        let copies =
+            if crate::sessions::enabled(&self.host.config().native_agents[&config.reviewer]) {
+                2
+            } else {
+                1
+            };
+        let planned_bytes = worktree_bytes
+            .checked_mul(copies)
+            .ok_or_else(|| Stop::failure("workspace admission byte count overflow"))?;
+        self.admit_worktree(planned_bytes)?;
         let format = self.git(config, source, &["rev-parse", "--show-object-format"])?;
         let format = format.trim();
         if !matches!(format, "sha1" | "sha256") {
@@ -861,6 +902,8 @@ impl Execution<'_> {
                 &base,
             ],
         )?;
+        // Recheck after fetch so Git objects count before materializing worktrees.
+        self.admit_worktree(planned_bytes)?;
         self.git(
             config,
             self.repository,

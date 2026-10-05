@@ -1112,3 +1112,38 @@ fn preserved_workflow_recovery_never_resets_missing_or_changed_baselines() {
         );
     }
 }
+
+#[test]
+fn workflow_admission_plans_reviewer_copy_before_fetch_without_snapshot_exclusions() {
+    for isolated in [false, true] {
+        let mut f = Fixture::new();
+        fs::write(f.source.join("large"), vec![b'x'; 1024 * 1024]).unwrap();
+        git(&f.source, &["add", "large"]);
+        git(&f.source, &["commit", "-m", "sized baseline"]);
+        f.config.max_snapshot_bytes = 64; // Workflow import is not a snapshot copy.
+        f.config.max_workspace_bytes = Some(1536 * 1024);
+        if isolated {
+            let reviewer = f.config.native_agents.get_mut("reviewer").unwrap();
+            reviewer.session_continuity = true;
+            let script = fs::read_to_string(&reviewer.program).unwrap().replace(
+                "--no-session-persistence');",
+                "--no-session-persistence --session-id --resume');",
+            );
+            fs::write(&reviewer.program, script).unwrap();
+        }
+        let result = f.run(false);
+        if isolated {
+            assert_eq!(result.outcome, Outcome::Failure, "{}", result.to_json());
+            assert!(
+                result
+                    .error
+                    .unwrap()
+                    .contains("workspace admission estimate")
+            );
+            assert!(!f.repository().join(".git").exists());
+            assert!(!f.repository().join("large").exists());
+        } else {
+            assert_eq!(result.outcome, Outcome::Success, "{}", result.to_json());
+        }
+    }
+}

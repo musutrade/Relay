@@ -335,3 +335,39 @@ async fn authenticated_http_and_mcp_share_the_same_explicit_continuation() {
     assert!(response.to_string().contains("http-retry"));
     assert_eq!(app.list(None).unwrap().len(), 2);
 }
+
+#[test]
+fn raising_workspace_quota_continues_same_files_without_reset_or_identity_change() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = config(
+        tmp.path(),
+        "if test ! -f sparse; then truncate -s 1280M sparse; printf preserved > keep; exit 7; fi; test \"$(cat keep)\" = preserved; printf continued > finished.txt",
+    );
+    config.max_workspace_bytes = Some(1024 * 1024 * 1024);
+    let db = tmp.path().join("db");
+    let app = Application::open(&db, config.clone()).unwrap();
+    app.submit(input()).unwrap();
+    assert!(app.work_once().unwrap());
+    let old = result(&app, 1);
+    assert_eq!(old.outcome, Outcome::Failure);
+    let workspace = old.workspace.unwrap();
+    drop(app);
+    config.max_workspace_bytes = Some(2 * 1024 * 1024 * 1024);
+    let app = Application::open(&db, config).unwrap();
+    let next = app.retry(1, retry("larger-quota")).unwrap();
+    assert!(app.work_once().unwrap());
+    let completed = result(&app, next.id);
+    assert_eq!(completed.outcome, Outcome::Success, "{completed:?}");
+    assert_eq!(completed.workspace.as_ref(), Some(&workspace));
+    assert_eq!(
+        fs::read_to_string(workspace.join("repository/keep")).unwrap(),
+        "preserved"
+    );
+    assert_eq!(
+        fs::metadata(workspace.join("repository/sparse"))
+            .unwrap()
+            .len(),
+        1280 * 1024 * 1024
+    );
+    assert_eq!(fs::read_dir(tmp.path().join("runs")).unwrap().count(), 1);
+}
