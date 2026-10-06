@@ -97,6 +97,9 @@ pub struct ProviderProbe {
     pub provider: ProviderKind,
     pub cli_version: String,
     pub read_only_supported: bool,
+    /// An advertised, current control stream may observe metadata in an existing task.
+    #[serde(default)]
+    pub task_model_observation_supported: bool,
 }
 
 impl NativeProfile {
@@ -288,6 +291,12 @@ impl NativeProfile {
         read_only: bool,
     ) -> Result<String, String> {
         self.validate_probe_with_max_turns(version, help, read_only, false)
+    }
+
+    pub(crate) fn task_model_observation_supported(&self, version: &str, help: &str) -> bool {
+        self.provider == ProviderKind::ClaudeCli
+            && parse_version(version).is_some_and(|version| version.0 >= (2, 1, 291))
+            && help_has_flag(help, "--input-format")
     }
 
     pub(crate) fn hidden_max_turns_probe_needed(&self, help: &str) -> bool {
@@ -724,6 +733,10 @@ pub struct ProtocolParser {
     answer_seen: bool,
     app_server: Option<crate::app_server::Driver>,
     catalog: Option<crate::capabilities::CatalogDriver>,
+    claude_control: Option<crate::claude_control::Driver>,
+    task_output: Vec<u8>,
+    task_catalog_time: Option<u64>,
+    task_prompt_dispatched: bool,
 }
 impl ProtocolParser {
     pub fn new(mut result: ProviderResult) -> Self {
@@ -738,6 +751,10 @@ impl ProtocolParser {
             answer_seen: false,
             app_server: None,
             catalog: None,
+            claude_control: None,
+            task_output: Vec::new(),
+            task_catalog_time: None,
+            task_prompt_dispatched: false,
         }
     }
     pub(crate) fn app_server(result: ProviderResult, start: crate::app_server::Start) -> Self {
@@ -750,10 +767,62 @@ impl ProtocolParser {
         parser.catalog = Some(crate::capabilities::CatalogDriver::new());
         parser
     }
+    pub(crate) fn claude_task(result: ProviderResult, prompt: String) -> Self {
+        let mut parser = Self::new(result);
+        parser.claude_control = Some(crate::claude_control::Driver::new(prompt));
+        parser
+    }
+    /// Called only after the supervisor has written every byte of the single
+    /// authorized prompt. A queued prompt is not a dispatched task.
+    pub(crate) fn mark_task_input_complete(&mut self) {
+        if self.error.is_none()
+            && self
+                .claude_control
+                .as_ref()
+                .is_some_and(|driver| driver.initialized() && driver.input_done())
+        {
+            self.task_prompt_dispatched = true;
+        }
+    }
+    pub(crate) fn task_catalog_time(&self) -> Option<u64> {
+        self.task_catalog_time
+    }
+    pub(crate) fn task_initialization_pending(&self) -> bool {
+        self.claude_control
+            .as_ref()
+            .is_some_and(|driver| !driver.initialized())
+    }
+    pub(crate) fn input_done(&self) -> bool {
+        self.claude_control
+            .as_ref()
+            .is_some_and(|driver| driver.input_done())
+    }
+    pub(crate) fn task_output_eof(&mut self) -> Option<Vec<u8>> {
+        self.claude_control.as_ref()?;
+        if !self.discarding_line && !self.line.is_empty() {
+            self.parse_line();
+            self.line.clear();
+        }
+        self.task_output()
+    }
+    pub(crate) fn task_output(&mut self) -> Option<Vec<u8>> {
+        self.claude_control.as_ref()?;
+        Some(std::mem::take(&mut self.task_output))
+    }
     pub(crate) fn catalog_result(&self) -> Option<Vec<crate::capabilities::ModelCapability>> {
-        self.catalog.as_ref().and_then(|driver| driver.models())
+        self.catalog
+            .as_ref()
+            .and_then(|driver| driver.models())
+            .or_else(|| {
+                self.claude_control
+                    .as_ref()
+                    .and_then(|driver| driver.models())
+            })
     }
     pub(crate) fn pending(&mut self) -> Vec<u8> {
+        if let Some(driver) = &mut self.claude_control {
+            return driver.pending();
+        }
         if let Some(driver) = &mut self.catalog {
             return driver.take_pending();
         }
@@ -779,6 +848,11 @@ impl ProtocolParser {
             .as_ref()
             .and_then(|driver| driver.failure())
             .or(self.error.as_deref())
+            .or_else(|| {
+                self.claude_control
+                    .as_ref()
+                    .and_then(|driver| driver.failure())
+            })
     }
     pub fn read_only(mut self, enabled: bool) -> Self {
         self.read_only = enabled;
@@ -816,6 +890,9 @@ impl ProtocolParser {
         if self.error.is_none() {
             self.error = Some(error);
         }
+        if let Some(driver) = &mut self.claude_control {
+            driver.abort();
+        }
     }
     fn parse_line(&mut self) {
         if self.line.iter().all(u8::is_ascii_whitespace) {
@@ -828,15 +905,65 @@ impl ProtocolParser {
                 return;
             }
         };
-        if let Err(error) = self.event(&event) {
-            self.record_error(error);
+        // Metadata/control envelopes are never task logs, even when malformed.
+        // Require a recognized ordinary task frame after initialization and a
+        // successful protocol parse, rather than trusting an absent type tag.
+        let task_frame = self
+            .claude_control
+            .as_ref()
+            .is_some_and(|driver| driver.initialized())
+            && matches!(
+                event.get("type").and_then(Value::as_str),
+                Some(
+                    "system"
+                        | "assistant"
+                        | "user"
+                        | "result"
+                        | "stream_event"
+                        | "tool_progress"
+                        | "tool_use_summary"
+                )
+            )
+            && event.get("response").is_none()
+            && event.get("request").is_none()
+            && event.get("account").is_none();
+        match self.event(&event) {
+            Err(error) => self.record_error(error),
+            Ok(()) if task_frame => {
+                self.task_output.extend_from_slice(&self.line);
+                self.task_output.push(b'\n');
+            }
+            Ok(()) => {}
         }
     }
+
     fn event(&mut self, event: &Value) -> Result<(), String> {
         let kind = event
             .get("type")
             .and_then(Value::as_str)
             .ok_or("provider event requires a string type")?;
+        if let Some(driver) = &mut self.claude_control {
+            if kind.starts_with("control_") {
+                let result = driver.event(event);
+                if result.is_ok() && driver.initialized() && self.task_catalog_time.is_none() {
+                    self.task_catalog_time = Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis()
+                            .min(u64::MAX as u128) as u64,
+                    );
+                }
+                return result;
+            }
+            if !self.task_prompt_dispatched
+                && matches!(kind, "assistant" | "user" | "result" | "stream_event")
+            {
+                return Err(
+                    "Claude emitted a task event before the task prompt was dispatched".into(),
+                );
+            }
+        }
         if kind.len() > MAX_FIELD {
             return Err("provider event type exceeds bound".into());
         }
@@ -1098,6 +1225,9 @@ impl ProtocolParser {
         }
         if !self.discarding_line && !self.line.is_empty() {
             self.parse_line();
+        }
+        if self.error.is_none() && self.claude_control.is_some() && !self.task_prompt_dispatched {
+            self.error = Some("Claude exited before the task prompt was dispatched".into());
         }
         if self.error.is_none() && !self.terminal {
             self.error =

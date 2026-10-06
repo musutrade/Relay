@@ -764,6 +764,7 @@ impl Execution<'_> {
                     self.host.config().output_limit_bytes
                 },
                 catalog: false,
+                claude_control: false,
                 app_server: None,
                 provider: None,
                 read_only: false,
@@ -789,6 +790,14 @@ impl Execution<'_> {
             crate::selection::native_profile(self.job, self.host.config(), read_only)
                 .expect("validated role selection")
         {
+            let observation_stamp = crate::capabilities::profile_stamp(
+                &self.host.config().native_agents[crate::selection::profile_name(
+                    self.job,
+                    self.host.config(),
+                    read_only,
+                )
+                .expect("native profile name")],
+            );
             native.env.extend(self.env(prompt));
             native.env.extend(extra.clone());
             let mut command = self.host.run_native(
@@ -808,6 +817,14 @@ impl Execution<'_> {
                         && !crate::replacement::changed(self.job, true),
                 ),
                 self.deadline,
+            );
+            self.host.observe_task_models(
+                &mut command,
+                self.task,
+                self.job,
+                &native,
+                read_only,
+                observation_stamp,
             );
             crate::selection::annotate(&mut command, self.job, self.host.config(), read_only);
             command
@@ -929,6 +946,7 @@ impl Execution<'_> {
                     .max(1) as u64,
                 output_limit_bytes: GIT_CAPTURE_BYTES,
                 catalog: false,
+                claude_control: false,
                 app_server: None,
                 provider: None,
                 read_only: false,

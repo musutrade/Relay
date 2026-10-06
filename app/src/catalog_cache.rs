@@ -1,6 +1,6 @@
 //! In-memory configured-profile catalogs. Reads never launch processes.
 use crate::{
-    capabilities::{ProfileCatalog, ProfileStamp, profile_stamp},
+    capabilities::{ProfileCatalog, ProfileStamp, TaskModelObservation, profile_stamp},
     providers::NativeProfile,
 };
 use serde::Serialize;
@@ -18,6 +18,8 @@ pub struct CatalogView {
     pub stale: bool,
     pub refreshing: bool,
     pub catalog: Option<ProfileCatalog>,
+    pub task_observation: Option<TaskModelObservation>,
+    pub task_observation_stale: bool,
 }
 pub(crate) struct CatalogCache {
     epoch: String,
@@ -42,6 +44,7 @@ struct Entry {
     checked: Option<Instant>,
     refreshing: bool,
     catalog: Option<ProfileCatalog>,
+    observation: Option<(TaskModelObservation, Instant)>,
 }
 impl CatalogCache {
     pub(crate) fn reconciled_guard(&mut self, guard_present: bool) {
@@ -57,12 +60,14 @@ impl CatalogCache {
             checked: None,
             refreshing: false,
             catalog: None,
+            observation: None,
         });
         if entry.stamp != stamp {
             entry.stamp = stamp;
             entry.generation += 1;
             entry.checked = None;
             entry.catalog = None;
+            entry.observation = None;
             // The old probe keeps its slot until completion, but cannot populate
             // this newly invalidated generation.
         }
@@ -80,6 +85,37 @@ impl CatalogCache {
                 .is_none_or(|time| time.elapsed() >= CATALOG_TTL),
             refreshing: entry.refreshing,
             catalog: entry.catalog.clone(),
+            task_observation: entry.observation.as_ref().map(|(value, _)| value.clone()),
+            task_observation_stale: entry
+                .observation
+                .as_ref()
+                .is_none_or(|(_, time)| time.elapsed() >= CATALOG_TTL),
+        }
+    }
+    pub(crate) fn observe(
+        &mut self,
+        name: &str,
+        profile: &NativeProfile,
+        observation: TaskModelObservation,
+        stamp: ProfileStamp,
+    ) {
+        let entry = self.entry(name, profile);
+        if entry.stamp == stamp {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
+            // A long task does not make its initialization snapshot fresh again.
+            // Future clock values fail stale instead of extending evidence life.
+            let age = now
+                .checked_sub(observation.checked_at_unix_ms)
+                .map(Duration::from_millis)
+                .unwrap_or(CATALOG_TTL)
+                .min(CATALOG_TTL);
+            entry.observation = Some((observation, Instant::now() - age));
+            // Do not disturb an explicit refresh's generation or a selectable
+            // standalone catalog. Task observations have independent freshness.
         }
     }
     /// One probe tree for the service. Repeated same-profile requests don't queue.
@@ -209,6 +245,57 @@ mod tests {
         assert!(cache.begin("native", &profile).is_err());
         cache.reconciled_guard(false);
         assert!(cache.begin("native", &profile).is_ok());
+    }
+
+    #[test]
+    fn task_observation_is_separate_expires_and_cannot_survive_context_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake");
+        std::fs::write(&path, "initial").unwrap();
+        let mut profile = profile(&path);
+        let mut cache = CatalogCache::default();
+        let observation = TaskModelObservation {
+            task_id: 1,
+            repository: "repo".into(),
+            role: "reviewer".into(),
+            cli_version: Some("2.1.291".into()),
+            checked_at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            requested_model: None,
+            requested_effort: None,
+            native_permission: None,
+            models: vec![],
+        };
+        let stamp = profile_stamp(&profile);
+        cache.observe("native", &profile, observation.clone(), stamp.clone());
+        let view = cache.view("native", &profile);
+        assert!(view.catalog.is_none() && view.stale && !view.task_observation_stale);
+        assert_eq!(view.task_observation.unwrap().task_id, 1);
+        cache
+            .entries
+            .get_mut("native")
+            .unwrap()
+            .observation
+            .as_mut()
+            .unwrap()
+            .1 = Instant::now() - CATALOG_TTL;
+        assert!(cache.view("native", &profile).task_observation_stale);
+        let mut old = observation.clone();
+        old.checked_at_unix_ms = old.checked_at_unix_ms.saturating_sub(300_001);
+        cache.observe("native", &profile, old, stamp.clone());
+        assert!(cache.view("native", &profile).task_observation_stale);
+        let mut future = observation.clone();
+        future.checked_at_unix_ms = u64::MAX;
+        cache.observe("native", &profile, future, stamp.clone());
+        assert!(cache.view("native", &profile).task_observation_stale);
+        profile.model = Some("changed-profile".into());
+        cache.observe("native", &profile, observation.clone(), stamp);
+        assert!(cache.view("native", &profile).task_observation.is_none());
+        cache.observe("native", &profile, observation, profile_stamp(&profile));
+        std::fs::write(&path, "changed executable").unwrap();
+        assert!(cache.view("native", &profile).task_observation.is_none());
     }
 
     #[test]

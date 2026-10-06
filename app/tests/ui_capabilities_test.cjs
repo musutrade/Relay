@@ -15,6 +15,11 @@ const catalog = (version = 'fixture-1') => ({provider: 'codex_app_server', check
   models: [model('alpha', [{effort: 'low', description: 'fast'}, {effort: 'high', description: null}]), model('unknown-efforts', null), model('empty-efforts', [])],
   selection: {requested_model: 'manual-model', requested_effort: 'high', effective_model: null, effective_effort: null, status: capability('unknown', 'execution has not verified this selection')}});
 const envelope = (name = 'dev / one', generation = 1, data = catalog(), stale = false, refreshing = false, cache_epoch = 'process-a') => ({name, cache_epoch, generation, catalog: data, stale, refreshing});
+const observation = (extra = {}) => ({task_id: 42, repository: 'task-repo', role: 'reviewer', cli_version: '2.1.291', checked_at_unix_ms: 1700000010000, requested_model: 'task-requested-alias', requested_effort: 'high', native_permission: 'claude_restricted', models: [
+  {...model('future-route-from-cli', [{effort: 'future-effort', description: 'supplied dynamically'}]), source: 'claude_cli:task_initialize', resolved_model: 'resolved-future-route', supports_effort: true, supports_adaptive_thinking: true, supports_fast_mode: false, supports_auto_mode: false},
+  {...model('legacy-model-fields', null), source: 'claude_cli:task_initialize'},
+], ...extra});
+const observedEnvelope = (data = observation(), stale = false, generation = 0, standalone = null, catalogStale = true) => ({...envelope('review', generation, standalone, catalogStale), task_observation: data, task_observation_stale: stale});
 function fixture(authMode = 'bearer', restored = false) {
   const nodes = new Map(), events = new Map(), timers = new Map(); let active = null, timerId = 0;
   class Element {
@@ -158,6 +163,48 @@ function fixture(authMode = 'bearer', restored = false) {
   const legacy = fixture(); await settle(); delete legacy.config.native_agents; await legacy.login(); await legacy.$('capability-toggle').emit('click'); assert.match(legacy.$('capability-profiles').textContent, /未配置原生 Agent/); assert.equal(legacy.catalogRequests().length, 0); assert(legacy.$('capability-read').disabled); legacy.events.get('pagehide')();
   // Cookie restoration reads only the cache and never initiates discovery.
   for (const authMode of ['session', 'hybrid']) { const restored = fixture(authMode, true); await settle(); assert.equal(restored.catalogRequests().length, 1); assert.equal(restored.posts().length, 0); assert(!restored.$('capability-panel').hidden); restored.events.get('pagehide')(); }
+  // Task-only observations render independently of a null standalone catalog.
+  const scoped = fixture(); await settle(); Object.assign(scoped.config.native_agents[1], {permission_modes: [], reviewer_supported: true});
+  scoped.cache = {profiles: [observedEnvelope()]}; await scoped.login();
+  const observedContent = scoped.card('review').textContent;
+  for (const text of ['尚无缓存', 'Claude 任务上下文观察', '任务 #42', '仓库：task-repo', '审查者（reviewer）', '观察时间：', '2.1.291', '上次读取时任务观察未过期', '任务请求模型：task-requested-alias', '请求 effort：high', '原生模式：claude_restricted', '不是完整实时目录', '不证明账户可调用、获得授权或任务实际生效', '不会用于已验证的目录选择', '手动输入模型 ID（未验证）', 'future-route-from-cli', 'future-effort（supplied dynamically）', '初始化解析模型（非实际生效证明）：resolved-future-route', 'Effort 支持：是', 'Adaptive thinking 支持：是', 'Fast mode 支持：否', 'Auto mode 支持：否', '初始化解析模型（非实际生效证明）：未知', 'Effort 支持：未知（供应商未提供）', '支持的 effort：未知（供应商未提供）', '来源：claude_cli:task_initialize']) assert(observedContent.includes(text), text);
+  assert(!scoped.card('dev / one').textContent.includes('Claude 任务上下文观察'));
+  assert.equal(scoped.$('capability-profiles').querySelectorAll('select').length, 0);
+  assert.equal(scoped.$('capability-profiles').querySelectorAll('input').length, 0);
+  assert.equal(scoped.posts().length, 0);
+  // Observation freshness is distinct from standalone freshness. Equal-generation
+  // updates can carry task evidence, but an old snapshot cannot replace newer evidence.
+  const newerObservation = observation({task_id: 43, role: 'developer', checked_at_unix_ms: 1700000020000});
+  scoped.cache = {profiles: [observedEnvelope(newerObservation, true, 1, catalog('fresh-standalone'), false)]}; await scoped.$('capability-read').emit('click');
+  assert.match(scoped.card('review').textContent, /上次读取时缓存有效/); assert.match(scoped.card('review').textContent, /任务观察已陈旧/); assert.match(scoped.card('review').textContent, /任务 #43/); assert.match(scoped.card('review').textContent, /开发者（developer）/);
+  scoped.cache = {profiles: [observedEnvelope(observation(), false, 1, catalog('fresh-standalone'), false)]}; await scoped.$('capability-read').emit('click');
+  assert.match(scoped.card('review').textContent, /任务 #43/); assert.match(scoped.card('review').textContent, /任务观察已陈旧/);
+  scoped.cache = {profiles: [observedEnvelope(newerObservation, false, 1, catalog('fresh-standalone'), false)]}; await scoped.$('capability-read').emit('click'); assert.match(scoped.card('review').textContent, /任务观察已陈旧/);
+  scoped.cache = {profiles: [observedEnvelope(observation({task_id: 44, checked_at_unix_ms: 1700000030000}), false, 1, catalog('fresh-standalone'), true)]}; await scoped.$('capability-read').emit('click');
+  assert.match(scoped.card('review').textContent, /缓存已陈旧/); assert.match(scoped.card('review').textContent, /上次读取时任务观察未过期/); assert.match(scoped.card('review').textContent, /任务 #44/);
+  scoped.cache = {profiles: [envelope('review', 1, catalog('fresh-standalone'))]}; await scoped.$('capability-read').emit('click'); assert.match(scoped.card('review').textContent, /任务 #44/);
+  // Every externally supplied display field is text, even in the observation-only path.
+  const attack = '<img src=x onerror=alert(1)>', unsafeModel = {...model(attack, [{effort: attack, description: attack}]), display_name: attack, description: attack, default_effort: attack, resolved_model: attack, source: attack, supports_effort: attack};
+  const unsafeObservation = observation({repository: attack, cli_version: attack, requested_model: attack, requested_effort: attack, native_permission: attack, models: [unsafeModel]});
+  scoped.cache = {profiles: [observedEnvelope(unsafeObservation, false, 2)]}; await scoped.$('capability-read').emit('click');
+  assert(scoped.card('review').textContent.includes('仓库：' + attack)); assert(scoped.card('review').textContent.includes('CLI 版本：' + attack)); assert(scoped.card('review').textContent.includes('初始化解析模型（非实际生效证明）：' + attack)); assert.match(scoped.card('review').textContent, /Effort 支持：未知/); assert.equal(scoped.card('review').querySelectorAll('img').length, 0);
+  assert.equal(scoped.card('review').querySelectorAll('script').length, 0);
+  // Task observations cannot populate the verified selector, even with a valid
+  // epoch/generation; explicit manual entry remains available and unverified.
+  scoped.cache = {profiles: [{...observedEnvelope(), cache_epoch: 'a'.repeat(32), generation: 3, stale: false}]}; await scoped.$('capability-read').emit('click');
+  scoped.$('agent').value = 'review'; await scoped.$('agent').emit('change'); scoped.$('developer-model-source').value = 'catalog'; await scoped.$('developer-model-source').emit('change');
+  assert(scoped.$('developer-model').disabled); assert.equal(scoped.$('developer-model').children.length, 1); assert(!scoped.$('developer-model').textContent.includes('future-route-from-cli')); assert(scoped.$('developer-effort').disabled);
+  scoped.$('developer-model-source').value = 'manual'; await scoped.$('developer-model-source').emit('change'); scoped.$('developer-manual-model').value = 'future-route-from-cli'; await scoped.$('developer-manual-model').emit('input');
+  assert(!scoped.$('developer-manual-model').disabled); assert.equal(scoped.$('developer-manual-model').value, 'future-route-from-cli'); assert.match(scoped.$('developer-model-note').textContent, /未验证/); assert(scoped.$('developer-effort').disabled); assert.equal(scoped.posts().length, 0);
+  // An invalid observation is rejected without erasing the last valid snapshot.
+  scoped.cache = {profiles: [{...observedEnvelope({...observation(), task_id: attack}), cache_epoch: 'a'.repeat(32), generation: 4}]}; await scoped.$('capability-read').emit('click');
+  assert.match(scoped.$('capability-error').textContent, /格式不符合预期/); assert.match(scoped.card('review').textContent, /任务 #42/);
+  // Profile/binary invalidation clears observations at the next generation;
+  // an absent optional freshness field stays explicitly unknown.
+  scoped.cache = {profiles: [{...observedEnvelope(null, true, 4), cache_epoch: 'a'.repeat(32)}]}; await scoped.$('capability-read').emit('click'); assert(!scoped.card('review').textContent.includes('Claude 任务上下文观察'));
+  const uncertain = {...observedEnvelope(observation({models: []}), false, 4), cache_epoch: 'a'.repeat(32)}; delete uncertain.task_observation_stale;
+  scoped.cache = {profiles: [uncertain]}; await scoped.$('capability-read').emit('click'); assert.match(scoped.card('review').textContent, /任务观察新鲜度未知/); assert.match(scoped.card('review').textContent, /本次任务未返回模型条目/);
+  await scoped.$('logout').emit('click'); assert.equal(scoped.$('capability-profiles').children.length, 0); scoped.events.get('pagehide')();
   assert.match(html, /能力与模型目录不代表账户已登录、可调用模型或获得调用授权/);
-  console.log('PASS: capability UI cached-only login/open; explicit bounded-profile refresh; no polling discovery; process epoch/generation/session/navigation fences; restart unlock and stale-finally guard; repeated click guard; safe evidence/models/efforts; unknown auth and effective selection; startup context; last-read freshness; local errors; legacy config; bearer/session/hybrid restoration');
+  console.log('PASS: capability UI cached-only login/open; explicit bounded-profile refresh; no polling discovery; process epoch/generation/session/navigation fences; restart unlock and stale-finally guard; repeated click guard; safe evidence/models/efforts; task-only scoped observations and optional metadata; independent freshness and same-generation ordering; no observation-backed selector; manual fallback; XSS-safe fields; unknown auth and effective selection; startup context; last-read freshness; local errors; legacy config; bearer/session/hybrid restoration');
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -252,6 +252,8 @@ pub struct CommandResult {
     pub provider: Option<ProviderResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<Vec<crate::capabilities::ModelCapability>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_checked_at_unix_ms: Option<u64>,
     pub outcome: Outcome,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
@@ -269,6 +271,7 @@ impl CommandResult {
             failure: None,
             provider: None,
             catalog: None,
+            catalog_checked_at_unix_ms: None,
             outcome,
             exit_code: None,
             signal: None,
@@ -467,6 +470,17 @@ pub struct Host {
     config: HostConfig,
     supervisor: PathBuf,
     leases: Mutex<BTreeMap<PathBuf, Arc<File>>>,
+    model_observations: Arc<
+        Mutex<
+            BTreeMap<
+                String,
+                (
+                    crate::capabilities::TaskModelObservation,
+                    crate::capabilities::ProfileStamp,
+                ),
+            >,
+        >,
+    >,
 }
 struct ExecutionLease<'a> {
     leases: &'a Mutex<BTreeMap<PathBuf, Arc<File>>>,
@@ -621,11 +635,64 @@ impl Host {
             config,
             supervisor,
             leases: Mutex::new(BTreeMap::new()),
+            model_observations: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
     pub fn config(&self) -> &HostConfig {
         &self.config
+    }
+
+    pub(crate) fn take_model_observations(
+        &self,
+    ) -> Vec<(
+        String,
+        crate::capabilities::TaskModelObservation,
+        crate::capabilities::ProfileStamp,
+    )> {
+        self.model_observations
+            .lock()
+            .map(|mut values| {
+                std::mem::take(&mut *values)
+                    .into_iter()
+                    .map(|(name, (observation, stamp))| (name, observation, stamp))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    pub(crate) fn observe_task_models(
+        &self,
+        command: &mut CommandResult,
+        task: &Task,
+        job: &Job,
+        profile: &NativeProfile,
+        reviewer: bool,
+        stamp: crate::capabilities::ProfileStamp,
+    ) {
+        let checked_at = command.catalog_checked_at_unix_ms.take();
+        let Some(models) = command.catalog.take() else {
+            return;
+        };
+        let Some(name) = crate::selection::profile_name(job, &self.config, reviewer) else {
+            return;
+        };
+        let observation = crate::capabilities::TaskModelObservation {
+            task_id: task.id,
+            repository: job.repository.clone(),
+            role: if reviewer { "reviewer" } else { "developer" }.into(),
+            cli_version: command
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.cli_version.clone()),
+            checked_at_unix_ms: checked_at.unwrap_or(0),
+            requested_model: profile.model.clone(),
+            requested_effort: profile.effort.clone(),
+            native_permission: profile.native_permission,
+            models,
+        };
+        if let Ok(mut values) = self.model_observations.lock() {
+            values.insert(name.to_owned(), (observation, stamp));
+        }
     }
 
     /// Only execute a newly claimed generation. A pre-existing workspace is unknown,
@@ -641,6 +708,7 @@ impl Host {
             config,
             supervisor: self.supervisor.clone(),
             leases: Mutex::new(BTreeMap::new()),
+            model_observations: Arc::clone(&self.model_observations),
         };
         let mut result = attempt.execute_at_limit(task, cancellation, &self.config);
         result.complete_metadata(&self.config, quota);
@@ -851,6 +919,7 @@ impl Host {
                     timeout_ms: remaining_ms(deadline),
                     output_limit_bytes: MAX_CAPTURE,
                     catalog: false,
+                    claude_control: false,
                     app_server: None,
                     provider: None,
                     read_only: false,
@@ -888,6 +957,14 @@ impl Host {
         if let Some(profile) = crate::selection::native_profile(job, &self.config, false)
             .expect("validated role selection")
         {
+            let observation_stamp = crate::capabilities::profile_stamp(
+                &self.config.native_agents[crate::selection::profile_name(
+                    job,
+                    &self.config,
+                    false,
+                )
+                .expect("native profile name")],
+            );
             let mut command = self.run_native(
                 &profile,
                 &execution_requirements,
@@ -896,6 +973,7 @@ impl Host {
                 (workspace, &repository, false),
                 deadline,
             );
+            self.observe_task_models(&mut command, task, job, &profile, false, observation_stamp);
             crate::selection::annotate(&mut command, job, &self.config, false);
             result.outcome = command.outcome;
             result.agent = Some(command);
@@ -964,6 +1042,7 @@ impl Host {
                 workspace_lease: false,
                 git_inventory: false,
                 catalog: false,
+                claude_control: false,
                 app_server: None,
                 provider: None,
                 read_only: false,
@@ -1061,6 +1140,7 @@ impl Host {
                 workspace_lease: false,
                 git_inventory: false,
                 catalog: false,
+                claude_control: false,
                 app_server: None,
                 provider: None,
                 read_only: false,
@@ -1167,6 +1247,8 @@ impl Host {
         Ok(ProviderProbe {
             provider: profile.provider,
             cli_version,
+            task_model_observation_supported: profile
+                .task_model_observation_supported(&responses[0], &responses[1]),
             read_only_supported: profile
                 .validate_probe_with_max_turns(&responses[0], &responses[1], true, hidden_max_turns)
                 .is_ok(),
@@ -1183,6 +1265,7 @@ impl Host {
         deadline: Instant,
     ) -> CommandResult {
         let (workspace, repository, require_resume) = paths;
+        let catalog_stamp = crate::capabilities::profile_stamp(profile);
         let mut compiled = match profile.compile(read_only) {
             Ok(compiled) => compiled,
             Err(error) => {
@@ -1250,10 +1333,16 @@ impl Host {
                 compiled.args.extend(["--session-id".into(), id.clone()]);
             }
         }
+        if probe.task_model_observation_supported {
+            compiled
+                .args
+                .extend(["--input-format".into(), "stream-json".into()]);
+        }
         let spec = CommandSpec {
             workspace_lease: false,
             git_inventory: false,
             catalog: false,
+            claude_control: probe.task_model_observation_supported,
             app_server: if profile.provider == ProviderKind::CodexAppServer {
                 Some(crate::app_server::Start {
                     cwd: repository.to_owned(),
@@ -1285,6 +1374,10 @@ impl Host {
             workspace,
             if read_only { "review" } else { "agent" },
         );
+        if catalog_stamp != crate::capabilities::profile_stamp(profile) {
+            result.catalog = None;
+            result.catalog_checked_at_unix_ms = None;
+        }
         if result.provider.is_none() {
             result.provider = metadata;
         }
@@ -1420,7 +1513,7 @@ impl Host {
         let mut next_workspace_check = Instant::now();
         // JSON can escape each inventory byte to six bytes. stderr retains its
         // ordinary control-output budget; no task log budget is increased.
-        let mut output = Capture::new(if spec.catalog {
+        let mut output = Capture::new(if spec.catalog || spec.claude_control {
             2 * crate::capabilities::MAX_CATALOG_RESPONSE_BYTES
         } else if spec.git_inventory {
             6 * (crate::git_inventory::MAX_BYTES + MAX_PROBE_CAPTURE) + 128 * 1024
@@ -1822,6 +1915,8 @@ pub(crate) struct CommandSpec {
     #[serde(default)]
     pub(crate) catalog: bool,
     #[serde(default)]
+    pub(crate) claude_control: bool,
+    #[serde(default)]
     pub(crate) read_only: bool,
     #[serde(default)]
     pub(crate) clear_env: bool,
@@ -1866,7 +1961,16 @@ pub fn supervisor_main() -> i32 {
                 && (spec.provider.is_none()
                     || spec.app_server.is_some()
                     || spec.git_inventory
-                    || !spec.input.is_empty()))
+                    || !spec.input.is_empty()
+                    || spec.claude_control))
+            || (spec.claude_control
+                && (spec
+                    .provider
+                    .as_ref()
+                    .is_none_or(|provider| provider.provider != ProviderKind::ClaudeCli)
+                    || spec.catalog
+                    || spec.app_server.is_some()
+                    || spec.git_inventory))
         {
             return Err(io::Error::other("invalid supervisor limits"));
         }
@@ -1975,10 +2079,12 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
     if spec.git_inventory {
         output.inventory = Some(crate::git_inventory::Framing::default());
     }
-    let bidirectional = spec.app_server.is_some() || spec.catalog;
+    let bidirectional = spec.app_server.is_some() || spec.catalog || spec.claude_control;
     let mut protocol = spec.provider.map(|result| {
         if spec.catalog {
             ProtocolParser::catalog(result)
+        } else if spec.claude_control {
+            ProtocolParser::claude_task(result, spec.input.clone()).read_only(spec.read_only)
         } else if let Some(start) = spec.app_server {
             ProtocolParser::app_server(result, start)
         } else {
@@ -2043,9 +2149,39 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
             outcome = Outcome::Failure;
             break;
         }
+        if spec.claude_control
+            && protocol
+                .as_ref()
+                .is_some_and(ProtocolParser::task_initialization_pending)
+            && started.elapsed() >= Duration::from_secs(10)
+        {
+            error = Some(
+                "Claude control initialization timed out before sending the task prompt".into(),
+            );
+            outcome = Outcome::TimedOut;
+            break;
+        }
+        if spec.claude_control
+            && protocol
+                .as_ref()
+                .and_then(ProtocolParser::failure)
+                .is_some()
+        {
+            // Never finish writing a previously queued task prompt after a
+            // protocol failure. A static denial is unnecessary after stdin closes.
+            error = protocol
+                .as_ref()
+                .and_then(ProtocolParser::failure)
+                .map(str::to_owned);
+            outcome = Outcome::Failure;
+            break;
+        }
         if bidirectional && input_offset == input_bytes.len() {
             input_bytes = protocol.as_mut().expect("native protocol").pending();
             input_offset = 0;
+            if input_bytes.is_empty() && protocol.as_ref().is_some_and(ProtocolParser::input_done) {
+                input.take();
+            }
             if input_bytes.is_empty() && protocol.as_ref().is_some_and(ProtocolParser::stopped) {
                 error = protocol
                     .as_ref()
@@ -2063,6 +2199,12 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
             match writer.write(&input_bytes[input_offset..]) {
                 Ok(written) => {
                     input_offset += written;
+                    if spec.claude_control && input_offset == input_bytes.len() {
+                        protocol
+                            .as_mut()
+                            .expect("native protocol")
+                            .mark_task_input_complete();
+                    }
                     if !bidirectional && input_offset == input_bytes.len() {
                         input.take();
                     }
@@ -2153,6 +2295,9 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
         }
     }
     let catalog = protocol.as_ref().and_then(ProtocolParser::catalog_result);
+    let catalog_checked_at_unix_ms = protocol
+        .as_ref()
+        .and_then(ProtocolParser::task_catalog_time);
     let provider = protocol.map(|parser| {
         let (result, protocol_error) = parser.finish();
         if let Some(failure) = protocol_error {
@@ -2171,6 +2316,11 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
         provider: if spec.catalog { None } else { provider },
         catalog: if outcome == Outcome::Success && error.is_none() {
             catalog
+        } else {
+            None
+        },
+        catalog_checked_at_unix_ms: if outcome == Outcome::Success && error.is_none() {
+            catalog_checked_at_unix_ms
         } else {
             None
         },
@@ -2312,6 +2462,14 @@ impl Capture {
             match reader.read(&mut buffer) {
                 Ok(0) => {
                     self.eof = true;
+                    if let Some(bytes) = protocol
+                        .as_mut()
+                        .and_then(|parser| parser.task_output_eof())
+                    {
+                        let keep = bytes.len().min(self.limit.saturating_sub(self.bytes.len()));
+                        self.bytes.extend_from_slice(&bytes[..keep]);
+                        self.truncated |= keep < bytes.len();
+                    }
                     if let Some(inventory) = self.inventory.take()
                         && let Err(error) = inventory.finish()
                     {
@@ -2331,9 +2489,11 @@ impl Capture {
                         self.truncated = true;
                         return Err(error);
                     }
-                    let keep = read.min(self.limit.saturating_sub(self.bytes.len()));
-                    self.bytes.extend_from_slice(&buffer[..keep]);
-                    self.truncated |= keep < read;
+                    let filtered = protocol.as_mut().and_then(|parser| parser.task_output());
+                    let bytes = filtered.as_deref().unwrap_or(&buffer[..read]);
+                    let keep = bytes.len().min(self.limit.saturating_sub(self.bytes.len()));
+                    self.bytes.extend_from_slice(&bytes[..keep]);
+                    self.truncated |= keep < bytes.len();
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
