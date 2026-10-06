@@ -2199,6 +2199,12 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
             match writer.write(&input_bytes[input_offset..]) {
                 Ok(written) => {
                     input_offset += written;
+                    if spec.catalog && input_offset == input_bytes.len() {
+                        protocol
+                            .as_mut()
+                            .expect("native protocol")
+                            .mark_catalog_input_complete();
+                    }
                     if spec.claude_control && input_offset == input_bytes.len() {
                         protocol
                             .as_mut()

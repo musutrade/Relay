@@ -114,7 +114,7 @@ with sync_playwright() as p:
     data={'tasks':[task(3,'queued'),task(2,'claimed'),task(1,'finished',outcome='success')], 'status':{'active':task(2,'claimed'),'recovery_required':False,'diagnostic':None},'post':'success','list_error':False,'continuations':{},'continuation_payloads':{},'continuation_post':'success','hidden_task_ids':set(),'frozen_lists':{},'retry_requests':[],'review_requests':[],'config':{'repositories':['relay-demo','api-service'],'agents':['codex','reviewer'],'tests':['unit','full']}}
     data['catalog']={'name':'codex','cache_epoch':'browser-fixture-process','generation':0,'stale':True,'refreshing':False,'catalog':None}
     data['workspaces']=workspace_fixture();data['workspace_error']=False
-    data['catalog_refreshes']=0
+    data['catalog_refreshes']=0;data['startup_refreshes']=0;data['startup_token_serial']=0
     data['resources']=resource_fixture();data['operator_overrides']={}
     # Model persisted reservations separately from visible task payloads. A child
     # outside the recent page must not make its predecessor appear retryable.
@@ -166,12 +166,29 @@ with sync_playwright() as p:
             result=data['operator_overrides'].get(task_id) or operator_fixture(value,data['continuations'].get(task_id),data['continuation_payloads'].get(task_id))
         elif path=='/api/capabilities':
             assert req.method=='GET'
-            result={'profiles':data.get('catalogs', [data['catalog']]) if data['config'].get('native_agents') else []}
+            profiles=data.get('catalogs', [data['catalog']])
+            if any(profile['name']=='startup-claude' for profile in data['config'].get('native_agents',[])):
+                scope=data['startup_catalog']['startup_discovery']
+                if scope['confirmation_token'] is None or scope['expires_at_unix_ms']<=int(time.time()*1000):
+                    data['startup_token_serial']+=1
+                    scope.update(confirmation_token=f"browser-startup-{data['startup_token_serial']}",expires_at_unix_ms=int(time.time()*1000)+90000)
+                profiles=[*profiles,data['startup_catalog']]
+            result={'profiles':profiles if data['config'].get('native_agents') else []}
         elif path=='/api/capabilities/codex/refresh':
             assert req.method=='POST' and not req.post_data
             data['catalog_refreshes']+=1
             data['catalog'].update(generation=data['catalog']['generation']+1,stale=False,catalog=catalog_fixture())
             result=data['catalog']
+        elif path=='/api/capabilities/startup-claude/refresh':
+            scope=data['startup_catalog']['startup_discovery']
+            assert req.method=='POST' and req.post_data_json=={'confirm_startup_effects':True,'confirmation_token':scope['confirmation_token']}
+            assert scope['expires_at_unix_ms']>int(time.time()*1000)
+            data['startup_refreshes']+=1
+            scope.update(confirmation_token=None,expires_at_unix_ms=None)
+            metadata=catalog_fixture();metadata.update(provider='claude_cli',cli_version='Claude startup fixture 2.1.291')
+            metadata['models'][0]['source']='fixture:claude_initialize'
+            data['startup_catalog'].update(generation=data['startup_catalog']['generation']+1,stale=False,catalog=metadata)
+            result=data['startup_catalog']
         elif path=='/api/tasks' and req.method=='GET':
             if data['list_error']: r.abort();return
             result=data['frozen_lists'].get(req.frame.page,visible_tasks())
@@ -362,7 +379,12 @@ with sync_playwright() as p:
     assert not page.locator('#detail-usage').is_visible()
     # The catalog reads cached evidence on login/open, without automatic discovery.
     page.locator('#logout').click()
-    data['config']['native_agents']=[{'name':'codex','provider':'codex_app_server','model':'manual-model','effort':'high','authentication':'unknown'}]
+    data['config']['agents'].append('startup-claude')
+    data['config']['native_agents']=[{'name':'codex','provider':'codex_app_server','model':'manual-model','effort':'high','authentication':'unknown','allow_startup_discovery':False},
+        {'name':'startup-claude','provider':'claude_cli','model':None,'effort':None,'allow_startup_discovery':True}]
+    data['startup_catalog']={'name':'startup-claude','cache_epoch':'browser-fixture-process','generation':0,'stale':True,'refreshing':False,'catalog':None,
+        'startup_discovery':{'confirmation_token':None,'expires_at_unix_ms':None,
+            'confirmation_text':'启动将沿用正常 managed/user hooks、policy/auth helpers、MCP/plugins，可能执行操作、访问网络并产生费用。Relay 仅发送 initialize，不发送模型任务提示；不保证没有副作用。<img src=x onerror=window.__startupXss=1>'}}
     with page.expect_response(lambda response: response.url==base+'/api/capabilities' and response.request.method=='GET'):
         connect(page)
     expect(page.locator('#capability-panel')).to_be_visible()
@@ -399,12 +421,40 @@ with sync_playwright() as p:
         page.screenshot(path=str(SCREENSHOTS / f'relay-catalog-{width}.png'),full_page=True)
     page.wait_for_timeout(2200)
     assert data['catalog_refreshes']==1, 'Open catalog must not repeat discovery'
+    # Opt-in Claude start is a separate explicit native-dialog flow. Merely opening
+    # it reads the cache; cancel, Escape and focus-default Enter never start work.
+    startup_button=page.locator('[data-catalog-refresh="startup-claude"]')
+    assert data['startup_refreshes']==0
+    with page.expect_response(lambda response: response.url==base+'/api/capabilities' and response.request.method=='GET'):
+        startup_button.click()
+    dialog=page.locator('#startup-discovery-dialog')
+    expect(dialog).to_be_visible();expect(page.locator('#startup-discovery-title')).to_contain_text('startup-claude')
+    expect(page.locator('#startup-discovery-description')).to_contain_text('managed/user hooks')
+    expect(page.locator('#startup-discovery-description')).to_contain_text('访问网络并产生费用')
+    assert page.locator('img').count()==0 and page.evaluate('window.__startupXss') is None
+    assert data['startup_refreshes']==0
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':650 if width==320 else 900})
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'startup dialog overflow at {width}'
+        bounds=dialog.bounding_box();assert bounds['x']>=0 and bounds['x']+bounds['width']<=width
+        assert page.evaluate('document.getElementById("startup-discovery-dialog").scrollWidth <= document.getElementById("startup-discovery-dialog").clientWidth')
+        page.screenshot(path=str(SCREENSHOTS / f'relay-startup-confirm-{width}.png'),full_page=True)
+    page.locator('#startup-discovery-dismiss').click();expect(dialog).not_to_be_visible();assert data['startup_refreshes']==0
+    startup_button.click();expect(dialog).to_be_visible();page.keyboard.press('Escape');expect(dialog).not_to_be_visible();assert data['startup_refreshes']==0
+    startup_button.click();expect(dialog).to_be_visible();expect(page.locator('#startup-discovery-dismiss')).to_be_focused()
+    page.keyboard.press('Enter');expect(dialog).not_to_be_visible();assert data['startup_refreshes']==0
+    startup_button.click();expect(dialog).to_be_visible()
+    with page.expect_response(lambda response: response.url==base+'/api/capabilities/startup-claude/refresh' and response.request.method=='POST'):
+        page.locator('#startup-discovery-confirm').click()
+    expect(dialog).not_to_be_visible();expect(page.locator('[data-profile="startup-claude"]')).to_contain_text('Claude startup fixture 2.1.291')
+    assert data['startup_refreshes']==1 and not submissions
+    page.wait_for_timeout(2200);assert data['startup_refreshes']==1, 'Confirmed discovery must not repeat itself'
     page.locator('#logout').click()
     expect(page.locator('#capability-panel')).to_be_hidden()
     expect(page.locator('#capability-body')).to_be_hidden()
     expect(page.locator('#capability-profiles')).to_be_empty()
     expect(page.locator('#capability-toggle')).to_have_attribute('aria-expanded','false')
-    data['config'].pop('native_agents')
+    data['config'].pop('native_agents');data['config']['agents'].remove('startup-claude')
     page.set_viewport_size({'width':1440,'height':1150})
     # Optional named workflows lock configured fields, then restore ordinary choices.
     reviewed={'name':'reviewed','repository':'api-service','developer':'native-codex','reviewer':'reviewer <img src=x onerror=alert(1)>','test':'full','max_repairs':2}
@@ -1046,6 +1096,6 @@ with sync_playwright() as p:
     assert not page.locator('#workflow-field').is_visible()
     assert page.locator('#workflow-hint').inner_text()==''
     assert not errors, errors
-    print('PASS: explicit workspace inventory reads/pagination/keyboard controls, allocated-vs-logical/reclaimable semantics, unknown/incomplete/error/empty states, inert XSS, no polling, responsive 320/390/1440; cached-only catalog login/open, explicit profile discovery, unknown auth/effective selection, startup context, safe model/effort metadata, task-only observations with scoped context/resolved alias/false-vs-unknown/staleness/inert XSS and no selector promotion, catalog screenshots at 320/390/1440, no automatic discovery, catalog logout reset; optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, persisted continuation status, repeated successor navigation, stale two-tab confirmation, reload/new-context recovery, off-page successor detail/refresh, continuation chains, reserved-submit recovery, review-only eligibility and dismissal, review focus UTF-8 boundary, immutable unknown-request retry, duplicate review confirmation, bidirectional cross-mode stale confirmations, review successor reload, logout; no browser errors')
+    print('PASS: opt-in Claude fresh-GET/native-dialog/Cancel/Escape/default-focus/confirmed-start with inert text and 320/390/1440 screenshots; explicit workspace inventory reads/pagination/keyboard controls, allocated-vs-logical/reclaimable semantics, unknown/incomplete/error/empty states, inert XSS, no polling, responsive 320/390/1440; cached-only catalog login/open, explicit profile discovery, unknown auth/effective selection, startup context, safe model/effort metadata, task-only observations with scoped context/resolved alias/false-vs-unknown/staleness/inert XSS and no selector promotion, catalog screenshots at 320/390/1440, no automatic discovery, catalog logout reset; optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, persisted continuation status, repeated successor navigation, stale two-tab confirmation, reload/new-context recovery, off-page successor detail/refresh, continuation chains, reserved-submit recovery, review-only eligibility and dismissal, review focus UTF-8 boundary, immutable unknown-request retry, duplicate review confirmation, bidirectional cross-mode stale confirmations, review successor reload, logout; no browser errors')
     browser.close()
 server.shutdown()

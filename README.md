@@ -32,7 +32,7 @@ cargo run -p relay-app -- serve .relay/config.json .relay/relay.db
 ```text
 GET  /api/config
 GET  /api/capabilities            # 已配置 native profile 的缓存能力目录
-POST /api/capabilities/<name>/refresh # 显式有界目录探测，不发起用户推理回合
+POST /api/capabilities/<name>/refresh # 有界刷新；启用 Claude 启动发现后需逐次确认
 GET  /api/workspaces?before=<id> # 只读工作区占用 / 共享历史 / 现有保留策略预览
 GET  /api/status
 GET  /api/tasks?before=<id>      # 最近 100 项，按 id 倒序

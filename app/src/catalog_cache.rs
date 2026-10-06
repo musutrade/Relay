@@ -9,6 +9,43 @@ use std::{
     time::{Duration, Instant},
 };
 const CATALOG_TTL: Duration = Duration::from_secs(300);
+const CONFIRMATION_TTL: Duration = Duration::from_secs(90);
+const STARTUP_WARNING: &str = "将启动这个已配置的 Claude，读取初始化模型元数据。它会遵循现有用户和管理策略；启动钩子、策略及认证辅助程序、MCP 或插件可能执行操作、访问网络并产生费用。Relay 只发送 initialize，不发送任务提示，不自动重试，也不切换认证。外部原生设置不由本次确认锁定。是否确认本次启动？";
+
+#[derive(Clone, Serialize)]
+pub struct StartupDiscovery {
+    pub confirmation_token: Option<String>,
+    pub expires_at_unix_ms: Option<u64>,
+    pub confirmation_text: &'static str,
+}
+struct PendingConfirmation {
+    token: String,
+    issued: Instant,
+    expires_at_unix_ms: u64,
+}
+fn confirmation() -> PendingConfirmation {
+    use rand_core::{OsRng, RngCore};
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    PendingConfirmation {
+        token: bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+        issued: Instant::now(),
+        expires_at_unix_ms: now.saturating_add(CONFIRMATION_TTL.as_millis() as u64),
+    }
+}
+fn token_matches(expected: &str, supplied: &str) -> bool {
+    expected.len() == supplied.len()
+        && expected
+            .bytes()
+            .zip(supplied.bytes())
+            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+            == 0
+}
 
 #[derive(Clone, Serialize)]
 pub struct CatalogView {
@@ -20,6 +57,7 @@ pub struct CatalogView {
     pub catalog: Option<ProfileCatalog>,
     pub task_observation: Option<TaskModelObservation>,
     pub task_observation_stale: bool,
+    pub startup_discovery: Option<StartupDiscovery>,
 }
 pub(crate) struct CatalogCache {
     epoch: String,
@@ -45,6 +83,7 @@ struct Entry {
     refreshing: bool,
     catalog: Option<ProfileCatalog>,
     observation: Option<(TaskModelObservation, Instant)>,
+    confirmation: Option<PendingConfirmation>,
 }
 impl CatalogCache {
     pub(crate) fn reconciled_guard(&mut self, guard_present: bool) {
@@ -61,6 +100,7 @@ impl CatalogCache {
             refreshing: false,
             catalog: None,
             observation: None,
+            confirmation: None,
         });
         if entry.stamp != stamp {
             entry.stamp = stamp;
@@ -68,6 +108,7 @@ impl CatalogCache {
             entry.checked = None;
             entry.catalog = None;
             entry.observation = None;
+            entry.confirmation = None;
             // The old probe keeps its slot until completion, but cannot populate
             // this newly invalidated generation.
         }
@@ -76,8 +117,30 @@ impl CatalogCache {
     pub(crate) fn view(&mut self, name: &str, profile: &NativeProfile) -> CatalogView {
         let cache_epoch = self.epoch.clone();
         let entry = self.entry(name, profile);
+        let startup_discovery = profile.allow_startup_discovery.then(|| {
+            if !entry.refreshing
+                && entry
+                    .confirmation
+                    .as_ref()
+                    .is_none_or(|pending| pending.issued.elapsed() >= CONFIRMATION_TTL)
+            {
+                entry.confirmation = Some(confirmation());
+            }
+            StartupDiscovery {
+                confirmation_token: entry
+                    .confirmation
+                    .as_ref()
+                    .map(|pending| pending.token.clone()),
+                expires_at_unix_ms: entry
+                    .confirmation
+                    .as_ref()
+                    .map(|pending| pending.expires_at_unix_ms),
+                confirmation_text: STARTUP_WARNING,
+            }
+        });
         CatalogView {
             cache_epoch,
+            startup_discovery,
             name: name.into(),
             generation: entry.generation,
             stale: entry
@@ -118,13 +181,49 @@ impl CatalogCache {
             // standalone catalog. Task observations have independent freshness.
         }
     }
+    pub(crate) fn begin_confirmed(
+        &mut self,
+        name: &str,
+        profile: &NativeProfile,
+        request: &crate::CatalogRefreshRequest,
+    ) -> Result<Option<(u64, ProfileStamp)>, &'static str> {
+        let entry = self.entry(name, profile);
+        if profile.allow_startup_discovery {
+            let valid = request.confirm_startup_effects
+                && request.confirmation_token.as_deref().is_some_and(|token| {
+                    entry.confirmation.as_ref().is_some_and(|pending| {
+                        pending.issued.elapsed() < CONFIRMATION_TTL
+                            && token_matches(&pending.token, token)
+                    })
+                });
+            if !valid {
+                return Err(
+                    "Claude startup requires fresh confirmation for this profile; read the current cache and confirm again",
+                );
+            }
+        } else if request.confirm_startup_effects || request.confirmation_token.is_some() {
+            return Err("Claude startup discovery is not enabled by the current host profile");
+        }
+        self.reserve(name).map(|generation| {
+            generation.map(|generation| {
+                let entry = self.entries.get_mut(name).expect("existing entry");
+                entry.confirmation = None;
+                (generation, entry.stamp.clone())
+            })
+        })
+    }
+
     /// One probe tree for the service. Repeated same-profile requests don't queue.
+    #[cfg(test)]
     pub(crate) fn begin(
         &mut self,
         name: &str,
         profile: &NativeProfile,
     ) -> Result<Option<u64>, &'static str> {
         self.entry(name, profile);
+        self.reserve(name)
+    }
+    fn reserve(&mut self, name: &str) -> Result<Option<u64>, &'static str> {
         if self.cleanup_blocked {
             return Err(
                 "catalog process cleanup is unknown; trusted host inspection is required before further discovery",
@@ -296,6 +395,122 @@ mod tests {
         cache.observe("native", &profile, observation, profile_stamp(&profile));
         std::fs::write(&path, "changed executable").unwrap();
         assert!(cache.view("native", &profile).task_observation.is_none());
+    }
+
+    fn startup_profile(path: &std::path::Path) -> NativeProfile {
+        serde_json::from_value(
+            json!({"provider":"claude_cli","program":path,"allow_startup_discovery":true}),
+        )
+        .unwrap()
+    }
+    fn consent(
+        cache: &mut CatalogCache,
+        name: &str,
+        profile: &NativeProfile,
+    ) -> crate::CatalogRefreshRequest {
+        let view = cache.view(name, profile);
+        crate::CatalogRefreshRequest {
+            confirm_startup_effects: true,
+            confirmation_token: view.startup_discovery.unwrap().confirmation_token,
+        }
+    }
+    #[test]
+    fn startup_consent_requires_attestation_is_single_use_and_is_not_renewed_by_reads() {
+        let p = startup_profile(std::path::Path::new("/bin/true"));
+        let mut cache = CatalogCache::default();
+        assert!(
+            cache
+                .begin_confirmed("native", &p, &crate::CatalogRefreshRequest::default())
+                .is_err()
+        );
+        let request = consent(&mut cache, "native", &p);
+        assert_eq!(
+            request.confirmation_token,
+            consent(&mut cache, "native", &p).confirmation_token
+        );
+        let unconfirmed = crate::CatalogRefreshRequest {
+            confirm_startup_effects: false,
+            confirmation_token: request.confirmation_token.clone(),
+        };
+        assert!(cache.begin_confirmed("native", &p, &unconfirmed).is_err());
+        let (generation, _) = cache
+            .begin_confirmed("native", &p, &request)
+            .unwrap()
+            .unwrap();
+        assert!(
+            cache
+                .view("native", &p)
+                .startup_discovery
+                .unwrap()
+                .confirmation_token
+                .is_none()
+        );
+        assert!(cache.begin_confirmed("native", &p, &request).is_err());
+        cache.finish("native", &p, generation, catalog(), true);
+        assert!(cache.begin_confirmed("native", &p, &request).is_err());
+        assert_ne!(
+            request.confirmation_token,
+            consent(&mut cache, "native", &p).confirmation_token
+        );
+    }
+    #[test]
+    fn expiry_other_profile_other_process_and_profile_policy_drift_reject_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake");
+        std::fs::write(&path, "version one").unwrap();
+        let mut p = startup_profile(&path);
+        let mut cache = CatalogCache::default();
+        let expired = consent(&mut cache, "native", &p);
+        cache
+            .entries
+            .get_mut("native")
+            .unwrap()
+            .confirmation
+            .as_mut()
+            .unwrap()
+            .issued = Instant::now() - CONFIRMATION_TTL;
+        assert!(cache.begin_confirmed("native", &p, &expired).is_err());
+        let request = consent(&mut cache, "native", &p);
+        assert_ne!(request.confirmation_token, expired.confirmation_token);
+        assert!(cache.begin_confirmed("other", &p, &request).is_err());
+        assert!(
+            CatalogCache::default()
+                .begin_confirmed("native", &p, &request)
+                .is_err()
+        );
+        p.model = Some("different requested model".into());
+        assert!(cache.begin_confirmed("native", &p, &request).is_err());
+        let request = consent(&mut cache, "native", &p);
+        p.env
+            .insert("PRIVATE_API_CONFIG".into(), "DO_NOT_EXPOSE".into());
+        assert!(cache.begin_confirmed("native", &p, &request).is_err());
+        assert!(
+            !serde_json::to_string(&cache.view("native", &p))
+                .unwrap()
+                .contains("DO_NOT_EXPOSE")
+        );
+        let request = consent(&mut cache, "native", &p);
+        std::fs::write(&path, "version two changed").unwrap();
+        assert!(cache.begin_confirmed("native", &p, &request).is_err());
+        let request = consent(&mut cache, "native", &p);
+        p.allow_startup_discovery = false;
+        assert!(cache.begin_confirmed("native", &p, &request).is_err());
+        assert!(cache.view("native", &p).startup_discovery.is_none());
+    }
+    #[test]
+    fn startup_confirmation_cannot_bypass_unknown_cleanup_or_parallel_discovery() {
+        let p = startup_profile(std::path::Path::new("/bin/true"));
+        let mut cache = CatalogCache::default();
+        let first = consent(&mut cache, "first", &p);
+        let second = consent(&mut cache, "second", &p);
+        let (generation, _) = cache.begin_confirmed("first", &p, &first).unwrap().unwrap();
+        assert!(cache.begin_confirmed("second", &p, &second).is_err());
+        cache.finish("first", &p, generation, catalog(), false);
+        assert!(cache.begin_confirmed("second", &p, &second).is_err());
+        cache.reconciled_guard(true);
+        assert!(cache.begin_confirmed("second", &p, &second).is_err());
+        cache.reconciled_guard(false);
+        assert!(cache.begin_confirmed("second", &p, &second).is_ok());
     }
 
     #[test]

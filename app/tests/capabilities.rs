@@ -260,14 +260,14 @@ fn reconciliation_refuses_symlinks_without_touching_target() {
 }
 
 #[test]
-fn claude_reports_known_route_but_never_starts_unverified_managed_hooks() {
+fn claude_without_opt_in_and_confirmation_keeps_manual_discovery() {
     let fixture = Fixture::new("success", "claude_cli");
     let c = fixture.run();
     assert_eq!(c.compatibility.state, CapabilityState::Supported);
     assert_eq!(c.cli_version.as_deref(), Some("2.1.281"));
     assert_eq!(c.model_catalog.state, CapabilityState::Unknown);
-    assert!(c.model_catalog.reason.contains("initialize"));
-    assert!(c.startup_context.reason.contains("managed startup hooks"));
+    assert!(c.model_catalog.reason.contains("initialization"));
+    assert!(c.startup_context.reason.contains("freshly confirmed"));
     assert!(c.models.is_empty());
     assert_eq!(c.authentication.state, CapabilityState::Unknown);
     let trace = fs::read_to_string(fixture.temp.path().join("trace")).unwrap();

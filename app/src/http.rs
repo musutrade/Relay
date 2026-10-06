@@ -2,9 +2,9 @@
 use crate::{Application, Error, Submission, auth::Auth};
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, Path, Query, Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -196,10 +196,38 @@ async fn capabilities(State(state): State<Web>) -> Result<Json<Value>, ApiError>
 async fn refresh_capabilities(
     State(state): State<Web>,
     Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
-    let result = tokio::task::spawn_blocking(move || state.app.refresh_capabilities(&name))
-        .await
-        .map_err(|_| Error::Poisoned)??;
+    // Legacy callers may set a JSON Content-Type on a genuinely empty POST.
+    // Bytes still applies DefaultBodyLimit; nonempty confirmations stay strict.
+    let request = if body.is_empty() {
+        crate::CatalogRefreshRequest::default()
+    } else {
+        let content_type = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if content_type != "application/json"
+            && !(content_type.starts_with("application/") && content_type.ends_with("+json"))
+        {
+            return Err(
+                Error::Invalid("catalog refresh confirmation requires a JSON body".into()).into(),
+            );
+        }
+        serde_json::from_slice(&body)
+            .map_err(|_| Error::Invalid("invalid catalog refresh confirmation JSON".into()))?
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        state.app.refresh_capabilities_confirmed(&name, &request)
+    })
+    .await
+    .map_err(|_| Error::Poisoned)??;
     Ok(Json(json!(result)))
 }
 async fn status(State(state): State<Web>) -> Result<Json<Value>, ApiError> {
