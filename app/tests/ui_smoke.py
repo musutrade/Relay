@@ -986,6 +986,8 @@ with sync_playwright() as p:
     confirm_permission();page.locator('#developer-manual-model').fill('manual-unverified')
     expect(page.locator('#developer-confirm')).not_to_be_checked();expect(page.locator('#developer-confirm')).to_be_disabled()
     confirm_permission()
+    # The preceding successful Auto-review submission cleared the form.
+    page.locator('#requirements').fill('Preserve role retry after Auto-review submission')
     data['post']='401';page.locator('#submit-task').click();expect(page.locator('#auth-panel')).to_be_visible()
     original=json.loads(json.dumps(submissions[-1]));assert len(original['permission_challenge'])==64;assert original['job']['role_selections']['developer']['model']=={'value':'manual-unverified','source':'manual'}
     assert 'effort' not in original['job']['role_selections']['developer']
