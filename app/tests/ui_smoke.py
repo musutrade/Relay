@@ -1081,6 +1081,65 @@ with sync_playwright() as p:
     page.locator('#operator-read').click();expect(page.locator('#operator-replacement')).to_contain_text('Missing stopped-stage proof')
     page.locator('#retry-task').click();expect(page.locator('#retry-replace')).to_be_disabled();expect(page.locator('#retry-replacement-status')).to_contain_text('requires reconciliation');page.locator('#retry-dismiss').click()
     assert not any(path.endswith('/refresh') for _,path,_ in requests[replacement_request_start:]), 'Replacement must not start catalog discovery'
+    # Phase 5: the opt-in native Codex tier stays distinct from strict no-execution review.
+    page.locator('#logout').click();data['frozen_lists'].pop(page,None)
+    native_review_mode='codex_native_sandboxed_review'
+    native_review_label='Codex 原生审查（本地只读，允许命令）'
+    native_review_warning='我确认本次审查允许在 Codex 本地只读沙箱中执行命令，原生审批设为 never。原生 hooks、MCP、插件和远程工具不受此本地沙箱约束，仅可使用我信任的启动配置和集成。此模式不等同于严格无执行审查。'
+    native_review=native_profile('codex-review','codex_app_server')
+    native_review.update(native_permission=native_review_mode,reviewer_supported=True,reviewer_contract='native_local_read_only')
+    native_review['permission_modes'].append(dict(permission_mode(native_review_mode),label=native_review_label,reviewer_only=True))
+    data['config']['agents'].append('codex-review');data['config']['native_agents'].append(native_review)
+    data['config']['workflows'][0]['selectable_reviewers'].append('codex-review')
+    native_review_catalog=json.loads(json.dumps(role_catalog))
+    native_review_catalog['native_reviewer']={'state':'supported','reason':'Explicit host opt-in; native local sandbox only','source':'fixture'}
+    data['catalogs'].append({'name':'codex-review','cache_epoch':'e'*32,'generation':1,'stale':False,'refreshing':False,'catalog':native_review_catalog})
+    value=review_task(224);data['tasks'].append(value);data['operator_overrides'][224]=replacement_operator(value,'reviewer')
+    data['operator_overrides'][224]['recovery']['actions'][0]['replacement']['profiles'].append('codex-review')
+    native_request_start=len(requests);connect(page)
+    page.locator('#workflow').select_option('reviewed');page.locator('#reviewer').select_option('codex-review')
+    expect(page.locator('#reviewer-support')).to_contain_text('独立 checkout 与全新独立会话，不恢复旧会话')
+    expect(page.locator('#reviewer-confirm-text')).to_contain_text(native_review_warning)
+    expect(page.locator('#reviewer-permission option[value="codex_full_access"]')).to_be_disabled()
+    page.locator('#requirements').fill('Explicit opt-in native review fixture');count=len(submissions)
+    page.locator('#submit-task').click();expect(page.locator('#form-message')).to_contain_text('风险确认');assert len(submissions)==count
+    def confirm_native_review():
+        page.locator('#reviewer-challenge').click();expect(page.locator('#reviewer-confirm')).to_be_enabled()
+        expect(page.locator('#reviewer-challenge-scope')).to_contain_text('native_permission='+native_review_mode)
+        page.locator('#reviewer-confirm').check()
+    confirm_native_review();page.locator('#reviewer-model-source').select_option('manual')
+    expect(page.locator('#reviewer-confirm')).not_to_be_checked();expect(page.locator('#reviewer-confirm')).to_be_disabled()
+    page.locator('#reviewer-manual-model').fill('native-review-model');confirm_native_review()
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':1000});assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'native reviewer overflow at {width}'
+        page.locator('#reviewer-settings').screenshot(path=str(SCREENSHOTS / f'relay-codex-native-review-{width}.png'))
+    page.locator('#submit-task').click();expect(page.locator('#form-message')).to_contain_text('已确认')
+    native_job=submissions[-1]['job'];assert native_job['role_selections']['reviewer']=={'profile':'codex-review','model':{'value':'native-review-model','source':'manual'},'native_permission':native_review_mode,'confirm_permission_expansion':True}
+    assert 'permission_challenge' in submissions[-1];assert 'developer' not in native_job['role_selections']
+    page.locator('#capability-toggle').click()
+    native_card=page.locator('[data-profile="codex-review"]')
+    expect(native_card).to_contain_text('严格无执行审查隔离');expect(native_card).to_contain_text('Read-only reviewer isolation is unavailable')
+    expect(native_card).to_contain_text('原生本地只读审查（允许命令）');expect(native_card).to_contain_text('Explicit host opt-in; native local sandbox only')
+    page.locator('#capability-toggle').click();select_task(page,224);page.locator('#review-task').click()
+    page.locator('#retry-replace').check();page.locator('#replacement-profile').select_option('codex-review')
+    expect(page.locator('#replacement-session')).to_contain_text('全新独立 Codex 会话，不恢复旧会话')
+    expect(page.locator('#replacement-confirm-text')).to_contain_text(native_review_warning)
+    page.locator('#retry-confirm').click();expect(page.locator('#retry-dialog-error')).to_contain_text('精确权限范围')
+    page.locator('#replacement-challenge').click();expect(page.locator('#replacement-confirm')).to_be_enabled();page.locator('#replacement-confirm').check()
+    page.keyboard.press('Escape');expect(page.locator('#retry-dialog')).to_be_hidden()
+    page.locator('#review-task').click();expect(page.locator('#retry-replace')).not_to_be_checked()
+    page.locator('#retry-replace').check();page.locator('#replacement-profile').select_option('codex-review')
+    expect(page.locator('#replacement-confirm')).not_to_be_checked();expect(page.locator('#replacement-confirm')).to_be_disabled()
+    page.locator('#replacement-challenge').click();expect(page.locator('#replacement-confirm')).to_be_enabled();page.locator('#replacement-confirm').check()
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':1000});assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        assert page.locator('#retry-dialog').evaluate('(node) => node.scrollWidth <= node.clientWidth')
+        page.locator('#replacement-confirm').scroll_into_view_if_needed();page.screenshot(path=str(SCREENSHOTS / f'relay-codex-native-review-replacement-{width}.png'),full_page=True)
+    page.locator('#retry-confirm').click();expect(page.locator('#continuation-choice')).to_contain_text('配置 codex-review')
+    native_replacement=data['review_requests'][-1][1]
+    assert native_replacement['replacement']=={'profile':'codex-review','native_permission':native_review_mode,'confirm_permission_expansion':True}
+    assert native_replacement['revalidate_tests'] and native_replacement['permission_challenge']
+    assert not any(path.endswith('/refresh') for _,path,_ in requests[native_request_start:])
     page.locator('#logout').click();after_logout=len(requests);page.wait_for_timeout(2400)
     assert len(requests)==after_logout
     assert page.locator('#auth-panel').is_visible()
@@ -1096,6 +1155,6 @@ with sync_playwright() as p:
     assert not page.locator('#workflow-field').is_visible()
     assert page.locator('#workflow-hint').inner_text()==''
     assert not errors, errors
-    print('PASS: opt-in Claude fresh-GET/native-dialog/Cancel/Escape/default-focus/confirmed-start with inert text and 320/390/1440 screenshots; explicit workspace inventory reads/pagination/keyboard controls, allocated-vs-logical/reclaimable semantics, unknown/incomplete/error/empty states, inert XSS, no polling, responsive 320/390/1440; cached-only catalog login/open, explicit profile discovery, unknown auth/effective selection, startup context, safe model/effort metadata, task-only observations with scoped context/resolved alias/false-vs-unknown/staleness/inert XSS and no selector promotion, catalog screenshots at 320/390/1440, no automatic discovery, catalog logout reset; optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, persisted continuation status, repeated successor navigation, stale two-tab confirmation, reload/new-context recovery, off-page successor detail/refresh, continuation chains, reserved-submit recovery, review-only eligibility and dismissal, review focus UTF-8 boundary, immutable unknown-request retry, duplicate review confirmation, bidirectional cross-mode stale confirmations, review successor reload, logout; no browser errors')
+    print('PASS: opt-in Codex native reviewer submit/replacement consent, manual-model invalidation, Escape reset, independent strict/native capability evidence, no discovery and 320/390/1440 screenshots; opt-in Claude fresh-GET/native-dialog/Cancel/Escape/default-focus/confirmed-start with inert text and 320/390/1440 screenshots; explicit workspace inventory reads/pagination/keyboard controls, allocated-vs-logical/reclaimable semantics, unknown/incomplete/error/empty states, inert XSS, no polling, responsive 320/390/1440; cached-only catalog login/open, explicit profile discovery, unknown auth/effective selection, startup context, safe model/effort metadata, task-only observations with scoped context/resolved alias/false-vs-unknown/staleness/inert XSS and no selector promotion, catalog screenshots at 320/390/1440, no automatic discovery, catalog logout reset; optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, persisted continuation status, repeated successor navigation, stale two-tab confirmation, reload/new-context recovery, off-page successor detail/refresh, continuation chains, reserved-submit recovery, review-only eligibility and dismissal, review focus UTF-8 boundary, immutable unknown-request retry, duplicate review confirmation, bidirectional cross-mode stale confirmations, review successor reload, logout; no browser errors')
     browser.close()
 server.shutdown()

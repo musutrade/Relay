@@ -132,3 +132,7 @@ Claude 独立启动发现由 host profile 的 `allow_startup_discovery` 显式 o
 ## 只读工作区保留预览
 
 `workspaces.rs` 在应用/宿主边界提供有界配置根清单和索引续接链；只读 claim 与锁、持久结果、完成标记及既有成功 TTL 共同给出保护/未知/等待/策略符合的观察，不创建清理动作。完成证明检查与原宿主清理复用，未改变核心状态或成功 TTL opt-in 默认关闭策略。`resources.rs` 在现有 fd 锚定 walker 中增加独立的 allocated-block 计量，不改变逻辑配额；硬链接去重不能证明独占或可回收空间。HTTP/UI 不查询 GitHub，不接受路径或策略写入。详见[工作区保留预览](workspace-inventory.md)。
+
+## 原生本地沙箱审查档
+
+[ADR 0003](adr/0003-native-sandboxed-review-tier.md) 保留严格审查并新增默认关闭的本地只读命令档。角色选择沿用宿主允许项和逐次 challenge；原生 hooks/MCP/插件/远程工具在本地命令沙箱外，由操作员显式信任。app-server 在发送任务前核对完整策略快照，始终使用新 ephemeral 线程。`sessions::reviewer_checkout` 将独立候选副本与 provider 会话保留解耦，资源估算、审查续接、采纳和替换拓扑均使用同一判断。旧恢复语义不改，内核不增加状态；候选事后核对不保证阻止外部副作用。

@@ -49,7 +49,7 @@ POST /api/tasks/<id>/continue-review # 同一候选复验一次测试后只继�
 
 ## 接入真实开发 Agent
 
-把允许访问的本地仓库、Agent、测试和 PR 命令显式写入配置。请求只引用配置中的名字，不能指定任意程序、路径或 shell。原生 `native_agents` 支持 Codex / Claude CLI 的有界 JSONL 协议与终态校验；可显式开启 [Codex app-server / Claude 会话续接](docs/session-continuity.md)；旧通用命令保持兼容。`relay-app doctor <config.json>` 可只探测版本/参数，不调用模型。网页中的[主机能力与模型目录](docs/agent-capabilities.md)提供显式刷新和已知/未知能力说明；目录可见不代表调用授权；首次提交可按宿主允许范围[分别选择开发与审查角色](docs/native-role-selection.md)。模型与供应商凭据由这些外部 CLI 自行管理，Relay 不存储或代办凭据。命令失败和测试失败作为开发结果保存，内核不理解业务状态。
+把允许访问的本地仓库、Agent、测试和 PR 命令显式写入配置。请求只引用配置中的名字，不能指定任意程序、路径或 shell。原生 `native_agents` 支持 Codex / Claude CLI 的有界 JSONL 协议与终态校验；可显式开启 [Codex app-server / Claude 会话续接](docs/session-continuity.md)；旧通用命令保持兼容。`relay-app doctor <config.json>` 可只探测版本/参数，不调用模型。网页中的[主机能力与模型目录](docs/agent-capabilities.md)提供显式刷新和已知/未知能力说明；目录可见不代表调用授权；首次提交可按宿主允许范围[分别选择开发与审查角色](docs/native-role-selection.md)。严格 Claude 审查保持默认；可单独配置默认关闭的 [Codex 原生本地沙箱审查](docs/native-sandboxed-review.md)，允许命令、显式信任原生集成并逐次确认。模型与供应商凭据由这些外部 CLI 自行管理，Relay 不存储或代办凭据。命令失败和测试失败作为开发结果保存，内核不理解业务状态。
 
 可选命名 `workflows` 将开发 → 测试 → 只读审查 → 有界修复绑定同一 candidate SHA；每次修复必须重新测试和审查。失败后可 [显式继续保留的工作](docs/workspace-continuation.md)，或在已证明的停止阶段[更换当前角色](docs/adapter-stage-continuation.md)，使用新任务编号但复用固定目录；成功工作区可选按期限清理；网页提供[只读保留预览](docs/workspace-inventory.md)，区分已分配空间、共享历史和当前 TTL 证据，不提供删除操作。GitHub 示例仅推送已批准的精确候选，默认 dry-run。
 

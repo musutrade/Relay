@@ -28,7 +28,7 @@
 
 `examples/local-cli-config.json` 显式选择 4 GiB（4294967296 字节）的整项任务预算，输入快照仍为 50 MiB。这只是容量示例，不会修改已有主机配置；运维者需按仓库、构建与保留数量选择。两种字节预算都可配置超过 1 GiB，零、负数、小数、溢出或超过 1 TiB 均拒绝。
 
-整项任务目录内的候选工作树、私有 `.git` 对象/索引、开启审查会话续接时的独立 `reviewer-repository`（含其私有 Git 对象）、构建产物、会话、检查点、旧轮次证据及控制文件共享同一预算；不排除 `.git`、`target` 或 `node_modules`。未开启审查会话续接的旧审查模式复用候选目录，不虚增一份副本。每个文件路径按逻辑长度计数，稀疏文件也计完整长度，不按磁盘块或 inode 去重，也不跟随符号链接。工作流通过私有浅 Git 导入，不使用普通输入快照复制，因此 `max_snapshot_bytes` 不单独限制工作流输入；实际工作流始终受整项任务预算约束。
+整项任务目录内的候选工作树、私有 `.git` 对象/索引、会话型或 fresh 原生审查的独立 `reviewer-repository`（含其私有 Git 对象）、构建产物、会话、检查点、旧轮次证据及控制文件共享同一预算；不排除 `.git`、`target` 或 `node_modules`。未开启审查会话续接的旧审查模式复用候选目录，不虚增一份副本。每个文件路径按逻辑长度计数，稀疏文件也计完整长度，不按磁盘块或 inode 去重，也不跟随符号链接。工作流通过私有浅 Git 导入，不使用普通输入快照复制，因此 `max_snapshot_bytes` 不单独限制工作流输入；实际工作流始终受整项任务预算约束。
 
 复制普通快照前只扫描元数据做准入检查，复制中仍检查变化。工作流在 fetch 前估算已固定基线的物化工作树大小（若需要独立 reviewer，预留两份工作树），fetch 后、checkout 前再计入已存在的实际 Git/控制字节；创建 reviewer 时再次检查，复用 reviewer 仅估算增长差额。该估算不重复完整内容哈希，也不复制对象；源 Git filters 可能影响实际 checkout 大小，Git 压缩/临时 pack、后续模型和构建增长均不能提前精确预测。通过准入检查不保证后续所有阶段都能容纳；运行期检查仍是同一整项预算，错误报告有效上限和观测/估算字节。
 
@@ -82,7 +82,7 @@
 }
 ```
 
-这是完整 host 配置的片段；所有名字必须引用现有允许项。`test` 必须配置，`max_repairs` 默认 0、最大 3，表示初次开发之后最多自动修复几次。若不需要发布，同时省略 `draft_pr_adapter` 与 `github_repository`。当前 reviewer 必须是支持受限只读工具的 Claude 原生 profile；通用命令和 Codex reviewer 在执行开发前被拒绝。版本/能力不足也直接失败，不降级权限。
+这是完整 host 配置的片段；所有名字必须引用现有允许项。`test` 必须配置，`max_repairs` 默认 0、最大 3，表示初次开发之后最多自动修复几次。若不需要发布，同时省略 `draft_pr_adapter` 与 `github_repository`。默认 reviewer 必须是支持受限只读工具的 Claude 原生 profile；另可显式配置默认关闭的 [Codex 原生沙箱审查](native-sandboxed-review.md)，本地只读允许命令、原生集成仍受操作员信任。未获允许的组合和通用 reviewer 在执行开发前被拒绝。版本/能力不足也直接失败，不降级权限。
 
 ```json
 {"repository":"project","requirements":"实现需求并补测试","agent":"codex","workflow":"reviewed","publish":false}
@@ -183,7 +183,9 @@ cargo run -p relay-app -- doctor /absolute/path/config.json
 
 `doctor` 只调用已配置 CLI 的版本与帮助入口，输出 JSON 能力诊断；不发出模型请求。退出码 0 表示诊断完成，不代表所有 profile 兼容；自动化须检查 JSON 中所需 profile 的 `compatible`，审查能力另看 `probe.read_only_supported`。Claude 的[官方 CLI 文档](https://code.claude.com/docs/en/cli-reference)说明帮助输出不包含所有参数：若配置了但帮助中隐藏 `--max-turns`，Relay 先验证版本和其他必要参数，再用带 `--help` 的缺参/有效值探测确认解析器确实支持该选项；单独 `--help` 成功或普通非零退出均不足以通过。额外探测共享原有 10 秒期限和输出上限；格式不明仍拒绝，不删除 turn/budget 限制。`compatible` 仅表示本地接口满足调用要求，认证与模型访问始终标记 `unknown`。Claude 无人值守运行要求 v2.1.259+ 及相应参数。任务执行前再次进行受 supervisor 管理的检查，所有检查共享任务期限。缺少功能或检查失败时停止，不退回不安全的权限模式。
 
-只读能力单独探测：当前 Claude 需要 restricted 模式、仅 Read/Glob/Grep 工具、禁用 MCP/自定义命令的完整能力。Codex 开发调用可用，但只读审查返回 `review_profile_unsupported`，因为完整版本验证的无执行、hooks/MCP、配置加载与恢复隔离契约尚未证明；已有单项控制不能替代完整证明。机器上的托管设置仍属于可信部署边界，不承诺对恶意 CLI 或托管 hooks 隔离。
+只读能力单独探测：当前 Claude 需要 restricted 模式、仅 Read/Glob/Grep 工具、禁用 MCP/自定义命令的完整能力。Codex 开发调用可用，但严格无执行审查返回 `review_profile_unsupported`，因为完整版本验证的无执行、hooks/MCP、配置加载与恢复隔离契约尚未证明；已有单项控制不能替代完整证明。机器上的托管设置仍属于可信部署边界，不承诺对恶意 CLI 或托管 hooks 隔离。
+
+新 [`codex_native_sandboxed_review`](native-sandboxed-review.md) 是独立的默认关闭能力档；`probe.read_only_supported` 不用于报告它。首版 app-server 0.160.1、新 ephemeral 会话、本地 read-only / never、原生启动集成风险和逐次确认均有独立规则。
 
 原生调用使用 stdin 传需求、JSONL 输出以及显式权限参数。供应商事件在排空 stdout 时增量解析，独立于用户可见的截断日志；限制单事件、摘要、标识符与 usage 的保留大小。成功需要进程正常退出以及有效成功终态。Codex 的非致命 error item 和失败的工具 item 可由 Agent 后续恢复，不单独视为协议损坏；以最后一条已完成 agent_message 为摘要，仍须有成功 turn.completed 终态。缺失或非法终态、turn.failed、顶层供应商 error、权限拒绝、预算耗尽、非零退出都不能成为成功。格式错误保持失败，但继续有界解析后续行以保留摘要和 usage；超过 64 KiB 的行丢弃至下一换行后恢复解析，后续成功事件不会消除之前的致命错误。结果的 provider 信息保留实际报告的模型与会话标识；未报告的字段不猜测，旧无会话 profile 不会仅凭此字段恢复会话。显式续接配置与 app-server 生命周期见 [原生会话续接](session-continuity.md)。
 

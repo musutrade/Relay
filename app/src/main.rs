@@ -73,7 +73,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         let profiles: Vec<_> = host.config().native_agents.iter().map(|(name, profile)| {
-            match host.probe_native(name, profile.native_permission == Some(relay_app::providers::NativePermission::ClaudeRestricted)) {
+            match host.probe_native(name, profile.native_permission == Some(relay_app::providers::NativePermission::ClaudeRestricted) || profile.native_sandboxed_review()) {
                 Ok(probe) => serde_json::json!({"name":name,"compatible":true,"probe":probe,"authentication":"unknown","model_access":"unknown"}),
                 Err(error) => serde_json::json!({"name":name,"compatible":false,"error":error.to_string(),"authentication":"unknown","model_access":"unknown"}),
             }

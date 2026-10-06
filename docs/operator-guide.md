@@ -28,7 +28,7 @@ printf '%s\n' "$REV" > "$RELEASE/REVISION" || exit 1
 复制 [local-cli-config.json](../examples/local-cli-config.json) 到私有数据目录 `config.json`，将全部占位路径替换为实际绝对路径。测试命令和参数要适配你的项目，例如 Cargo 项目用本机 cargo 路径和 `["test", "--locked"]`。源仓库必须是干净的 Git checkout；工作区应放在单独的私有目录。配置不是 shell，不会展开 `$HOME` 或 `~`。无须配置模型名时由 CLI 选择账户默认模型，不猜测模型 ID。
 
 - Codex 和 Claude 都支持 developer 角色；示例包含 Codex 开发 + Claude 审查、Claude 开发 + Claude 审查两种工作流
-- reviewer 当前仅支持具备所需受限只读能力的 Claude CLI；Codex reviewer 是未支持能力，登录成功也不能解锁它
+- 默认严格 reviewer 使用具备受限只读能力的 Claude CLI；可另外配置默认关闭的 [Codex 原生沙箱审查](native-sandboxed-review.md)。它允许命令且信任原生启动/集成，不是严格无执行审查；登录成功不能跳过版本、允许项和逐次确认
 - 示例不配置 PR adapter，job `publish` 默认 false；即使误提交 true，也会因未配置允许项而失败。网页不请求发布
 - 显式设置总期限、输出、工作区字节/条目/保留数量和修复次数。Claude 的 2 美元预算是每次 CLI 调用的上限，不是整个任务或账户的总费用上限；多轮开发和审查会累加。Codex profile 没有美元预算字段，需外部账户费用控制
 

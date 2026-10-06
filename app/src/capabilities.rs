@@ -124,6 +124,9 @@ pub struct ProfileCatalog {
     pub compatibility: Capability,
     pub authentication: Capability,
     pub reviewer_isolation: Capability,
+    /// Separate tier: a local command sandbox, never global integration isolation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_reviewer: Option<Capability>,
     pub permission_control: Capability,
     pub session_continuity: Capability,
     pub process_cleanup: Capability,
@@ -165,6 +168,11 @@ impl ProfileCatalog {
                     "relay:reviewer_contract",
                 )
             },
+            native_reviewer: profile.native_sandboxed_review().then(|| if profile.reviewer_supported() {
+                Capability::unknown("Opt-in native review: local read-only commands, approval never, fresh sessions only. Native hooks, MCP, plugins and remote tools remain operator-trusted outside this sandbox. Runtime policy has not been observed", "relay:native_reviewer_contract")
+            } else {
+                Capability::unsupported("Native review is not host-allowed or requests unsupported session continuity", "relay:native_reviewer_contract")
+            }),
             permission_control: Capability::unknown(
                 "Configured permission contract has not been verified",
                 HELP_SOURCE,
@@ -394,8 +402,9 @@ fn discover_inner(
     }
     let cancellation = AtomicBool::new(false);
     let deadline = Instant::now() + Duration::from_secs(10);
-    let reviewer_only =
-        profile.native_permission == Some(crate::providers::NativePermission::ClaudeRestricted);
+    let reviewer_only = profile.native_permission
+        == Some(crate::providers::NativePermission::ClaudeRestricted)
+        || profile.native_sandboxed_review();
     let mut probe_profile = profile.clone();
     if startup {
         probe_profile.session_continuity = false;
@@ -443,6 +452,12 @@ fn discover_inner(
                 };
             }
             catalog.session_continuity = match profile.provider {
+                ProviderKind::CodexAppServer if profile.native_sandboxed_review() => {
+                    Capability::unsupported(
+                        "Native sandboxed reviewer uses a fresh ephemeral thread for every invocation; provider resume is unsupported",
+                        "relay:native_reviewer_contract",
+                    )
+                }
                 ProviderKind::CodexCli => Capability::unsupported(
                     "The configured Codex exec adapter is ephemeral",
                     "relay:adapter_contract",
@@ -496,6 +511,12 @@ fn discover_inner(
         Err(failure) => {
             catalog.compatibility =
                 Capability::unknown(probe_failure_reason(&failure), HELP_SOURCE);
+            if profile.native_sandboxed_review() {
+                catalog.native_reviewer = Some(Capability::unsupported(
+                    "Native review compatibility was not verified; only app-server 0.160.1 with explicit host opt-in and fresh sessions is supported. Startup/integrations are not isolated",
+                    HELP_SOURCE,
+                ));
+            }
             record_cleanup(&mut catalog, &failure);
         }
     }
