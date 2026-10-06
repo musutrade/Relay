@@ -4,6 +4,7 @@ mod app_server;
 pub mod auth;
 pub mod capabilities;
 mod catalog_cache;
+mod claude_control;
 mod git_inventory;
 pub mod host;
 pub mod http;
@@ -1145,6 +1146,18 @@ impl Application {
             (task, flag)
         };
         let execution = self.host.execute(&task, cancellation);
+        // Observations are task-scoped, bounded and transient. They never enter
+        // durable task payloads/results or authorize a cross-context selection.
+        for (name, observation, stamp) in self.host.take_model_observations() {
+            if let Some(profile) = self.config.native_agents.get(&name) {
+                self.catalogs.lock().map_err(|_| Error::Poisoned)?.observe(
+                    &name,
+                    profile,
+                    observation,
+                    stamp,
+                );
+            }
+        }
         let result = execution.to_json();
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
         if execution.outcome == host::Outcome::Unknown {

@@ -77,6 +77,31 @@ pub struct ModelCapability {
     pub is_default: Option<bool>,
     pub hidden: Option<bool>,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_effort: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_adaptive_thinking: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_fast_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_auto_mode: Option<bool>,
+}
+
+/// Metadata observed inside an already-authorized task, never a profile-wide
+/// entitlement or a reusable catalog for a different workspace or role.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskModelObservation {
+    pub task_id: i64,
+    pub repository: String,
+    pub role: String,
+    pub cli_version: Option<String>,
+    pub checked_at_unix_ms: u64,
+    pub requested_model: Option<String>,
+    pub requested_effort: Option<String>,
+    pub native_permission: Option<crate::providers::NativePermission>,
+    pub models: Vec<ModelCapability>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -476,6 +501,7 @@ fn discover_codex(
                 workspace_lease: false,
                 git_inventory: false,
                 catalog: false,
+                claude_control: false,
                 app_server: None,
                 provider: None,
                 read_only: false,
@@ -528,6 +554,7 @@ fn discover_codex(
             workspace_lease: false,
             git_inventory: false,
             catalog: true,
+            claude_control: false,
             app_server: None,
             provider: Some(ProviderResult::new(profile, catalog.cli_version.clone())),
             read_only: true,
@@ -866,6 +893,11 @@ fn parse_model(value: &Value) -> Result<ModelCapability, &'static str> {
         is_default: bool_field(value, "isDefault")?,
         hidden: bool_field(value, "hidden")?,
         source: CODEX_SOURCE.into(),
+        resolved_model: None,
+        supports_effort: None,
+        supports_adaptive_thinking: None,
+        supports_fast_mode: None,
+        supports_auto_mode: None,
     })
 }
 

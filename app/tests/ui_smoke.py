@@ -78,6 +78,15 @@ def catalog_fixture():
         'selection':{'requested_model':'manual-model','requested_effort':'high',
             'effective_model':None,'effective_effort':None,
             'status':evidence('unknown','Execution has not verified the requested configuration')}}
+def task_observation_fixture():
+    attack='<img src=x onerror=window.__taskObservationXss=1>'
+    return {'task_id':42,'repository':'relay-demo '+attack,'role':'reviewer',
+        'cli_version':'2.1.291','checked_at_unix_ms':1700000010000,
+        'requested_model':'observed-alias','requested_effort':'high','native_permission':'claude_restricted',
+        'models':[{'id':'observed-alias','model':'observed-alias','display_name':'Observed task model',
+            'description':attack,'default_effort':None,'supported_efforts':[{'effort':'high','description':None}],
+            'is_default':None,'hidden':None,'source':'fixture:task_initialize',
+            'resolved_model':'resolved-observed-alias','supports_effort':True,'supports_fast_mode':False}]}
 with sync_playwright() as p:
     browser=p.chromium.launch(executable_path=os.environ.get('CHROMIUM_PATH'),headless=True,args=['--no-sandbox'])
     context=browser.new_context(viewport={'width':1440,'height':1150},locale='zh-CN')
@@ -730,10 +739,50 @@ with sync_playwright() as p:
     role_catalog=catalog_fixture()
     role_catalog['models'].append(dict(role_catalog['models'][0],id='review-model',model='review-model',display_name='Independent reviewer model'))
     data['catalogs']=[{'name':name,'cache_epoch':'a'*32,'generation':1,'stale':False,'refreshing':False,'catalog':role_catalog} for name in ['codex','claude','other-review']]
+    claude_catalog=next(item for item in data['catalogs'] if item['name']=='claude')
+    claude_catalog.update(catalog=None,stale=True,task_observation=task_observation_fixture(),task_observation_stale=False)
     data['post']='success';page.locator('#token').fill('test-token');page.locator('#connect').click()
     expect(page.locator('#auth-panel')).to_be_hidden()
     page.locator('#workflow').select_option('role-flow');page.locator('#agent').select_option('claude')
     expect(page.locator('#reviewer option[value="codex"]')).to_be_disabled()
+    # Task-scoped observations render without a standalone catalog and never become
+    # verified model choices for either role. Reading them sends no model/task POST.
+    observation_request_start=len(requests)
+    page.locator('#capability-toggle').click()
+    observed_card=page.locator('[data-profile="claude"]')
+    observed=observed_card.locator('.catalog-task-observation')
+    expect(observed).to_be_visible();expect(observed_card).to_contain_text('尚无缓存')
+    for text in ['任务 #42','仓库：relay-demo','审查者（reviewer）','CLI 版本：2.1.291',
+                 '上次读取时任务观察未过期','不是完整实时目录','不会用于已验证的目录选择',
+                 '任务请求模型：observed-alias','原生模式：claude_restricted']:
+        expect(observed).to_contain_text(text)
+    observed.locator('summary').click()
+    expect(observed.locator('.catalog-model-list')).to_be_visible()
+    for text in ['初始化解析模型（非实际生效证明）：resolved-observed-alias','支持的 effort：high',
+                 'Effort 支持：是','Fast mode 支持：否','Adaptive thinking 支持：未知（供应商未提供）',
+                 'Auto mode 支持：未知（供应商未提供）','<img src=x onerror=window.__taskObservationXss=1>']:
+        expect(observed).to_contain_text(text)
+    assert observed.locator('img,script,select,input').count()==0
+    assert page.evaluate('window.__taskObservationXss === undefined')
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':900})
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'task observation overflow at {width}'
+        page.screenshot(path=str(SCREENSHOTS / f'relay-task-observation-{width}.png'),full_page=True)
+    for role in ['developer','reviewer']:
+        page.locator(f'#{role}-model-source').select_option('catalog')
+        expect(page.locator(f'#{role}-model')).to_be_disabled()
+        expect(page.locator(f'#{role}-model option')).to_have_count(1)
+        expect(page.locator(f'#{role}-model option[value="observed-alias"]')).to_have_count(0)
+        expect(page.locator(f'#{role}-effort')).to_be_disabled()
+    claude_catalog['task_observation_stale']=True
+    page.locator('#capability-read').click();expect(observed).to_contain_text('任务观察已陈旧')
+    assert not any(method=='POST' for method,_,_ in requests[observation_request_start:])
+    # Restore a separate fixture catalog for the existing role-selection scenarios.
+    claude_catalog.update(catalog=role_catalog,stale=False,generation=2)
+    page.locator('#capability-read').click()
+    expect(page.locator('#developer-model option[value="fixture-model"]')).to_have_count(1)
+    expect(page.locator('#reviewer-model option[value="observed-alias"]')).to_have_count(0)
+    page.locator('#capability-toggle').click();expect(page.locator('#capability-body')).to_be_hidden()
     for role, model, effort in [('developer','fixture-model','high'),('reviewer','review-model','low')]:
         page.locator(f'#{role}-model-source').select_option('catalog')
         page.locator(f'#{role}-model').select_option(model);page.locator(f'#{role}-effort').select_option(effort)
@@ -908,6 +957,6 @@ with sync_playwright() as p:
     assert not page.locator('#workflow-field').is_visible()
     assert page.locator('#workflow-hint').inner_text()==''
     assert not errors, errors
-    print('PASS: cached-only catalog login/open, explicit profile discovery, unknown auth/effective selection, startup context, safe model/effort metadata, catalog screenshots at 320/390/1440, no automatic discovery, catalog logout reset; optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, persisted continuation status, repeated successor navigation, stale two-tab confirmation, reload/new-context recovery, off-page successor detail/refresh, continuation chains, reserved-submit recovery, review-only eligibility and dismissal, review focus UTF-8 boundary, immutable unknown-request retry, duplicate review confirmation, bidirectional cross-mode stale confirmations, review successor reload, logout; no browser errors')
+    print('PASS: cached-only catalog login/open, explicit profile discovery, unknown auth/effective selection, startup context, safe model/effort metadata, task-only observations with scoped context/resolved alias/false-vs-unknown/staleness/inert XSS and no selector promotion, catalog screenshots at 320/390/1440, no automatic discovery, catalog logout reset; optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, persisted continuation status, repeated successor navigation, stale two-tab confirmation, reload/new-context recovery, off-page successor detail/refresh, continuation chains, reserved-submit recovery, review-only eligibility and dismissal, review focus UTF-8 boundary, immutable unknown-request retry, duplicate review confirmation, bidirectional cross-mode stale confirmations, review successor reload, logout; no browser errors')
     browser.close()
 server.shutdown()

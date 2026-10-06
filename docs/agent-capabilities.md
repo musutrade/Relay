@@ -4,9 +4,10 @@
 
 ## 操作与接口
 
-- `GET /api/capabilities` 只读取缓存，不启动进程。每个 profile 返回 `name`、进程级 `cache_epoch`、`generation`、`stale`、`refreshing` 和 `catalog`
+- `GET /api/capabilities` 只读取缓存，不启动进程。每个 profile 返回 `name`、进程级 `cache_epoch`、`generation`、`stale`、`refreshing`、`catalog`，以及独立的 `task_observation` / `task_observation_stale`
 - `POST /api/capabilities/<name>/refresh` 显式检查所选 profile 并获取目录，不提交任务或用户推理回合。使用与其他 API 相同的认证和会话请求保护
 - 缓存仅存在于服务进程内，五分钟后标记过期；过期不会自动探测。可执行文件或配置变化使旧目录失效，清空旧值并推进 generation。服务重启更换 cache_epoch，前端只在同一 epoch 内比较 generation
+- 每个 profile 只保留最近一次已授权 Claude 任务的模型观察，单独计时并在五分钟后标记陈旧。它不推进可选择目录的 generation，不会写入 `catalog.models`。配置或可执行文件变化同时清除观察；服务重启也不保留。页面只在连接、打开面板或手动读取时获得当前缓存，不为此轮询或启动任务
 - 整个服务同时最多执行一个目录探测；重复刷新不会排队启动更多进程。另一个 profile 正在探测时返回 409
 - 进程清理无法确认时停止后续探测，交由可信宿主核对。不能把超时当成进程已停止的证据
 
@@ -24,7 +25,27 @@
 
 Codex 使用当前配置 binary 的 app-server `initialize` → `initialized` → 分页 `model/list`，读取运行时返回的模型和 supportedReasoningEfforts。不会发送 thread/start 或 turn/start。它在私有空目录初始化，仍使用原有环境和宿主配置；来源/上下文会明确说明这点。[官方协议](https://learn.chatgpt.com/docs/app-server#list-models-modellist)
 
-Claude SDK 的初始化响应确实提供 models，且无需发送用户推理回合。但本阶段没有启动该目录探测：restricted 模式仍可能加载受管理的 hooks，普通 disableAllHooks 设置无法覆盖组织策略。这里报告的是“启动隔离尚未验证”，不是断言用户机器存在这些 hooks、账户被拒绝或 CLI 不支持发现。不会换用官方 API 账号目录冒充 CLI 订阅目录。现有配置中的手工 model ID 保持可用并标为未验证；Claude 自动目录是后续待完成的支持。[官方 hook 优先级](https://code.claude.com/docs/en/hooks#disable-or-remove-hooks) · [SDK 初始化实现](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/query.py)
+Claude SDK 的初始化响应提供 `models`，无需先发送用户推理回合。但**独立刷新仍不启动 Claude 目录初始化**：非交互进程可能加载 hooks / MCP；普通 `disableAllHooks` 无法覆盖受管理 hooks。`--bare` 又不使用订阅 OAuth 登录或系统钥匙串，不能作为保留现有订阅认证的替代方案。这里报告的是“独立启动隔离尚未验证”，不是断言用户机器存在这些 hooks、账户被拒绝或 CLI 不支持发现。不会换用官方 API 账号目录冒充 CLI 订阅目录。[官方非交互与 bare 模式说明](https://code.claude.com/docs/en/headless#start-faster-with-bare-mode) · [官方 hook 优先级](https://code.claude.com/docs/en/hooks#disable-or-remove-hooks)
+
+### 已授权任务内的 Claude 模型观察（部分支持）
+
+对于执行前检查通过、版本至少 `2.1.291` 且帮助中声明 `--input-format` 的 Claude CLI，Relay 在**本来就要执行的已授权任务进程**中使用 `stream-json` 输入：先发送一次 `initialize` 控制请求，再发送一次原有任务提示。没有为了更新面板额外启动的 Claude 初始化进程、额外用户回合或模型试调用。原任务的认证、环境、settings、权限、工作区与 `--session-id` / `--resume` 路径不变；开发者和审查者继续遵守各自已有的权限与隔离契约。旧版 CLI 沿用原文本输入，不为取得观察而增加新调用。[SDK 初始化实现](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/query.py)
+
+`task_observation` 为 `null` 或以下任务作用域信息：
+
+- `task_id`、仓库 allowlist 名称 `repository`、`role`（`developer` / `reviewer`）、`cli_version`、`checked_at_unix_ms`
+- 此任务的 `requested_model`、`requested_effort`、`native_permission`，不与 profile 默认值或其他任务混用
+- 初始化实际返回并经过有界校验的 `models`；模型 ID 和 effort 来自响应，不内置名称列表
+
+模型条目沿用 `ModelCapability`，并可提供 `resolved_model`、`supports_effort`、`supports_adaptive_thinking`、`supports_fast_mode`、`supports_auto_mode`；初始化的 `supportedEffortLevels` 转为 `supported_efforts`。缺失可选字段仍是未知，`false` 与缺失不同。`resolved_model` 只说明初始化时别名如何解析，不是任务实际调用该模型的证明。字段契约参考官方 [Agent SDK 0.3.291](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk/v/0.3.291) 的 `sdk.d.ts` / `ModelInfo`；以每次实际响应为准，不推测没有返回的能力。
+
+这里只保存并公开上述允许字段，不返回初始化的账户资料、凭据、原始控制 payload 或供应商原始错误。初始化属于现有任务启动行为，不能据此宣称整个任务无网络、无 hooks 或免费。
+
+页面把观察与独立目录分开显示，即使 `catalog: null` 也能看到任务编号、仓库、角色、请求配置、观察时间、CLI 版本和独立陈旧标签。观察只适用于那个任务的初始化上下文，**不是完整实时模型目录、账户可调用证明或授权依据**。观察条目不会进入“已验证目录”的模型 / effort 选择；仍可显式使用未验证的手工 model ID，执行时继续由原生 CLI 验证。
+
+因此 issue #20 仍为部分完成：已经能展示正常任务带回的 Claude 模型元数据，但完整、独立、保留订阅认证且启动隔离经过验证的 Claude 自动目录仍未实现；不能把一次任务观察标为该 profile 的完整可选目录。
+
+任务观察的时间取初始化响应收到时刻，五分钟新鲜度也从该时刻计算；后续长任务、测试或审查不会重新延长有效期。
 
 ## 只有进程状态未知时才需要核对
 
