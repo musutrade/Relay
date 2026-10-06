@@ -5,7 +5,6 @@ use crate::host::{
     CommandProfile, CommandResult, CommandSpec, Host, HostConfig, HostError, Job, Outcome,
     RunResult,
 };
-use crate::providers::ProviderKind;
 use relay::Task;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -66,10 +65,10 @@ impl WorkflowConfig {
         if !config
             .native_agents
             .get(&self.reviewer)
-            .is_some_and(|profile| profile.provider == ProviderKind::ClaudeCli)
+            .is_some_and(|profile| profile.reviewer_supported())
         {
             return Err(invalid(
-                "review_profile_unsupported: workflow reviewer requires a restricted Claude native profile",
+                "review_profile_unsupported: workflow reviewer requires restricted Claude or host-allowed Codex native sandboxed review",
             ));
         }
         config.native_agents[&self.reviewer]
@@ -800,6 +799,12 @@ impl Execution<'_> {
             );
             native.env.extend(self.env(prompt));
             native.env.extend(extra.clone());
+            if native.native_sandboxed_review() {
+                // The app-server driver releases review input only after it
+                // verifies the local policy. Do not leak it to startup/probes.
+                native.env.remove("RELAY_REQUIREMENTS");
+                native.env.remove("RELAY_REQUIREMENTS_FILE");
+            }
             let mut command = self.host.run_native(
                 &native,
                 prompt,
@@ -1221,7 +1226,7 @@ impl Execution<'_> {
         let base = self.sha(config, source, "HEAD^{commit}")?;
         self.clean(config, source)?;
         let worktree_bytes = self.worktree_bytes(config, source, &base)?;
-        let copies = if crate::sessions::enabled(&self.reviewer_profile()) {
+        let copies = if crate::sessions::reviewer_checkout(&self.reviewer_profile()) {
             2
         } else {
             1
@@ -1698,7 +1703,7 @@ fn run_operator_adoption(
     let candidate = &adoption.review.candidate_sha;
     context.verify(config, candidate)?;
     let reviewer = &context.reviewer_profile();
-    if crate::sessions::enabled(reviewer) {
+    if crate::sessions::reviewer_checkout(reviewer) {
         let repository = context.workspace.join("reviewer-repository");
         let checkpoint =
             crate::workspaces::read_marker(&context.workspace.join("reviewer-candidate.txt"))
@@ -1715,23 +1720,25 @@ fn run_operator_adoption(
             ..*context
         }
         .verify(config, candidate)?;
-        crate::sessions::Session::verify_reviewer_adoption(
-            context.workspace,
-            &repository,
-            reviewer,
-            crate::workspaces::attempt(context.workspace)
-                .map_err(|error| Stop::failure(error.to_string()))?,
-            context
-                .job
-                .role_epochs
-                .as_ref()
-                .and_then(|epochs| epochs.role(true)),
-        )
-        .map_err(|error| {
-            Stop::failure(format!(
-                "original reviewer session is not complete: {error}"
-            ))
-        })?;
+        if crate::sessions::enabled(reviewer) {
+            crate::sessions::Session::verify_reviewer_adoption(
+                context.workspace,
+                &repository,
+                reviewer,
+                crate::workspaces::attempt(context.workspace)
+                    .map_err(|error| Stop::failure(error.to_string()))?,
+                context
+                    .job
+                    .role_epochs
+                    .as_ref()
+                    .and_then(|epochs| epochs.role(true)),
+            )
+            .map_err(|error| {
+                Stop::failure(format!(
+                    "original reviewer session is not complete: {error}"
+                ))
+            })?;
+        }
     }
     let predecessor = context
         .job
@@ -1790,7 +1797,7 @@ fn run_review_only(
     let candidate = &continuation.candidate_sha;
     context.verify(config, candidate)?;
     let reviewer = &context.reviewer_profile();
-    if crate::sessions::enabled(reviewer) {
+    if crate::sessions::reviewer_checkout(reviewer) {
         let reviewer_repository = context.workspace.join("reviewer-repository");
         let reviewer_candidate =
             crate::workspaces::read_marker(&context.workspace.join("reviewer-candidate.txt"))
@@ -1807,7 +1814,7 @@ fn run_review_only(
             ..*context
         };
         review_context.verify(config, candidate)?;
-        if !crate::replacement::changed(context.job, true) {
+        if crate::sessions::enabled(reviewer) && !crate::replacement::changed(context.job, true) {
             crate::sessions::Session::verify_reviewer_resume(
                 context.workspace,
                 &context.workspace.join("reviewer-repository"),
@@ -1911,7 +1918,7 @@ fn review_candidate(
     let patch = context.patch(config, base, candidate, round)?;
     // One fixed review checkout, separate from developer files and conversation.
     // Legacy stateless reviewers keep their established guarded cwd contract.
-    let isolated = crate::sessions::enabled(&context.reviewer_profile());
+    let isolated = crate::sessions::reviewer_checkout(&context.reviewer_profile());
     let reviewer_repository = if isolated {
         if context
             .job

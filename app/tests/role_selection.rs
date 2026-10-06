@@ -1462,3 +1462,51 @@ fn replacement_and_quota_increase_are_independent_frozen_deltas() {
     assert_eq!(result["stopped_stage"]["role"], "developer", "{result}");
     assert_eq!(result["resources"]["quota_bytes"], 1024 * 1024);
 }
+
+#[test]
+fn developer_auto_review_and_native_read_only_reviewer_require_distinct_scoped_consent() {
+    let temp = Fixture::new();
+    let mut config = config(temp.path());
+    config
+        .native_agents
+        .get_mut("other")
+        .unwrap()
+        .allowed_permission_modes = vec![NativePermission::CodexAutoReview];
+    let review = config.native_agents.get_mut("review").unwrap();
+    review.provider = relay_app::providers::ProviderKind::CodexAppServer;
+    review.native_permission = Some(NativePermission::CodexNativeSandboxedReview);
+    review.allowed_permission_modes = vec![
+        NativePermission::CodexNativeSandboxedReview,
+        NativePermission::CodexAutoReview,
+    ];
+    config.workflows.get_mut("checked").unwrap().developer = "other".into();
+    let mut selected = job();
+    selected["agent"] = json!("other");
+    selected["role_selections"] = json!({
+        "developer":{"profile":"other","native_permission":"codex_auto_review","confirm_permission_expansion":true},
+        "reviewer":{"profile":"review","native_permission":"codex_native_sandboxed_review","confirm_permission_expansion":true}
+    });
+    validate(selected.clone(), &config).unwrap();
+    let app = Application::open(temp.path().join("queue.db"), config.clone()).unwrap();
+    let challenge = app
+        .permission_challenge(serde_json::from_value(selected.clone()).unwrap())
+        .unwrap();
+    assert_eq!(
+        challenge["scope"]["developer"]["native_permission"],
+        "codex_auto_review"
+    );
+    assert_eq!(
+        challenge["scope"]["reviewer"]["native_permission"],
+        "codex_native_sandboxed_review"
+    );
+    let text = challenge["confirmation_text"].as_str().unwrap();
+    assert!(
+        text.contains("Auto-review") && text.contains("approval never"),
+        "{text}"
+    );
+    // Even a host allowlist and explicit attestation cannot weaken this review role.
+    selected["role_selections"]["reviewer"]["native_permission"] = json!("codex_auto_review");
+    assert!(validate(selected.clone(), &config).is_err());
+    let request: Submission = serde_json::from_value(json!({"key":"wrong-review-mode", "job":selected, "permission_challenge":challenge["challenge"]})).unwrap();
+    assert!(app.submit(request).is_err());
+}

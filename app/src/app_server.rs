@@ -56,12 +56,18 @@ impl Driver {
             error: None,
         };
         driver.result.usage.usage_scope = Some("last_snapshot".into());
+        let native_review =
+            driver.start.native_permission == Some(NativePermission::CodexNativeSandboxedReview);
         if driver
             .start
             .native_permission
-            .is_some_and(|mode| !mode.compatible(ProviderKind::CodexAppServer, false))
+            .is_some_and(|mode| !mode.compatible(ProviderKind::CodexAppServer, native_review))
         {
             driver.fail("native permission mode is incompatible with Codex app-server");
+            return driver;
+        }
+        if native_review && (driver.start.resume.is_some() || driver.start.checkpoint.is_some()) {
+            driver.fail("Codex native sandboxed review supports fresh sessions only; resume/checkpoint is unsupported");
             return driver;
         }
         if driver.start.resume.is_none() {
@@ -218,7 +224,11 @@ impl Driver {
             match self.request {
                 1 => {
                     self.send(json!({"method":"initialized","params":{}}));
-                    let sandbox = if self.start.native_permission
+                    let native_review = self.start.native_permission
+                        == Some(NativePermission::CodexNativeSandboxedReview);
+                    let sandbox = if native_review {
+                        "read-only"
+                    } else if self.start.native_permission
                         == Some(NativePermission::CodexFullAccess)
                     {
                         "danger-full-access"
@@ -235,6 +245,9 @@ impl Driver {
                             "sandbox_workspace_write.exclude_slash_tmp": false
                         });
                     }
+                    if native_review {
+                        params["ephemeral"] = json!(true);
+                    }
                     let method = if let Some(id) = &self.start.resume {
                         valid_id(id)?;
                         params["threadId"] = json!(id);
@@ -247,6 +260,14 @@ impl Driver {
                 }
                 2 => {
                     let id = id_field(&result["thread"], "id")?;
+                    if self.start.native_permission
+                        == Some(NativePermission::CodexNativeSandboxedReview)
+                        && result["thread"]["ephemeral"] != true
+                    {
+                        return Err(
+                            "native reviewer did not confirm a fresh ephemeral thread".into()
+                        );
+                    }
                     if self
                         .start
                         .resume
@@ -270,6 +291,10 @@ impl Driver {
                         },
                     )?;
                     let sandbox_policy = if self.start.native_permission
+                        == Some(NativePermission::CodexNativeSandboxedReview)
+                    {
+                        json!({"type":"readOnly","networkAccess":false})
+                    } else if self.start.native_permission
                         == Some(NativePermission::CodexFullAccess)
                     {
                         json!({"type":"dangerFullAccess"})
@@ -323,6 +348,28 @@ impl Driver {
                 "approvalPolicy":settings.get("approvalPolicy"), "approvalsReviewer":settings.get("approvalsReviewer"),
                 "sandbox":settings.get("sandboxPolicy")});
             self.session_settings(&normalized, "codex.thread/settings/updated")?;
+            return Ok(());
+        }
+        if method == "thread/settings/updated"
+            && self.start.native_permission == Some(NativePermission::CodexNativeSandboxedReview)
+        {
+            if self.terminal
+                || self.result.session_id.is_none()
+                || params["threadId"].as_str() != self.result.session_id.as_deref()
+            {
+                return Err("native reviewer settings update is outside the active thread".into());
+            }
+            let settings = &params["threadSettings"];
+            if settings["approvalPolicy"] != "never"
+                || settings["sandboxPolicy"]["type"] != "readOnly"
+                || settings["sandboxPolicy"]["networkAccess"] != false
+                || settings["cwd"].as_str() != self.start.cwd.to_str()
+            {
+                if let Some(selection) = &mut self.result.selection {
+                    selection.verification.permission = "mismatch".into();
+                }
+                return Err("native reviewer session settings changed or omitted the required local policy/candidate directory".into());
+            }
             return Ok(());
         }
         if matches!(
@@ -507,6 +554,7 @@ impl Driver {
             .get("approvalPolicy")
             .filter(|value| !value.is_null());
         let expected_sandbox = match self.start.native_permission {
+            Some(NativePermission::CodexNativeSandboxedReview) => Some(["read-only", "readOnly"]),
             Some(NativePermission::CodexWorkspaceWrite | NativePermission::CodexAutoReview) => {
                 Some(["workspace-write", "workspaceWrite"])
             }
@@ -515,12 +563,24 @@ impl Driver {
             }
             _ => None,
         };
+        let native_review =
+            self.start.native_permission == Some(NativePermission::CodexNativeSandboxedReview);
+        // This tier must observe the complete local policy before sending any
+        // task prompt. A request or a missing/partial snapshot is not evidence.
+        let native_review_unverified = native_review
+            && (actual_approval != Some(&json!("never"))
+                || actual_sandbox.is_none_or(|policy| {
+                    policy["type"] != "readOnly" || policy["networkAccess"] != false
+                })
+                || approval_truncated
+                || sandbox_truncated);
         let (baseline_mismatch, baseline_missing) = if self.auto_review() {
             auto_review_baseline(result, &self.start.cwd)
         } else {
             (false, false)
         };
-        let permission_mismatch = baseline_mismatch
+        let permission_mismatch = native_review_unverified
+            || baseline_mismatch
             || expected_sandbox.is_some_and(|expected| {
                 (!self.auto_review()
                     && actual_sandbox.is_some()
@@ -793,6 +853,107 @@ mod tests {
     fn start(driver: &mut Driver) {
         start_pending(driver);
         feed(driver, json!({"id":3,"result":{"turn":{"id":"turn-1"}}}));
+    }
+    fn native_review_driver(resume: Option<&str>) -> Driver {
+        let original = driver(resume);
+        let mut start = original.start;
+        start.native_permission = Some(NativePermission::CodexNativeSandboxedReview);
+        Driver::new(original.result, start)
+    }
+    #[test]
+    fn native_review_requires_fresh_ephemeral_and_complete_local_policy_before_prompt() {
+        let cases = [
+            json!({"thread":{"id":"thread-1","ephemeral":true}}),
+            json!({"thread":{"id":"thread-1","ephemeral":true},"approvalPolicy":"never","sandbox":"read-only"}),
+            json!({"thread":{"id":"thread-1","ephemeral":true},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}),
+            json!({"thread":{"id":"thread-1","ephemeral":true},"approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":true}}),
+            json!({"thread":{"id":"thread-1","ephemeral":true},"approvalPolicy":"on-request","sandbox":{"type":"readOnly","networkAccess":false}}),
+            json!({"thread":{"id":"thread-1","ephemeral":false},"approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false}}),
+            json!({"thread":{"id":"thread-1","ephemeral":true},"approvalPolicy":"never","sandbox":{"type":"workspaceWrite","networkAccess":false}}),
+        ];
+        for settings in cases {
+            let mut d = native_review_driver(None);
+            d.take_pending();
+            feed(&mut d, json!({"id":1,"result":{}}));
+            let sent = String::from_utf8(d.take_pending()).unwrap();
+            assert!(
+                sent.contains("thread/start")
+                    && sent.contains("read-only")
+                    && sent.contains("\"ephemeral\":true")
+            );
+            assert!(!sent.contains("literal prompt"));
+            feed(&mut d, json!({"id":2,"result":settings}));
+            assert!(d.failure().is_some());
+            assert!(d.take_pending().is_empty());
+        }
+        let mut resumed = native_review_driver(Some("old-thread"));
+        assert!(resumed.failure().unwrap().contains("fresh sessions only"));
+        assert!(resumed.take_pending().is_empty());
+        let mut d = native_review_driver(None);
+        d.take_pending();
+        feed(&mut d, json!({"id":1,"result":{}}));
+        d.take_pending();
+        feed(
+            &mut d,
+            json!({"id":2,"result":{"thread":{"id":"thread-1","ephemeral":true},"approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false}}}),
+        );
+        let sent: Value = serde_json::from_slice(&d.take_pending()).unwrap();
+        assert_eq!(sent["method"], "turn/start");
+        assert_eq!(sent["params"]["approvalPolicy"], "never");
+        assert_eq!(
+            sent["params"]["sandboxPolicy"],
+            json!({"type":"readOnly","networkAccess":false})
+        );
+        assert_eq!(sent["params"]["input"][0]["text"], "literal prompt\n✓");
+        feed(
+            &mut d,
+            json!({"method":"thread/settings/updated","params":{
+                "threadId":"thread-1","threadSettings":{"cwd":"/tmp/task/repository","approvalPolicy":"never","sandboxPolicy":{"type":"readOnly","networkAccess":false}}
+            }}),
+        );
+        assert!(d.failure().is_none());
+        feed(
+            &mut d,
+            json!({"id":4,"method":"item/commandExecution/requestApproval","params":{}}),
+        );
+        assert!(d.failure().unwrap().contains("requested approval"));
+        assert!(d.take_pending().is_empty());
+    }
+    #[test]
+    fn native_review_rejects_observed_policy_or_candidate_directory_drift() {
+        for change in [
+            json!({}),
+            json!({"approvalPolicy":"on-request"}),
+            json!({"sandboxPolicy":{"type":"readOnly","networkAccess":true}}),
+            json!({"cwd":"/other"}),
+        ] {
+            let mut d = native_review_driver(None);
+            d.take_pending();
+            feed(&mut d, json!({"id":1,"result":{}}));
+            d.take_pending();
+            feed(
+                &mut d,
+                json!({"id":2,"result":{"thread":{"id":"thread-1","ephemeral":true},"approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false}}}),
+            );
+            d.take_pending();
+            let mut settings = json!({"cwd":"/tmp/task/repository","approvalPolicy":"never","sandboxPolicy":{"type":"readOnly","networkAccess":false}});
+            if change.as_object().unwrap().is_empty() {
+                settings = json!({});
+            } else {
+                for (key, value) in change.as_object().unwrap() {
+                    settings[key] = value.clone();
+                }
+            }
+            feed(
+                &mut d,
+                json!({"method":"thread/settings/updated","params":{"threadId":"thread-1","threadSettings":settings}}),
+            );
+            assert!(d.failure().unwrap().contains("settings changed"));
+            assert_eq!(
+                d.result.selection.as_ref().unwrap().verification.permission,
+                "mismatch"
+            );
+        }
     }
     fn usage(thread: &str, turn: &str, input: u64) -> Value {
         json!({"method":"thread/tokenUsage/updated","params":{

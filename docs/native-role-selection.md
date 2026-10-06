@@ -27,11 +27,13 @@
 - `claude_auto`：原生分类器 auto；需宿主允许并确认。模型、供应商、版本、账户与托管策略适用性仍可能未知，不能把可选理解为已生效，也不会失败后换成 bypass
 - `claude_bypass_permissions`：原生 bypassPermissions；需宿主允许并确认，明确提示文件系统和网络访问扩大
 
-审查者仅可用 `claude_restricted`，它是 Relay 的固定只读审查契约，不是 Claude 的 `--permission-mode` 值。它保留 restricted、Read/Glob/Grep、执行/委派禁用以及 MCP/自定义命令限制。不能把开发者或 Full access 模式用于审查。Claude 各模式仍带 `--permission-prompts none`；未回答的请求会被拒绝，不自动批准。Relay 不支持交互审批或输入请求。
+严格审查者使用 `claude_restricted`，它是 Relay 的固定只读审查契约，不是 Claude 的 `--permission-mode` 值。它保留 restricted、Read/Glob/Grep、执行/委派禁用以及 MCP/自定义命令限制。不能把开发者或 Full access 模式用于审查。Claude 各模式仍带 `--permission-prompts none`；未回答的请求会被拒绝，不自动批准。Relay 不支持交互审批或输入请求。
 
-Codex reviewer 仍保持 `review_profile_unsupported`：完整的版本验证、启动/配置加载、hooks/MCP、无执行工具、恢复隔离契约尚未证明。这不表示 Codex 没有关闭单项 hooks/MCP 的控制。Codex/astra 审查支持仍是未完成验收项，不能把当前角色选择子集当作已完成它。
+严格 Codex reviewer 仍保持 `review_profile_unsupported`：完整的版本验证、启动/配置加载、hooks/MCP、无执行工具、恢复隔离契约尚未证明。这不表示 Codex 没有关闭单项 hooks/MCP 的控制。Codex/astra 审查支持仍是未完成验收项，不能把当前角色选择子集当作已完成它。
 
 #22 的 Codex/astra 后续验收仍需覆盖：固定已核验的版本/实验协议 schema；启动前的 plugin、remote environment、legacy notify 与配置行为；Astra 模型元数据覆盖工具模式开关；动态 MCP/托管配置刷新缺少原子工具上限；fresh/warm/cold resume 都保持无执行工具。上游内部 `ToolPolicy.allowed_tools=[]` 不是公开 CLI/RPC 契约。需要真实工具 schema 的空集合断言与 sentinel 测试，不能以一次宿主声明或单项禁用标志替代证明；当前实现不引入这些未验证路径。
+
+另可显式选择默认关闭的 [`codex_native_sandboxed_review`](native-sandboxed-review.md)：本地只读、允许命令、approval never，原生启动与外部集成由操作员信任，需宿主允许并逐次确认。首版仅 app-server 0.160.1，使用新独立线程；不替代严格模式。
 
 ## 提交 schema
 

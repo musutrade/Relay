@@ -1249,9 +1249,15 @@ impl Host {
             cli_version,
             task_model_observation_supported: profile
                 .task_model_observation_supported(&responses[0], &responses[1]),
-            read_only_supported: profile
-                .validate_probe_with_max_turns(&responses[0], &responses[1], true, hidden_max_turns)
-                .is_ok(),
+            read_only_supported: profile.provider == ProviderKind::ClaudeCli
+                && profile
+                    .validate_probe_with_max_turns(
+                        &responses[0],
+                        &responses[1],
+                        true,
+                        hidden_max_turns,
+                    )
+                    .is_ok(),
         })
     }
 
@@ -2017,6 +2023,11 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
     if spec.clear_env {
         command.env_clear();
     }
+    // Only this command's explicit Relay inputs may be passed to it. In
+    // particular native review/probes intentionally omit early prompt inputs.
+    // The generic adapter's per-command env below retains its existing contract.
+    command.env_remove("RELAY_REQUIREMENTS");
+    command.env_remove("RELAY_REQUIREMENTS_FILE");
     // Do not let inherited Git redirections select the service's repository.
     // Trusted per-command values (such as the workflow index) remain supported.
     for key in [

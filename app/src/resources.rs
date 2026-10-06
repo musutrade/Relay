@@ -333,7 +333,7 @@ pub fn estimate_with_reviewer(
             config
                 .native_agents
                 .get(reviewer_profile.unwrap_or(&workflow.reviewer))
-                .map(crate::sessions::enabled)
+                .map(crate::sessions::reviewer_checkout)
         })
         .unwrap_or(Some(false));
     let reviewer_copy_bytes = match isolated_reviewer {

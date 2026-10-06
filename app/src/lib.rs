@@ -1105,7 +1105,7 @@ impl Application {
                 "effort": profile.effort, "authentication": "unknown",
                 "native_permission":profile.native_permission,"permission_modes":selection::permission_choices(profile),
                 "allow_startup_discovery":profile.allow_startup_discovery,
-                "reviewer_supported":profile.provider == providers::ProviderKind::ClaudeCli && profile.native_permission.is_none_or(|mode|mode.compatible(profile.provider,true))})
+                "reviewer_supported":profile.reviewer_supported(),"reviewer_contract":profile.reviewer_contract()})
             })
             .collect();
         let workflows: Vec<_> = self.config.workflows.iter().map(|(name, workflow)| {

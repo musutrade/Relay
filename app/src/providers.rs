@@ -28,6 +28,8 @@ pub enum NativePermission {
     CodexWorkspaceWrite,
     CodexFullAccess,
     CodexAutoReview,
+    /// Local command sandbox only. Native startup/integrations remain trusted.
+    CodexNativeSandboxedReview,
     ClaudeDontAsk,
     ClaudeAuto,
     ClaudeBypassPermissions,
@@ -51,6 +53,11 @@ impl NativePermission {
                     false,
                 )
                 | (Self::ClaudeRestricted, ProviderKind::ClaudeCli, true)
+                | (
+                    Self::CodexNativeSandboxedReview,
+                    ProviderKind::CodexAppServer,
+                    true
+                )
         )
     }
     pub(crate) fn claude_mode(self) -> Option<&'static str> {
@@ -113,6 +120,31 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl NativeProfile {
+    pub fn native_sandboxed_review(&self) -> bool {
+        self.provider == ProviderKind::CodexAppServer
+            && self.native_permission == Some(NativePermission::CodexNativeSandboxedReview)
+    }
+    pub fn reviewer_supported(&self) -> bool {
+        if self.native_sandboxed_review() {
+            self.allowed_permission_modes
+                .contains(&NativePermission::CodexNativeSandboxedReview)
+                && !self.session_continuity
+        } else {
+            self.provider == ProviderKind::ClaudeCli
+                && self
+                    .native_permission
+                    .is_none_or(|mode| mode.compatible(self.provider, true))
+        }
+    }
+    pub fn reviewer_contract(&self) -> &'static str {
+        if !self.reviewer_supported() {
+            "unsupported"
+        } else if self.native_sandboxed_review() {
+            "native_local_read_only"
+        } else {
+            "strict_no_execution"
+        }
+    }
     pub fn validate(&self) -> Result<(), String> {
         if !self.program.is_absolute() || !self.program.is_file() {
             return Err("native CLI requires an existing absolute executable path".into());
@@ -138,7 +170,7 @@ impl NativeProfile {
         {
             return Err("native effort must contain 1–256 bytes without control characters or a leading '-'".into());
         }
-        if self.allowed_permission_modes.len() > 6
+        if self.allowed_permission_modes.len() > 7
             || self
                 .native_permission
                 .iter()
@@ -173,6 +205,12 @@ impl NativeProfile {
         if self.session_continuity && self.provider == ProviderKind::CodexCli {
             return Err("Codex session continuity requires provider codex_app_server".into());
         }
+        if self.native_sandboxed_review() && self.session_continuity {
+            return Err(
+                "Codex native sandboxed review supports fresh sessions only; resume is unsupported"
+                    .into(),
+            );
+        }
         if serde_json::to_vec(self)
             .map_err(|error| error.to_string())?
             .len()
@@ -187,8 +225,8 @@ impl NativeProfile {
     /// Callers must verify version/help capabilities before executing these arguments.
     pub fn compile(&self, read_only: bool) -> Result<CommandProfile, String> {
         self.validate()?;
-        if read_only && self.provider != ProviderKind::ClaudeCli {
-            return Err("review_profile_unsupported: a complete version-verified Codex reviewer isolation contract is unproven".into());
+        if read_only && !self.reviewer_supported() {
+            return Err("review_profile_unsupported: requires restricted Claude or explicitly host-allowed Codex native sandboxed review; strict Codex reviewer isolation contract is unproven".into());
         }
         if self
             .native_permission
@@ -327,8 +365,8 @@ impl NativeProfile {
         read_only: bool,
         hidden_max_turns_verified: bool,
     ) -> Result<String, String> {
-        if read_only && self.provider != ProviderKind::ClaudeCli {
-            return Err("review_profile_unsupported: a complete version-verified Codex reviewer isolation contract is unproven".into());
+        if read_only && !self.reviewer_supported() {
+            return Err("review_profile_unsupported: requires restricted Claude or explicitly host-allowed Codex native sandboxed review; strict Codex reviewer isolation contract is unproven".into());
         }
         if self
             .native_permission
@@ -343,6 +381,9 @@ impl NativeProfile {
             );
         }
         if self.provider == ProviderKind::CodexAppServer {
+            if read_only && self.native_sandboxed_review() && version.0 != (0, 160, 1) {
+                return Err("Codex native sandboxed review requires verified app-server 0.160.1; other versions are unsupported".into());
+            }
             if version.0 < (0, 160, 0) || !help.contains("app-server") {
                 return Err("Codex app-server 0.160.0 or later is required".into());
             }

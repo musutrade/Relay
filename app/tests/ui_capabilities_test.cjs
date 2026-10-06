@@ -94,6 +94,7 @@ function fixture(authMode = 'bearer', restored = false) {
     await $('capability-toggle').emit('click'); assert.equal(f.catalogRequests().length, 2); assert.equal($('capability-toggle').getAttribute('aria-expanded'), 'true');
     const content = f.card('dev / one').textContent;
     for (const text of ['fixture-1', '发现启动上下文', 'isolated discovery context differs from execution', '支持', '不支持', '未知', 'fixture reason', 'fixture source', 'manual-model', 'high', '未验证', '未知（尚无执行证据）', 'login not checked', '来源：codex_app_server.model/list', 'low（fast）', '支持的 effort：未知（供应商未提供）', '空列表（未报告可选项）']) assert(content.includes(text), text);
+    assert.match(content, /严格无执行审查隔离.*不支持/); assert.match(content, /原生本地只读审查（允许命令）.*未知/);
     assert.match(f.card('review').textContent, /尚无缓存/); assert.match(f.card('review').textContent, /未指定（由 CLI 决定）/);
     assert.equal($('capability-profiles').querySelectorAll('select').length, 0); assert.equal($('capability-profiles').querySelectorAll('input').length, 0);
     // Task refresh, scheduled task polling, and online notifications never discover or read catalogs.
@@ -101,9 +102,10 @@ function fixture(authMode = 'bearer', restored = false) {
     await $('refresh').emit('click'); await f.flushTimer(2000); f.events.get('online')(); await settle();
     assert.equal(f.catalogRequests().length, beforePolling); assert.equal(f.posts().length, 0);
     // Safe literal profile/model/evidence text, stale state, and ignored unconfigured profiles.
-    const attack = '<img src=x onerror=alert(1)>', injected = catalog('fixture-safe'); injected.models[0].display_name = attack; injected.models[0].supported_efforts[0].description = attack; injected.authentication = capability('unknown', attack, attack);
+    const attack = '<img src=x onerror=alert(1)>', injected = catalog('fixture-safe'); injected.models[0].display_name = attack; injected.models[0].supported_efforts[0].description = attack; injected.authentication = capability('unknown', attack, attack); injected.native_reviewer = capability('supported', 'native-local-only '+attack);
     f.cache = {profiles: [envelope('dev / one', 3, injected, true), envelope('review', 0, null, true), envelope('unconfigured', 99)]}; await $('capability-read').emit('click');
     assert.match(f.card('dev / one').textContent, /缓存已陈旧/); assert(f.card('dev / one').textContent.includes(attack)); assert.equal($('capability-profiles').querySelectorAll('img').length, 0); assert.equal($('capability-profiles').children.length, 2);
+    assert.match(f.card('dev / one').textContent, /严格无执行审查隔离.*不支持/); assert.match(f.card('dev / one').textContent, /原生本地只读审查（允许命令）支持/);
     // A lower-generation read cannot replace newer evidence.
     f.cache = {profiles: [envelope('dev / one', 2, catalog('too-old'))]}; await $('capability-read').emit('click'); assert.match(f.card('dev / one').textContent, /fixture-safe/); assert(!f.card('dev / one').textContent.includes('too-old'));
     // Exactly one explicit profile POST, with no request body or task/config mutation.

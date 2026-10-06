@@ -669,3 +669,37 @@ fn invalid_utf8_remains_fatal_and_preserves_later_diagnostics() {
     assert!(error.unwrap().contains("unrecoverable"));
     assert_eq!(result.terminal_reason.as_deref(), Some("provider_error"));
 }
+
+#[test]
+fn native_review_is_separate_opt_in_fresh_and_version_verified() {
+    let mut p = profile(ProviderKind::CodexAppServer);
+    assert!(!p.reviewer_supported());
+    assert!(p.compile(true).is_err());
+    p.native_permission = Some(NativePermission::CodexNativeSandboxedReview);
+    assert!(!p.reviewer_supported());
+    assert!(p.compile(true).is_err());
+    p.allowed_permission_modes
+        .push(NativePermission::CodexNativeSandboxedReview);
+    assert_eq!(p.reviewer_contract(), "native_local_read_only");
+    assert!(p.compile(false).is_err());
+    let compiled = p.compile(true).unwrap();
+    assert_eq!(compiled.args, ["app-server"]);
+    // Preserve native startup/auth/provider context. No fabricated clean home,
+    // tool-mode/model overrides, fake empty MCP table or copied credentials.
+    assert!(compiled.env.is_empty());
+    assert!(
+        p.validate_probe("codex-cli 0.160.1", "app-server", true)
+            .is_ok()
+    );
+    for version in ["0.159.2", "0.160.0", "0.160.2", "0.160.1-dev"] {
+        assert!(p.validate_probe(version, "app-server", true).is_err());
+    }
+    p.session_continuity = true;
+    assert!(!p.reviewer_supported());
+    assert!(p.validate().unwrap_err().contains("fresh sessions only"));
+    p.session_continuity = false;
+    p.provider = ProviderKind::CodexCli;
+    assert!(!p.reviewer_supported());
+    assert!(p.compile(true).is_err());
+    assert!(NativePermission::CodexNativeSandboxedReview.requires_confirmation());
+}
