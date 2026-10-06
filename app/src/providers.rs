@@ -90,6 +90,9 @@ pub struct NativeProfile {
     /// Retain an explicit, task/role-scoped Claude session. Codex app-server always retains its thread.
     #[serde(default)]
     pub session_continuity: bool,
+    /// Host opt-in only. Each standalone startup still needs fresh confirmation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_startup_discovery: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +103,10 @@ pub struct ProviderProbe {
     /// An advertised, current control stream may observe metadata in an existing task.
     #[serde(default)]
     pub task_model_observation_supported: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl NativeProfile {
@@ -154,6 +161,11 @@ impl NativeProfile {
             && (self.max_turns.is_some() || self.max_budget_usd.is_some())
         {
             return Err("max_turns and max_budget_usd are Claude-only settings".into());
+        }
+        if self.allow_startup_discovery && self.provider != ProviderKind::ClaudeCli {
+            return Err(
+                "allow_startup_discovery is only supported for Claude native profiles".into(),
+            );
         }
         if self.session_continuity && self.provider == ProviderKind::CodexCli {
             return Err("Codex session continuity requires provider codex_app_server".into());
@@ -737,6 +749,9 @@ pub struct ProtocolParser {
     task_output: Vec<u8>,
     task_catalog_time: Option<u64>,
     task_prompt_dispatched: bool,
+    catalog_bytes: usize,
+    catalog_messages: usize,
+    catalog_input_dispatched: bool,
 }
 impl ProtocolParser {
     pub fn new(mut result: ProviderResult) -> Self {
@@ -755,6 +770,9 @@ impl ProtocolParser {
             task_output: Vec::new(),
             task_catalog_time: None,
             task_prompt_dispatched: false,
+            catalog_bytes: 0,
+            catalog_messages: 0,
+            catalog_input_dispatched: false,
         }
     }
     pub(crate) fn app_server(result: ProviderResult, start: crate::app_server::Start) -> Self {
@@ -764,13 +782,27 @@ impl ProtocolParser {
     }
     pub(crate) fn catalog(result: ProviderResult) -> Self {
         let mut parser = Self::new(result);
-        parser.catalog = Some(crate::capabilities::CatalogDriver::new());
+        if parser.result.provider == ProviderKind::ClaudeCli {
+            parser.claude_control = Some(crate::claude_control::Driver::catalog());
+        } else {
+            parser.catalog = Some(crate::capabilities::CatalogDriver::new());
+        }
         parser
     }
     pub(crate) fn claude_task(result: ProviderResult, prompt: String) -> Self {
         let mut parser = Self::new(result);
         parser.claude_control = Some(crate::claude_control::Driver::new(prompt));
         parser
+    }
+    pub(crate) fn mark_catalog_input_complete(&mut self) {
+        if self.error.is_none()
+            && self
+                .claude_control
+                .as_ref()
+                .is_some_and(|driver| driver.is_catalog())
+        {
+            self.catalog_input_dispatched = true;
+        }
     }
     /// Called only after the supervisor has written every byte of the single
     /// authorized prompt. A queued prompt is not a dispatched task.
@@ -798,7 +830,9 @@ impl ProtocolParser {
             .is_some_and(|driver| driver.input_done())
     }
     pub(crate) fn task_output_eof(&mut self) -> Option<Vec<u8>> {
-        self.claude_control.as_ref()?;
+        if self.claude_control.as_ref()?.is_catalog() {
+            return Some(Vec::new());
+        }
         if !self.discarding_line && !self.line.is_empty() {
             self.parse_line();
             self.line.clear();
@@ -810,6 +844,17 @@ impl ProtocolParser {
         Some(std::mem::take(&mut self.task_output))
     }
     pub(crate) fn catalog_result(&self) -> Option<Vec<crate::capabilities::ModelCapability>> {
+        if (self
+            .claude_control
+            .as_ref()
+            .is_some_and(|driver| driver.is_catalog())
+            && !self.catalog_input_dispatched)
+            || self.error.is_some()
+            || self.discarding_line
+            || !self.line.iter().all(u8::is_ascii_whitespace)
+        {
+            return None;
+        }
         self.catalog
             .as_ref()
             .and_then(|driver| driver.models())
@@ -838,6 +883,9 @@ impl ProtocolParser {
         self.app_server
             .as_ref()
             .is_some_and(|driver| driver.stopped())
+            || self.claude_control.as_ref().is_some_and(|driver| {
+                driver.is_catalog() && (driver.catalog_complete() || driver.failure().is_some())
+            })
             || self.error.is_some()
     }
     pub(crate) fn failure(&self) -> Option<&str> {
@@ -866,6 +914,17 @@ impl ProtocolParser {
         if let Some(driver) = &mut self.app_server {
             driver.feed(bytes);
             return;
+        }
+        if self
+            .claude_control
+            .as_ref()
+            .is_some_and(|driver| driver.is_catalog())
+        {
+            self.catalog_bytes = self.catalog_bytes.saturating_add(bytes.len());
+            if self.catalog_bytes > 1024 * 1024 {
+                self.record_error("Claude catalog protocol exceeds its byte budget".into());
+                return;
+            }
         }
         for &byte in bytes {
             if byte == b'\n' {
@@ -897,6 +956,17 @@ impl ProtocolParser {
     fn parse_line(&mut self) {
         if self.line.iter().all(u8::is_ascii_whitespace) {
             return;
+        }
+        if self
+            .claude_control
+            .as_ref()
+            .is_some_and(|driver| driver.is_catalog())
+        {
+            self.catalog_messages += 1;
+            if self.catalog_messages > 1024 {
+                self.record_error("Claude catalog protocol exceeds its message budget".into());
+                return;
+            }
         }
         let event: Value = match serde_json::from_slice(&self.line) {
             Ok(value) => value,
@@ -943,6 +1013,14 @@ impl ProtocolParser {
             .and_then(Value::as_str)
             .ok_or("provider event requires a string type")?;
         if let Some(driver) = &mut self.claude_control {
+            if driver.is_catalog() {
+                if kind == "control_response" && !self.catalog_input_dispatched {
+                    return Err(
+                        "Claude replied before the initialize request was dispatched".into(),
+                    );
+                }
+                return driver.event(event);
+            }
             if kind.starts_with("control_") {
                 let result = driver.event(event);
                 if result.is_ok() && driver.initialized() && self.task_catalog_time.is_none() {
@@ -1223,8 +1301,34 @@ impl ProtocolParser {
         if let Some(driver) = self.app_server.take() {
             return driver.finish();
         }
-        if !self.discarding_line && !self.line.is_empty() {
+        if !self.discarding_line
+            && !self.line.is_empty()
+            && !self
+                .claude_control
+                .as_ref()
+                .is_some_and(|driver| driver.is_catalog())
+        {
             self.parse_line();
+        }
+        if self
+            .claude_control
+            .as_ref()
+            .is_some_and(|driver| driver.is_catalog())
+        {
+            if !self.catalog_input_dispatched {
+                self.record_error("Claude exited before initialize was dispatched".into());
+            }
+            // Catalog framing requires newline-terminated responses. Unlike task
+            // output, do not reinterpret an incomplete metadata tail as evidence.
+            if !self.line.iter().all(u8::is_ascii_whitespace) {
+                self.record_error("Claude catalog ended with an incomplete JSONL message".into());
+            }
+            let result = self
+                .claude_control
+                .take()
+                .expect("catalog driver")
+                .finish_catalog();
+            return (self.result, self.error.or_else(|| result.err()));
         }
         if self.error.is_none() && self.claude_control.is_some() && !self.task_prompt_dispatched {
             self.error = Some("Claude exited before the task prompt was dispatched".into());
@@ -1357,6 +1461,38 @@ mod tests {
             Some(NativePermission::ClaudeAuto)
         );
         assert_eq!(evidence.verification.permission, "unknown");
+    }
+
+    #[test]
+    fn catalog_requires_actual_initialize_dispatch_and_complete_framing() {
+        let profile: NativeProfile = serde_json::from_value(
+            serde_json::json!({"provider":"claude_cli","program":"/bin/true"}),
+        )
+        .unwrap();
+        let response = serde_json::json!({"type":"control_response","response":{"subtype":"success","request_id":"relay-initialize-1","pending_permission_requests":[],"pending_user_dialog_requests":[],"response":{"models":[]}}}).to_string()+"\n";
+        let parser =
+            || ProtocolParser::catalog(ProviderResult::new(&profile, Some("2.1.291".into())));
+        let mut early = parser();
+        assert!(!early.pending().is_empty());
+        early.feed(response.as_bytes());
+        assert!(early.failure().unwrap().contains("dispatched"));
+        assert!(early.catalog_result().is_none());
+        assert!(early.finish().1.is_some());
+        let mut valid = parser();
+        valid.pending();
+        valid.mark_catalog_input_complete();
+        valid.feed(response.as_bytes());
+        assert!(valid.stopped());
+        assert_eq!(valid.catalog_result().unwrap().len(), 0);
+        assert!(valid.finish().1.is_none());
+        let mut partial = parser();
+        partial.pending();
+        partial.mark_catalog_input_complete();
+        partial.feed(response.as_bytes());
+        partial.feed(b"{");
+        assert!(partial.catalog_result().is_none());
+        partial.task_output_eof();
+        assert!(partial.finish().1.is_some());
     }
 
     #[test]

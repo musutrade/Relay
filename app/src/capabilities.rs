@@ -24,6 +24,7 @@ const MAX_FIELD: usize = 256;
 const MAX_DESCRIPTION: usize = 1024;
 const MAX_EFFORTS: usize = 32;
 const CODEX_SOURCE: &str = "codex_app_server:model/list";
+const CLAUDE_SOURCE: &str = "claude_cli:initialize/models";
 const HELP_SOURCE: &str = "configured_cli:version/help";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,7 +278,31 @@ pub(crate) fn discovery_guard_present(host: &Host) -> bool {
 /// not call this function. No account/login, thread/start, turn/start, or inference
 /// requests are ever sent. No raw CLI output or environment values are returned.
 pub fn discover(host: &Host, profile: &NativeProfile) -> ProfileCatalog {
+    discover_inner(host, profile, None)
+}
+/// Only Application's consumed, context-bound startup confirmation enters here.
+/// The stamp predates reservation; do not restamp an approved context at launch.
+pub(crate) fn discover_confirmed(
+    host: &Host,
+    profile: &NativeProfile,
+    stamp: &ProfileStamp,
+) -> ProfileCatalog {
+    discover_inner(host, profile, Some(stamp))
+}
+fn discover_inner(
+    host: &Host,
+    profile: &NativeProfile,
+    approved: Option<&ProfileStamp>,
+) -> ProfileCatalog {
+    let startup = profile.allow_startup_discovery && approved.is_some();
     let mut catalog = ProfileCatalog::unknown(profile);
+    if approved.is_some_and(|stamp| *stamp != profile_stamp(profile)) {
+        catalog.startup_context = Capability::unknown(
+            "Approved profile or executable changed before discovery; confirm the new context",
+            "relay:startup_confirmation",
+        );
+        return catalog;
+    }
     let cleanup_marker = host.config().workspace_root.join(DISCOVERY_GUARD);
     let executable = fs::metadata(&profile.program)
         .ok()
@@ -371,7 +396,25 @@ pub fn discover(host: &Host, profile: &NativeProfile) -> ProfileCatalog {
     let deadline = Instant::now() + Duration::from_secs(10);
     let reviewer_only =
         profile.native_permission == Some(crate::providers::NativePermission::ClaudeRestricted);
-    match host.probe_profile(profile, reviewer_only, &cancellation, &workspace, deadline) {
+    let mut probe_profile = profile.clone();
+    if startup {
+        probe_profile.session_continuity = false;
+    }
+    let probe = if approved.is_some_and(|stamp| *stamp != profile_stamp(profile)) {
+        Err(Box::new(CommandResult::error(
+            Outcome::Failure,
+            "Approved discovery context changed before compatibility probes",
+        )))
+    } else {
+        host.probe_profile(
+            &probe_profile,
+            reviewer_only,
+            &cancellation,
+            &workspace,
+            deadline,
+        )
+    };
+    match probe {
         Ok(probe) => {
             catalog.process_cleanup = Capability::supported(
                 "Version/help subprocess trees stopped and were reaped",
@@ -408,6 +451,12 @@ pub fn discover(host: &Host, profile: &NativeProfile) -> ProfileCatalog {
                     "The supported app-server adapter has explicit thread resume",
                     HELP_SOURCE,
                 ),
+                ProviderKind::ClaudeCli if startup && profile.session_continuity => {
+                    Capability::unknown(
+                        "Discovery uses a new ephemeral initialization; task session continuation flags were not probed",
+                        "relay:claude_startup_context",
+                    )
+                }
                 ProviderKind::ClaudeCli if profile.session_continuity => Capability::supported(
                     "Configured session-id/resume flags passed compatibility checks",
                     HELP_SOURCE,
@@ -421,14 +470,25 @@ pub fn discover(host: &Host, profile: &NativeProfile) -> ProfileCatalog {
                 ProviderKind::CodexCli | ProviderKind::CodexAppServer => {
                     discover_codex(host, profile, &workspace, deadline, &mut catalog);
                 }
+                ProviderKind::ClaudeCli if startup => {
+                    discover_claude(
+                        host,
+                        profile,
+                        probe.task_model_observation_supported,
+                        &workspace,
+                        deadline,
+                        approved.expect("confirmed startup"),
+                        &mut catalog,
+                    );
+                }
                 ProviderKind::ClaudeCli => {
                     catalog.startup_context = Capability::unknown(
-                        "No Claude control session was started: restricted settings cannot guarantee suppression of managed startup hooks",
-                        "claude_sdk:initialize_contract",
+                        "No Claude control session was started: standalone startup discovery must be enabled by the host and freshly confirmed because normal policy, hooks and helpers can execute",
+                        "relay:startup_confirmation",
                     );
                     catalog.model_catalog = Capability::unknown(
-                        "Claude supportedModels uses initialize metadata, but safe startup under configured managed policy is unverified; no API-key catalog is substituted",
-                        "claude_sdk:initialize_contract",
+                        "Claude initialization can return model metadata after an explicitly confirmed startup; this request did not authorize it. Task observations and unverified manual model IDs remain available; no API-key catalog is substituted",
+                        "relay:startup_confirmation",
                     );
                 }
             }
@@ -438,6 +498,17 @@ pub fn discover(host: &Host, profile: &NativeProfile) -> ProfileCatalog {
                 Capability::unknown(probe_failure_reason(&failure), HELP_SOURCE);
             record_cleanup(&mut catalog, &failure);
         }
+    }
+    if approved.is_some_and(|stamp| *stamp != profile_stamp(profile)) {
+        catalog.models.clear();
+        catalog.model_catalog = Capability::unknown(
+            "Profile or executable changed during discovery; confirm the new context",
+            "relay:startup_confirmation",
+        );
+        catalog.selection.status = Capability::unknown(
+            "Discovery context changed; model selection remains unverified",
+            "relay:startup_confirmation",
+        );
     }
     if catalog.process_cleanup.state == CapabilityState::Supported {
         let _ = fs::remove_dir_all(&workspace);
@@ -587,6 +658,82 @@ fn discover_codex(
         }
     }
 }
+fn discover_claude(
+    host: &Host,
+    profile: &NativeProfile,
+    protocol_supported: bool,
+    workspace: &Path,
+    deadline: Instant,
+    approved: &ProfileStamp,
+    catalog: &mut ProfileCatalog,
+) {
+    if !protocol_supported || Instant::now() >= deadline {
+        catalog.model_catalog = Capability::unknown(
+            "Claude 2.1.291+ with advertised stream-json input and a remaining discovery deadline is required",
+            HELP_SOURCE,
+        );
+        return;
+    }
+    if *approved != profile_stamp(profile) {
+        catalog.model_catalog = Capability::unknown(
+            "Approved profile or executable changed before Claude initialization; confirm again",
+            "relay:startup_confirmation",
+        );
+        return;
+    }
+    let reviewer =
+        profile.native_permission == Some(crate::providers::NativePermission::ClaudeRestricted);
+    let mut ephemeral = profile.clone();
+    ephemeral.session_continuity = false;
+    let Ok(mut compiled) = ephemeral.compile(reviewer) else {
+        return;
+    };
+    compiled
+        .args
+        .extend(["--input-format".into(), "stream-json".into()]);
+    catalog.startup_context = Capability::supported(
+        "Explicitly confirmed configured Claude startup in a private empty working directory, with existing user/managed policy and authentication. Hooks, helpers, MCP/plugins and network may execute or incur costs; Relay sends initialize only, no task prompt. No bare mode or authentication substitution is used",
+        "relay:confirmed_claude_startup",
+    );
+    let response = host.run_supervised(
+        CommandSpec {
+            workspace_lease: false,
+            git_inventory: false,
+            catalog: true,
+            claude_control: false,
+            app_server: None,
+            provider: Some(ProviderResult::new(profile, catalog.cli_version.clone())),
+            read_only: reviewer,
+            clear_env: false,
+            program: compiled.program,
+            args: compiled.args,
+            env: compiled.env,
+            cwd: workspace.join("repository"),
+            input: String::new(),
+            timeout_ms: remaining_ms(deadline),
+            output_limit_bytes: 1024,
+        },
+        &AtomicBool::new(false),
+        workspace,
+        "catalog-models",
+    );
+    record_cleanup(catalog, &response);
+    match response.catalog {
+        Some(models) if response.outcome == Outcome::Success && response.error.is_none() => {
+            catalog.models = models;
+            catalog.model_catalog = Capability::supported(
+                "Bounded model metadata returned by the configured Claude initialization; it is not an exhaustive live endpoint catalog or proof of authentication, access, or execution-effective selection",
+                CLAUDE_SOURCE,
+            );
+            catalog.selection.status = selection_status(&catalog.selection, &catalog.models);
+        }
+        _ => {
+            catalog.model_catalog =
+                Capability::unknown(probe_failure_reason(&response), CLAUDE_SOURCE)
+        }
+    }
+}
+
 fn remaining_ms(deadline: Instant) -> u64 {
     deadline
         .saturating_duration_since(Instant::now())
@@ -595,10 +742,14 @@ fn remaining_ms(deadline: Instant) -> u64 {
         .min(u64::MAX as u128) as u64
 }
 fn selection_status(selection: &Selection, models: &[ModelCapability]) -> Capability {
+    let source = models
+        .first()
+        .map(|model| model.source.as_str())
+        .unwrap_or("native:catalog");
     let Some(requested) = &selection.requested_model else {
         return Capability::unknown(
             "No model was explicitly configured; a catalog default does not establish execution-effective settings",
-            CODEX_SOURCE,
+            source,
         );
     };
     let Some(model) = models
@@ -607,7 +758,7 @@ fn selection_status(selection: &Selection, models: &[ModelCapability]) -> Capabi
     else {
         return Capability::unknown(
             "Configured model was not listed; aliases or provider-specific resolution remain unverified",
-            CODEX_SOURCE,
+            source,
         );
     };
     if let Some(effort) = &selection.requested_effort {
@@ -615,13 +766,13 @@ fn selection_status(selection: &Selection, models: &[ModelCapability]) -> Capabi
             Some(efforts) if !efforts.iter().any(|item| item.effort == *effort) => {
                 return Capability::unsupported(
                     "Configured effort is absent from this model's reported supported efforts",
-                    CODEX_SOURCE,
+                    source,
                 );
             }
             None => {
                 return Capability::unknown(
                     "Configured model was listed, but effort metadata was not reported",
-                    CODEX_SOURCE,
+                    source,
                 );
             }
             _ => {}
@@ -629,7 +780,7 @@ fn selection_status(selection: &Selection, models: &[ModelCapability]) -> Capabi
     }
     Capability::supported(
         "Configured selection is advertised by the catalog; execution-effective settings and access remain unverified",
-        CODEX_SOURCE,
+        source,
     )
 }
 

@@ -19,6 +19,8 @@ const observation = (extra = {}) => ({task_id: 42, repository: 'task-repo', role
   {...model('future-route-from-cli', [{effort: 'future-effort', description: 'supplied dynamically'}]), source: 'claude_cli:task_initialize', resolved_model: 'resolved-future-route', supports_effort: true, supports_adaptive_thinking: true, supports_fast_mode: false, supports_auto_mode: false},
   {...model('legacy-model-fields', null), source: 'claude_cli:task_initialize'},
 ], ...extra});
+const startupText = '启动可能执行正常 managed/user hooks、policy/auth helpers、MCP/plugins、访问网络并产生费用；Relay 仅发送 initialize，不发送模型任务提示，不保证没有副作用。<img src=x onerror=alert(1)>';
+const startupEnvelope = (token, expires, extra = {}) => ({...envelope('review', 1, null, true), startup_discovery: {confirmation_token: token, expires_at_unix_ms: expires, confirmation_text: startupText}, ...extra});
 const observedEnvelope = (data = observation(), stale = false, generation = 0, standalone = null, catalogStale = true) => ({...envelope('review', generation, standalone, catalogStale), task_observation: data, task_observation_stale: stale});
 function fixture(authMode = 'bearer', restored = false) {
   const nodes = new Map(), events = new Map(), timers = new Map(); let active = null, timerId = 0;
@@ -38,7 +40,7 @@ function fixture(authMode = 'bearer', restored = false) {
   for (const match of html.matchAll(/<([a-z0-9]+)\b([^>]*\bid="([^"]+)"[^>]*)>/g)) { const node = new Element(match[1], match[3]); node.hidden = /\bhidden\b/.test(match[2]); node.disabled = /\bdisabled\b/.test(match[2]); nodes.set(match[3], node); }
   const filters = ['all', 'queued', 'claimed', 'finished'].map(filter => { const node = new Element('button'); node.dataset.filter = filter; return node; });
   const document = {getElementById: id => { assert(nodes.has(id), id); return nodes.get(id); }, createElement: tag => new Element(tag), querySelectorAll: () => filters, documentElement: new Element('html'), get activeElement() { return active; }};
-  const f = {nodes, events, timers, requests: [], pending: [], authenticated: restored, delayRead: false, delayRefresh: false, delayConfig: false, delayLogout: false, ignoreAbort: false, readFailure: null, refreshFailure: null, refreshResponse: null,
+  const f = {nodes, events, timers, now: Date.now(), startupStarts: 0, validateStartup: false, networkRefreshFailure: false, refreshErrorMessage: null, requests: [], pending: [], authenticated: restored, delayRead: false, delayRefresh: false, delayConfig: false, delayLogout: false, ignoreAbort: false, readFailure: null, refreshFailure: null, refreshResponse: null,
     config: {repositories: ['repo'], agents: ['generic', 'dev / one', 'review'], tests: ['test'], native_agents: [{name: 'dev / one', provider: 'codex_app_server', model: 'manual-model', effort: 'high'}, {name: 'review', provider: 'claude_cli', model: null, effort: null}]},
     cache: {profiles: [envelope(), envelope('review', 0, null, true)]}};
   const $ = id => nodes.get(id); f.$ = $;
@@ -61,16 +63,24 @@ function fixture(authMode = 'bearer', restored = false) {
     else if (url === '/api/status') data = {active: null, recovery_required: false, diagnostic: null};
     else if (url === '/api/capabilities') { data = f.cache; delayed = f.delayRead; if (f.readFailure) { status = f.readFailure; data = {error: 'cache unavailable'}; } }
     else if (url.startsWith('/api/capabilities/') && url.endsWith('/refresh')) {
-      assert.equal(opts.method, 'POST'); assert.equal(opts.body, undefined);
+      assert.equal(opts.method, 'POST');
+      if (!f.validateStartup) assert.equal(opts.body, undefined);
       const name = decodeURIComponent(url.slice('/api/capabilities/'.length, -'/refresh'.length));
       data = f.refreshResponse || envelope(name, 2, catalog('fixture-2')); delayed = f.delayRefresh;
-      if (f.refreshFailure) { status = f.refreshFailure; data = {error: 'another catalog refresh is in progress'}; }
+      if (f.validateStartup) {
+        const body = opts.body ? JSON.parse(opts.body) : null, scope = f.cache.profiles.find(entry => entry.name === name)?.startup_discovery;
+        if (!body?.confirm_startup_effects || !scope?.confirmation_token || body.confirmation_token !== scope.confirmation_token || scope.expires_at_unix_ms <= f.now) { status = 409; data = {error: 'startup confirmation expired, replayed or profile/executable/policy drifted'}; }
+        else if (!f.refreshFailure) { f.startupStarts++; scope.confirmation_token = null; scope.expires_at_unix_ms = null; }
+      }
+      if (f.refreshFailure) { status = f.refreshFailure; data = {error: f.refreshErrorMessage || 'another catalog refresh is in progress'}; }
+      if (f.networkRefreshFailure) throw new Error('connection lost after startup request');
     } else throw new Error('Unexpected endpoint ' + url);
     const snapshot = clone(data), response = {ok: status === 200, status, json: async () => clone(snapshot)};
     if (delayed) return new Promise((resolve, reject) => { f.pending.push({url, method: opts.method, signal: opts.signal, resolve: () => resolve(response)}); if (!f.ignoreAbort) opts.signal.addEventListener('abort', () => { const error = new Error('abort'); error.name = 'AbortError'; reject(error); }); });
     return response;
   }
-  const context = {console, document, window: {matchMedia: () => ({matches: false, addEventListener() {}}), addEventListener: (name, fn) => events.set(name, fn)}, navigator: {}, fetch, crypto: webcrypto, AbortController, TextEncoder, Uint8Array, Date, Error, JSON, Array, String, Number, Boolean, Set, Map, encodeURIComponent,
+  class FixtureDate extends Date { static now() { return f.now; } }
+  const context = {console, document, window: {matchMedia: () => ({matches: false, addEventListener() {}}), addEventListener: (name, fn) => events.set(name, fn)}, navigator: {}, fetch, crypto: webcrypto, AbortController, TextEncoder, Uint8Array, Date: FixtureDate, Error, JSON, Array, String, Number, Boolean, Set, Map, encodeURIComponent,
     setTimeout: (callback, milliseconds) => { const id = ++timerId; timers.set(id, {callback, milliseconds}); return id; }, clearTimeout: id => timers.delete(id)};
   Object.defineProperties(context, {localStorage: {get() { throw new Error('must not access storage'); }}, sessionStorage: {get() { throw new Error('must not access storage'); }}});
   vm.runInNewContext(script, context); return f;
@@ -205,6 +215,99 @@ function fixture(authMode = 'bearer', restored = false) {
   const uncertain = {...observedEnvelope(observation({models: []}), false, 4), cache_epoch: 'a'.repeat(32)}; delete uncertain.task_observation_stale;
   scoped.cache = {profiles: [uncertain]}; await scoped.$('capability-read').emit('click'); assert.match(scoped.card('review').textContent, /任务观察新鲜度未知/); assert.match(scoped.card('review').textContent, /本次任务未返回模型条目/);
   await scoped.$('logout').emit('click'); assert.equal(scoped.$('capability-profiles').children.length, 0); scoped.events.get('pagehide')();
+  // Host opt-in never starts a process on login, panel open, polling or fresh GET.
+  // Each explicit start has a fresh cache read and a native, dismissible consent dialog.
+  for (const authMode of ['bearer', 'session', 'hybrid']) {
+    const start = fixture(authMode), $ = start.$; await settle();
+    start.config.native_agents[1].allow_startup_discovery = true; start.validateStartup = true;
+    start.cache = {profiles: [startupEnvelope('login-token', start.now + 90000)]}; await start.login();
+    assert.equal(start.posts().length, 0); assert.equal(start.startupStarts, 0); assert(!$('startup-discovery-dialog').open);
+    await $('capability-toggle').emit('click'); assert(!$('startup-discovery-dialog').open); assert.equal(start.posts().length, 0);
+    assert.match(start.card('review').textContent, /宿主已启用启动发现/);
+    assert.match(start.card('review').textContent, /不保证无网络、无推理或无费用/);
+    start.cache = {profiles: [startupEnvelope('fresh-click-token', start.now + 90000)]}; start.delayRead = true;
+    const beforeReads = start.catalogRequests().length, original = start.button('review'), opening = original.emit('click'); await settle();
+    await original.emit('click'); await start.button('review').emit('click'); await start.button('dev / one').emit('click');
+    assert.equal(start.catalogRequests().length, beforeReads + 1); assert.equal(start.posts().length, 0); assert(!$('startup-discovery-dialog').open);
+    start.resolve('/api/capabilities'); await opening; start.delayRead = false;
+    assert($('startup-discovery-dialog').open); assert.match($('startup-discovery-title').textContent, /review/);
+    assert.equal($('startup-discovery-description').textContent, startupText); assert.equal($('startup-discovery-description').querySelectorAll('img').length, 0);
+    assert.match($('startup-discovery-expiry').textContent, /一次刷新/); assert.equal(start.startupStarts, 0);
+    await $('startup-discovery-dismiss').emit('click'); await $('startup-discovery-confirm').emit('click');
+    assert(!$('startup-discovery-dialog').open); assert.equal(start.posts().length, 0);
+    await start.button('review').emit('click'); assert($('startup-discovery-dialog').open);
+    await $('startup-discovery-dialog').emit('cancel'); await $('startup-discovery-confirm').emit('click');
+    assert(!$('startup-discovery-dialog').open); assert.equal(start.posts().length, 0);
+    // Closing the dialog itself invalidates its former confirmation handler.
+    await start.button('review').emit('click'); await $('startup-discovery-dialog').close(); await $('startup-discovery-confirm').emit('click'); assert.equal(start.posts().length, 0);
+    await start.button('review').emit('click'); start.delayRefresh = true;
+    start.refreshResponse = startupEnvelope(null, null, {generation: 2, catalog: {...catalog('confirmed-startup'), provider: 'claude_cli'}, stale: false});
+    const confirming = $('startup-discovery-confirm').emit('click'); await settle();
+    await $('startup-discovery-confirm').emit('click'); await original.emit('click'); await start.button('review').emit('click');
+    assert(!$('startup-discovery-dialog').open); assert.equal(start.posts().length, 1); assert.equal(start.startupStarts, 1);
+    assert.deepEqual(JSON.parse(start.posts()[0].opts.body), {confirm_startup_effects: true, confirmation_token: 'fresh-click-token'});
+    assert.equal(start.posts()[0].opts.headers['Content-Type'], 'application/json');
+    start.resolve('/api/capabilities/review/refresh', 'POST'); await confirming; start.delayRefresh = false;
+    assert.match(start.card('review').textContent, /confirmed-startup/);
+    // Even a stale/misbehaving response cannot reuse a token already sent once.
+    start.cache = {profiles: [startupEnvelope('fresh-click-token', start.now + 90000, {generation: 2})]};
+    await start.button('review').emit('click'); assert(!$('startup-discovery-dialog').open); assert.equal(start.posts().length, 1); assert.match(start.card('review').textContent, /已发送的确认不会重用/);
+    // A lost response must not trigger retries; even explicit clicks require a new token/dialog.
+    start.cache = {profiles: [startupEnvelope('unknown-result-token', start.now + 90000, {generation: 2})]}; await start.button('review').emit('click');
+    start.networkRefreshFailure = true; await $('startup-discovery-confirm').emit('click'); start.networkRefreshFailure = false;
+    assert.equal(start.posts().length, 2); assert.match(start.card('review').textContent, /不会重放或自动重试/);
+    start.cache = {profiles: [startupEnvelope('unknown-result-token', start.now + 90000, {generation: 2})]};
+    await start.flushTimer(2000); start.events.get('online')(); await settle(); await start.button('review').emit('click'); await $('startup-discovery-confirm').emit('click');
+    assert.equal(start.posts().length, 2); assert(!$('startup-discovery-dialog').open);
+    // Logout invalidates consent immediately, including a pending logout response.
+    start.cache = {profiles: [startupEnvelope('logout-token', start.now + 90000, {generation: 2})]}; await start.button('review').emit('click');
+    start.delayLogout = authMode !== 'bearer'; const logout = $('logout').emit('click'); await settle();
+    assert(!$('startup-discovery-dialog').open); await $('startup-discovery-confirm').emit('click'); assert.equal(start.posts().length, 2);
+    if (start.delayLogout) start.resolve('/auth/logout', 'POST'); await logout; await start.login();
+    assert(!$('startup-discovery-dialog').open); await $('startup-discovery-confirm').emit('click'); assert.equal(start.posts().length, 2);
+    start.events.get('pagehide')();
+  }
+  // Expiry, profile/binary/policy drift and server restart never preserve old consent.
+  const consent = fixture(), $c = consent.$; await settle(); consent.config.native_agents[1].allow_startup_discovery = true; consent.validateStartup = true;
+  let serial = 0;
+  const freshConsent = (extra = {}) => { consent.cache = {profiles: [startupEnvelope('scope-' + (++serial), consent.now + 90000, extra)]}; };
+  freshConsent(); await consent.login(); await consent.button('review').emit('click');
+  consent.now += 90000; await $c('startup-discovery-confirm').emit('click'); assert.equal(consent.posts().length, 0); assert(!$c('startup-discovery-dialog').open); assert.match(consent.card('review').textContent, /失效/);
+  freshConsent(); await consent.button('review').emit('click'); await consent.flushTimer(90000); assert(!$c('startup-discovery-dialog').open); assert.match(consent.card('review').textContent, /已过期/); assert.equal(consent.posts().length, 0);
+  freshConsent(); await consent.button('review').emit('click'); freshConsent({generation: 2}); await $c('capability-read').emit('click');
+  assert(!$c('startup-discovery-dialog').open); await $c('startup-discovery-confirm').emit('click'); assert.equal(consent.posts().length, 0);
+  await consent.button('review').emit('click'); freshConsent({generation: 0, cache_epoch: 'new-process'}); await $c('capability-read').emit('click');
+  assert(!$c('startup-discovery-dialog').open); assert.equal(consent.posts().length, 0);
+  // Missing configured profile in the fresh snapshot cannot borrow an older cached token.
+  await consent.button('review').emit('click'); consent.cache = {profiles: []}; await $c('capability-read').emit('click');
+  assert(!$c('startup-discovery-dialog').open); await consent.button('review').emit('click'); assert(!$c('startup-discovery-dialog').open); assert.equal(consent.posts().length, 0);
+  // The server rejects unseen drift or token expiry before any startup; UI requires new confirmation.
+  for (const reason of ['profile drift', 'executable drift', 'policy drift', 'service epoch drift', 'expired confirmation']) {
+    freshConsent({cache_epoch: 'new-process'}); await consent.button('review').emit('click'); assert($c('startup-discovery-dialog').open);
+    freshConsent({cache_epoch: 'new-process'}); consent.refreshErrorMessage = reason;
+    const before = consent.posts().length; await $c('startup-discovery-confirm').emit('click');
+    assert.equal(consent.posts().length, before + 1); assert.equal(consent.startupStarts, 0); assert(!$c('startup-discovery-dialog').open); assert.match(consent.card('review').textContent, /drifted/);
+    await consent.flushTimer(2000); assert.equal(consent.posts().length, before + 1);
+  }
+  for (const event of ['popstate', 'pagehide']) {
+    freshConsent({cache_epoch: 'new-process'}); await consent.button('review').emit('click'); assert($c('startup-discovery-dialog').open);
+    const posts = consent.posts().length; consent.events.get(event)(); await $c('startup-discovery-confirm').emit('click'); assert.equal(consent.posts().length, posts); assert(!$c('startup-discovery-dialog').open);
+  }
+  // Authentication failure during the fresh GET or POST discards all pending intent.
+  for (const phase of ['GET', 'POST']) {
+    const auth = fixture('session'); await settle(); auth.config.native_agents[1].allow_startup_discovery = true; auth.validateStartup = true;
+    auth.cache = {profiles: [startupEnvelope('auth-token', auth.now + 90000)]}; await auth.login();
+    if (phase === 'GET') auth.readFailure = 401;
+    await auth.button('review').emit('click');
+    if (phase === 'POST') { auth.refreshFailure = 401; await auth.$('startup-discovery-confirm').emit('click'); }
+    assert(!auth.$('startup-discovery-dialog').open); assert(auth.$('capability-panel').hidden); assert(!auth.$('auth-panel').hidden);
+    const posts = auth.posts().length; await auth.$('startup-discovery-confirm').emit('click'); assert.equal(auth.posts().length, posts); assert.equal(auth.startupStarts, 0); auth.events.get('pagehide')();
+  }
+  // Navigation while obtaining the fresh scope fences even an ignored abort response.
+  const waiting = fixture(); await settle(); waiting.config.native_agents[1].allow_startup_discovery = true;
+  waiting.cache = {profiles: [startupEnvelope('late-token', waiting.now + 90000)]}; await waiting.login(); waiting.delayRead = true; waiting.ignoreAbort = true;
+  const late = waiting.button('review').emit('click'); await settle(); waiting.events.get('popstate')(); waiting.resolve('/api/capabilities'); await late;
+  assert(!waiting.$('startup-discovery-dialog').open); assert.equal(waiting.posts().length, 0); waiting.events.get('pagehide')();
   assert.match(html, /能力与模型目录不代表账户已登录、可调用模型或获得调用授权/);
-  console.log('PASS: capability UI cached-only login/open; explicit bounded-profile refresh; no polling discovery; process epoch/generation/session/navigation fences; restart unlock and stale-finally guard; repeated click guard; safe evidence/models/efforts; task-only scoped observations and optional metadata; independent freshness and same-generation ordering; no observation-backed selector; manual fallback; XSS-safe fields; unknown auth and effective selection; startup context; last-read freshness; local errors; legacy config; bearer/session/hybrid restoration');
+  console.log('PASS: confirmed Claude startup fresh-GET/native-dialog/Cancel/Esc/close/expiry/drift/auth/navigation fences; bearer/session/hybrid one-shot POST; no replay or automatic retry after unknown network result; inert confirmation text; capability UI cached-only login/open; explicit bounded-profile refresh; no polling discovery; process epoch/generation/session/navigation fences; restart unlock and stale-finally guard; repeated click guard; safe evidence/models/efforts; task-only scoped observations and optional metadata; independent freshness and same-generation ordering; no observation-backed selector; manual fallback; XSS-safe fields; unknown auth and effective selection; startup context; last-read freshness; local errors; legacy config; bearer/session/hybrid restoration');
 })().catch(error => { console.error(error); process.exitCode = 1; });

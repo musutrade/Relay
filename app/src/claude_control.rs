@@ -1,4 +1,6 @@
-//! One bounded initialize exchange inside an already-authorized Claude task.
+//! One bounded initialize exchange in an authorized Claude task or an explicitly
+//! confirmed initialize-only catalog refresh. Catalog mode never queues a user
+//! prompt; it does not isolate or suppress the configured CLI's startup behavior.
 //! The outer JSONL parser enforces its 64 KiB line limit. The supervisor owns
 //! the ten-second initialization deadline, stdin writes, and process lifetime.
 //! This driver never starts a process or requests a second inference turn.
@@ -21,6 +23,7 @@ const SOURCE: &str = "claude_cli:initialize/models";
 const DENIAL: &str = "Relay does not authorize server control requests";
 
 pub(crate) struct Driver {
+    catalog: bool,
     prompt: Option<String>,
     pending: Vec<u8>,
     pending_denial: bool,
@@ -32,8 +35,17 @@ pub(crate) struct Driver {
 
 impl Driver {
     pub(crate) fn new(prompt: String) -> Self {
+        Self::start(Some(prompt))
+    }
+
+    pub(crate) fn catalog() -> Self {
+        Self::start(None)
+    }
+
+    fn start(prompt: Option<String>) -> Self {
         let mut driver = Self {
-            prompt: None,
+            catalog: prompt.is_none(),
+            prompt,
             pending: Vec::new(),
             pending_denial: false,
             initialize_sent: false,
@@ -41,11 +53,14 @@ impl Driver {
             models: None,
             error: None,
         };
-        if prompt.len() > crate::host::MAX_PHASE_INPUT {
+        if driver
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.len() > crate::host::MAX_PHASE_INPUT)
+        {
             driver.fail("Claude task prompt exceeds its byte budget");
             return driver;
         }
-        driver.prompt = Some(prompt);
         // Official Python SDK Query.initialize / _send_control_request envelope.
         // No hooks, plugins, client capabilities, permissions or account queries.
         driver.pending = encode_line(&json!({
@@ -69,7 +84,31 @@ impl Driver {
         self.initialized
     }
 
-    /// No further task input is owed. The caller must also finish writing every
+    pub(crate) fn is_catalog(&self) -> bool {
+        self.catalog
+    }
+
+    pub(crate) fn catalog_complete(&self) -> bool {
+        self.catalog && self.initialized && self.models.is_some() && self.error.is_none()
+    }
+
+    /// The outer parser must first verify its complete bounded JSONL stream;
+    /// the supervisor separately proves that the process tree has stopped.
+    pub(crate) fn finish_catalog(self) -> Result<Vec<ModelCapability>, String> {
+        if !self.is_catalog() {
+            return Err("Claude control exchange is not a catalog request".into());
+        }
+        if let Some(error) = self.error {
+            return Err(error.into());
+        }
+        if !self.catalog_complete() {
+            return Err("Claude catalog stream ended before initialize completed".into());
+        }
+        self.models
+            .ok_or_else(|| "Claude initialize did not return a valid model catalog".into())
+    }
+
+    /// No further input is owed. The caller must also finish writing every
     /// byte previously returned by `pending` before closing stdin. On failure,
     /// discard any caller-buffered task prompt rather than continuing to write it.
     pub(crate) fn input_done(&self) -> bool {
@@ -87,7 +126,11 @@ impl Driver {
     /// Cancel unsent task input after a sticky outer-parser error. A bounded,
     /// static denial may still be flushed, but neither initialize nor a prompt.
     pub(crate) fn abort(&mut self) {
-        self.fail("Claude task control exchange was aborted");
+        self.fail(if self.catalog {
+            "Claude catalog control exchange was aborted"
+        } else {
+            "Claude task control exchange was aborted"
+        });
     }
 
     fn fail(&mut self, reason: &'static str) {
@@ -99,8 +142,9 @@ impl Driver {
         }
     }
 
-    /// Only control_response, control_request and control_cancel_request belong
-    /// here. Normal provider events remain the outer parser's responsibility.
+    /// Task mode receives only control events; normal provider events remain the
+    /// outer parser's responsibility. Catalog mode receives every event so task
+    /// frames and malformed notifications fail closed without being logged.
     pub(crate) fn event(&mut self, event: &Value) -> Result<(), String> {
         if let Some(error) = self.error {
             return Err(error.into());
@@ -113,6 +157,9 @@ impl Driver {
     }
 
     fn control_event(&mut self, event: &Value) -> Result<(), &'static str> {
+        if self.catalog {
+            return self.catalog_event(event);
+        }
         match event.get("type").and_then(Value::as_str) {
             Some("control_request") => {
                 self.deny(event);
@@ -126,6 +173,79 @@ impl Driver {
             Some("control_response") => self.initialize_response(event),
             _ => Ok(()),
         }
+    }
+
+    fn catalog_event(&mut self, event: &Value) -> Result<(), &'static str> {
+        let kind = event
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|kind| valid_text(kind, MAX_FIELD))
+            .ok_or("Claude catalog event requires a bounded string type")?;
+        match kind {
+            "control_request" => {
+                self.deny(event);
+                return Err("Claude requested approval, input, or an unsupported client action");
+            }
+            "control_cancel_request" => return Err("unexpected Claude control cancellation"),
+            "control_response" | "system" => {}
+            _ => return Err("unexpected Claude event during catalog initialization"),
+        }
+        self.catalog_state(event)?;
+        if event.get("request").is_some() {
+            return Err("Claude catalog event has an unexpected request envelope");
+        }
+        if kind == "control_response" {
+            return self.initialize_response(event);
+        }
+        // Startup/status/hook notifications are not catalog evidence. Their
+        // unrecognized content is discarded, never copied into the result.
+        let subtype = event
+            .get("subtype")
+            .and_then(Value::as_str)
+            .filter(|subtype| valid_text(subtype, MAX_FIELD))
+            .ok_or("Claude catalog system event requires a bounded subtype")?;
+        if event.get("response").is_some()
+            || matches!(subtype, "error" | "permission_denied" | "requires_action")
+        {
+            return Err("Claude catalog system event was rejected or malformed");
+        }
+        Ok(())
+    }
+
+    fn catalog_state(&mut self, value: &Value) -> Result<(), &'static str> {
+        if value.get("error").is_some_and(|error| !error.is_null())
+            || value
+                .get("is_error")
+                .is_some_and(|error| error != &Value::Bool(false))
+            || value
+                .get("permission_denials")
+                .is_some_and(|denials| !denials.as_array().is_some_and(Vec::is_empty))
+        {
+            return Err("Claude catalog initialization reported an error or denied permission");
+        }
+        match value.get("session_state") {
+            None => {}
+            Some(Value::String(state)) if state == "requires_action" => {
+                return Err("Claude initialize requires an unsupported client action");
+            }
+            Some(Value::String(state)) if valid_text(state, MAX_FIELD) => {}
+            _ => return Err("Claude initialize has malformed session state"),
+        }
+        for name in [
+            "pending_permission_requests",
+            "pending_user_dialog_requests",
+        ] {
+            match value.get(name) {
+                None => {}
+                Some(Value::Array(items)) if items.is_empty() => {}
+                Some(Value::Array(items)) => {
+                    self.deny(&items[0]);
+                    return Err("Claude initialize requires an unsupported client action");
+                }
+                _ => return Err("Claude initialize has malformed pending requests"),
+            }
+        }
+        Ok(())
     }
 
     fn deny(&mut self, request: &Value) {
@@ -170,6 +290,10 @@ impl Driver {
             .get("response")
             .filter(|value| value.is_object())
             .ok_or("Claude initialize response requires an object payload")?;
+        if self.catalog {
+            self.catalog_state(response)?;
+            self.catalog_state(payload)?;
+        }
         for name in [
             "pending_permission_requests",
             "pending_user_dialog_requests",
@@ -191,10 +315,17 @@ impl Driver {
         }) {
             return Err("Claude initialize requires an unsupported client action");
         }
-        // Catalog metadata is optional evidence, not an execution prerequisite.
-        // Reject the whole catalog on incomplete, contradictory or oversized
-        // metadata, but a structurally successful initialization can still run.
+        // In task mode catalog metadata is optional evidence, not an execution
+        // prerequisite. Reject incomplete, contradictory or oversized metadata,
+        // but a structurally successful initialization can still run the task.
         self.models = parse_models(payload);
+        if self.catalog {
+            if self.models.is_none() {
+                return Err("Claude initialize did not return a valid model catalog");
+            }
+            self.initialized = true;
+            return Ok(());
+        }
         let prompt = self
             .prompt
             .take()
@@ -347,6 +478,263 @@ mod tests {
             "request": {"subtype": "initialize", "hooks": null}})
         );
         driver
+    }
+
+    fn catalog_driver() -> Driver {
+        let mut driver = Driver::catalog();
+        assert!(driver.is_catalog());
+        assert!(!driver.catalog_complete());
+        assert!(!driver.input_done());
+        let pending = driver.pending();
+        assert_eq!(pending.iter().filter(|&&byte| byte == b'\n').count(), 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&pending).unwrap(),
+            json!({"type": "control_request", "request_id": INITIALIZE_ID,
+                "request": {"subtype": "initialize", "hooks": null}})
+        );
+        assert!(driver.pending().is_empty());
+        driver
+    }
+
+    #[test]
+    fn catalog_initializes_once_without_ever_queuing_a_user_prompt() {
+        for models in [json!([]), json!([row("catalog-alias")])] {
+            let mut driver = catalog_driver();
+            for event in [
+                json!({"type":"system", "subtype":"init", "model":"not-catalog-evidence"}),
+                json!({"type":"system", "subtype":"hook_started", "account":"never-copy"}),
+            ] {
+                driver.event(&event).unwrap();
+                assert!(driver.models().is_none());
+                assert!(driver.pending().is_empty());
+            }
+            driver.event(&response(json!({"models": models}))).unwrap();
+            assert!(driver.initialized());
+            assert!(driver.catalog_complete());
+            assert!(driver.input_done());
+            assert!(driver.prompt.is_none());
+            assert!(driver.pending().is_empty());
+            let result = driver.finish_catalog().unwrap();
+            assert_eq!(result.len(), models.as_array().unwrap().len());
+            assert!(result.iter().all(|model| model.source == SOURCE));
+            assert!(
+                !serde_json::to_string(&result)
+                    .unwrap()
+                    .contains("never-copy")
+            );
+        }
+        let mut task = driver();
+        assert!(!task.is_catalog());
+        task.event(&response(json!({"models": []}))).unwrap();
+        assert!(!task.catalog_complete());
+        assert!(task.finish_catalog().is_err());
+    }
+
+    #[test]
+    fn catalog_requires_complete_valid_metadata_and_never_exposes_partial_models() {
+        for payload in [
+            json!({}),
+            json!({"models": null}),
+            json!({"models": {}}),
+            json!({"models": [row("valid"), {}]}),
+            json!({"models": [row("duplicate"), row("duplicate")]}),
+            json!({"models": [{"value":"alias", "displayName":"Alias"}]}),
+            json!({"models": [{"value":"alias", "displayName":"Alias", "description":"",
+                "supportsEffort":false, "supportedEffortLevels":["high"]}]}),
+            json!({"models": (0..=MAX_MODELS).map(|n| row(&n.to_string())).collect::<Vec<_>>()}),
+        ] {
+            let mut driver = catalog_driver();
+            assert!(driver.event(&response(payload)).is_err());
+            assert!(!driver.initialized());
+            assert!(!driver.catalog_complete());
+            assert!(driver.models().is_none());
+            assert!(driver.pending().is_empty());
+            assert!(driver.input_done());
+            assert!(driver.finish_catalog().is_err());
+        }
+    }
+
+    #[test]
+    fn catalog_rejects_early_duplicate_or_incomplete_initialize() {
+        let mut early = Driver::catalog();
+        assert!(early.event(&response(json!({"models": []}))).is_err());
+        assert!(early.pending().is_empty());
+        assert!(early.finish_catalog().is_err());
+        assert!(catalog_driver().finish_catalog().is_err());
+        for abort in [false, true] {
+            let mut driver = catalog_driver();
+            driver
+                .event(&response(json!({"models": [row("valid")]})))
+                .unwrap();
+            assert!(driver.catalog_complete());
+            if abort {
+                driver.abort();
+            } else {
+                assert!(driver.event(&response(json!({"models": []}))).is_err());
+            }
+            assert!(driver.models().is_none());
+            assert!(!driver.catalog_complete());
+            assert!(driver.pending().is_empty());
+            assert!(driver.finish_catalog().is_err());
+        }
+    }
+
+    #[test]
+    fn catalog_rejects_missing_malformed_or_pending_client_actions() {
+        for name in [
+            "pending_permission_requests",
+            "pending_user_dialog_requests",
+        ] {
+            for pending in [None, Some(Value::Null), Some(json!({})), Some(json!([{}]))] {
+                let mut driver = catalog_driver();
+                let mut event = response(json!({"models": []}));
+                match pending {
+                    None => {
+                        event["response"].as_object_mut().unwrap().remove(name);
+                    }
+                    Some(value) => event["response"][name] = value,
+                }
+                assert!(driver.event(&event).is_err());
+                assert!(driver.models().is_none());
+                assert!(driver.pending().is_empty());
+                assert!(driver.finish_catalog().is_err());
+            }
+            for location in ["envelope", "response", "payload"] {
+                let mut driver = catalog_driver();
+                let mut event = response(json!({"models": []}));
+                let pending =
+                    json!([{"request_id":"pending-action", "request":{"secret":"never-copy"}}]);
+                match location {
+                    "envelope" => event[name] = pending,
+                    "response" => event["response"][name] = pending,
+                    _ => event["response"]["response"][name] = pending,
+                }
+                assert!(driver.event(&event).is_err());
+                let outgoing = driver.pending();
+                assert!(!String::from_utf8_lossy(&outgoing).contains("never-copy"));
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&outgoing).unwrap(),
+                    json!({"type":"control_response", "response": {
+                        "subtype":"error", "request_id":"pending-action", "error":DENIAL
+                    }})
+                );
+                assert!(driver.models().is_none());
+                assert!(driver.finish_catalog().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_rejects_action_session_states_and_contradictory_errors() {
+        for location in ["envelope", "response", "payload"] {
+            for (field, value) in [
+                ("session_state", json!("requires_action")),
+                ("session_state", Value::Null),
+                ("session_state", json!({"state":"requires_action"})),
+                ("session_state", json!("")),
+                ("session_state", json!("s".repeat(MAX_FIELD + 1))),
+                ("error", json!("provider-secret")),
+                ("is_error", json!(true)),
+                ("is_error", Value::Null),
+                ("permission_denials", json!(["provider-secret"])),
+                ("permission_denials", Value::Null),
+            ] {
+                let mut driver = catalog_driver();
+                let mut event = response(json!({"models": [row("valid")]}));
+                match location {
+                    "envelope" => event[field] = value,
+                    "response" => event["response"][field] = value,
+                    _ => event["response"]["response"][field] = value,
+                }
+                let error = driver.event(&event).unwrap_err();
+                assert!(!error.contains("provider-secret"));
+                assert!(driver.models().is_none());
+                assert!(driver.pending().is_empty());
+                assert!(driver.finish_catalog().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_rejects_task_frames_unknown_events_and_malformed_envelopes() {
+        let mut bad_id = response(json!({"models": []}));
+        bad_id["response"]["request_id"] = json!("wrong-id");
+        for event in [
+            Value::Null,
+            json!([]),
+            json!({}),
+            json!({"type": 1}),
+            json!({"type":"control_unknown"}),
+            json!({"type":"assistant", "message":{"content":"provider-secret"}}),
+            json!({"type":"user"}),
+            json!({"type":"result", "subtype":"success"}),
+            json!({"type":"stream_event"}),
+            json!({"type":"tool_progress"}),
+            json!({"type":"error", "error":"provider-secret"}),
+            json!({"type":"control_response"}),
+            json!({"type":"control_response", "response": []}),
+            json!({"type":"control_response", "response": {"subtype":"error", "request_id":INITIALIZE_ID, "error":"provider-secret"}}),
+            json!({"type":"control_response", "response": {"subtype":"success", "request_id":INITIALIZE_ID, "response":[]}}),
+            json!({"type":"control_response", "request":{}, "response":{}}),
+            json!({"type":"control_cancel_request", "request_id":INITIALIZE_ID}),
+            json!({"type":"system"}),
+            json!({"type":"system", "subtype":null}),
+            json!({"type":"system", "subtype":"init", "response":{}}),
+            json!({"type":"system", "subtype":"permission_denied"}),
+            json!({"type":"system", "subtype":"status", "session_state":"requires_action"}),
+            bad_id,
+        ] {
+            let mut driver = catalog_driver();
+            let error = driver.event(&event).unwrap_err();
+            assert!(!error.contains("provider-secret"));
+            assert!(driver.models().is_none());
+            assert!(!driver.catalog_complete());
+            assert!(driver.pending().is_empty());
+            assert!(driver.event(&response(json!({"models": []}))).is_err());
+            assert_eq!(driver.failure(), Some(error.as_str()));
+            assert!(driver.finish_catalog().is_err());
+        }
+    }
+
+    #[test]
+    fn catalog_server_requests_get_only_one_static_bounded_denial() {
+        for initialized in [false, true] {
+            for id in [
+                json!("server-request"),
+                json!("x".repeat(MAX_FIELD + 1)),
+                json!({"secret":"provider-secret"}),
+                json!(1),
+                json!("bad\nid"),
+            ] {
+                let mut driver = catalog_driver();
+                if initialized {
+                    driver.event(&response(json!({"models": []}))).unwrap();
+                }
+                assert!(
+                    driver
+                        .event(&json!({"type":"control_request", "request_id":id,
+                            "request":{"subtype":"can_use_tool", "input":{"token":"provider-secret"}}}))
+                        .is_err()
+                );
+                driver.abort();
+                let outgoing = driver.pending();
+                assert!(!String::from_utf8_lossy(&outgoing).contains("provider-secret"));
+                if id == json!("server-request") {
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&outgoing).unwrap(),
+                        json!({"type":"control_response", "response": {
+                            "subtype":"error", "request_id":"server-request", "error":DENIAL
+                        }})
+                    );
+                } else {
+                    assert!(outgoing.is_empty());
+                }
+                assert!(driver.pending().is_empty());
+                assert!(driver.models().is_none());
+                assert!(!driver.catalog_complete());
+                assert!(driver.finish_catalog().is_err());
+            }
+        }
     }
 
     #[test]

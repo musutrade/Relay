@@ -52,6 +52,16 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// One explicit operator attestation. It is not a credential or a persistent permission.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogRefreshRequest {
+    #[serde(default)]
+    pub confirm_startup_effects: bool,
+    #[serde(default)]
+    pub confirmation_token: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Submission {
@@ -813,23 +823,30 @@ impl Application {
     }
     /// Explicit operator request; does not start a user turn or submit work.
     pub fn refresh_capabilities(&self, name: &str) -> Result<catalog_cache::CatalogView> {
+        self.refresh_capabilities_confirmed(name, &CatalogRefreshRequest::default())
+    }
+    pub fn refresh_capabilities_confirmed(
+        &self,
+        name: &str,
+        request: &CatalogRefreshRequest,
+    ) -> Result<catalog_cache::CatalogView> {
         let profile = self
             .config
             .native_agents
             .get(name)
             .ok_or_else(|| Error::Invalid("native profile is not allowlisted".into()))?;
-        let generation = {
+        let (generation, stamp) = {
             let mut cache = self.catalogs.lock().map_err(|_| Error::Poisoned)?;
             cache.reconciled_guard(capabilities::discovery_guard_present(&self.host));
             match cache
-                .begin(name, profile)
+                .begin_confirmed(name, profile, request)
                 .map_err(|error| Error::DiscoveryUnavailable(error.into()))?
             {
-                Some(generation) => generation,
+                Some(start) => start,
                 None => return Ok(cache.view(name, profile)),
             }
         };
-        let catalog = capabilities::discover(&self.host, profile);
+        let catalog = capabilities::discover_confirmed(&self.host, profile, &stamp);
         let cleanup_confirmed =
             catalog.process_cleanup.state == capabilities::CapabilityState::Supported;
         let mut cache = self.catalogs.lock().map_err(|_| Error::Poisoned)?;
@@ -1087,6 +1104,7 @@ impl Application {
                 json!({"name": name, "provider": profile.provider, "model": profile.model,
                 "effort": profile.effort, "authentication": "unknown",
                 "native_permission":profile.native_permission,"permission_modes":selection::permission_choices(profile),
+                "allow_startup_discovery":profile.allow_startup_discovery,
                 "reviewer_supported":profile.provider == providers::ProviderKind::ClaudeCli && profile.native_permission.is_none_or(|mode|mode.compatible(profile.provider,true))})
             })
             .collect();
