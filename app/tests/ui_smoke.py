@@ -120,7 +120,14 @@ with sync_playwright() as p:
     # outside the recent page must not make its predecessor appear retryable.
     def task_response(value):
         return dict(value,continuation_status=data['continuations'].get(value['id']))
+    def assert_unique_task_ids():
+        ids=[value['id'] for value in data['tasks']]
+        assert len(ids)==len(set(ids)), f'Duplicate fixture task IDs: {ids}'
+    def next_task_id():
+        assert_unique_task_ids()
+        return max((value['id'] for value in data['tasks']),default=0)+1
     def visible_tasks():
+        assert_unique_task_ids()
         return [task_response(value) for value in data['tasks'] if value['id'] not in data['hidden_task_ids']]
     def route(r):
         req=r.request; path=req.url.replace(base,''); requests.append((req.method,path,req.headers))
@@ -197,7 +204,7 @@ with sync_playwright() as p:
             assert body['job']['publish'] is False
             if data['post']=='abort': r.abort();return
             if data['post']=='401': r.fulfill(status=401,content_type='application/json',body=json.dumps({'error':'Unauthorized'}));return
-            result={'id':max(t['id'] for t in data['tasks'])+1,'key':body['key'],'payload':json.dumps(body['job'],ensure_ascii=False),'state':'queued','generation':0,'owner':None,'result':None,'continuation_status':None}
+            result={'id':next_task_id(),'key':body['key'],'payload':json.dumps(body['job'],ensure_ascii=False),'state':'queued','generation':0,'owner':None,'result':None,'continuation_status':None}
             data['tasks'].append(result)
         elif path.endswith(('/retry','/continue-review')):
             old_id=int(path.split('/')[-2]);body=req.post_data_json
@@ -234,7 +241,7 @@ with sync_playwright() as p:
                     choice=original['body']['replacement'];job.setdefault('role_selections',{})[role]=choice
                     if role=='developer': job['agent']=choice['profile']
                     job['continuation']['replacement']={'role':role,'session_epoch':1}
-                result=task(max(t['id'] for t in data['tasks'])+1);result['key']=original['body']['key'];result['payload']=json.dumps(job)
+                result=task(next_task_id());result['key']=original['body']['key'];result['payload']=json.dumps(job)
                 data['tasks'].append(result)
                 reservation['successor_id']=result['id']
             else:
@@ -1094,8 +1101,12 @@ with sync_playwright() as p:
     native_review_catalog=json.loads(json.dumps(role_catalog))
     native_review_catalog['native_reviewer']={'state':'supported','reason':'Explicit host opt-in; native local sandbox only','source':'fixture'}
     data['catalogs'].append({'name':'codex-review','cache_epoch':'e'*32,'generation':1,'stale':False,'refreshing':False,'catalog':native_review_catalog})
-    value=review_task(224);data['tasks'].append(value);data['operator_overrides'][224]=replacement_operator(value,'reviewer')
-    data['operator_overrides'][224]['recovery']['actions'][0]['replacement']['profiles'].append('codex-review')
+    # Phase 4 continuations already allocate IDs above its fixed 220–223 fixtures.
+    native_review_task_id=next_task_id()
+    value=review_task(native_review_task_id);data['tasks'].append(value)
+    data['operator_overrides'][native_review_task_id]=replacement_operator(value,'reviewer')
+    data['operator_overrides'][native_review_task_id]['recovery']['actions'][0]['replacement']['profiles'].append('codex-review')
+    assert_unique_task_ids()
     native_request_start=len(requests);connect(page)
     page.locator('#workflow').select_option('reviewed');page.locator('#reviewer').select_option('codex-review')
     expect(page.locator('#reviewer-support')).to_contain_text('独立 checkout 与全新独立会话，不恢复旧会话')
@@ -1110,8 +1121,16 @@ with sync_playwright() as p:
     confirm_native_review();page.locator('#reviewer-model-source').select_option('manual')
     expect(page.locator('#reviewer-confirm')).not_to_be_checked();expect(page.locator('#reviewer-confirm')).to_be_disabled()
     page.locator('#reviewer-manual-model').fill('native-review-model');confirm_native_review()
+    # The inherited default above requires consent and pins the wire mode. For the
+    # evidence images, explicitly select that same mode so its label is visible.
+    page.locator('#reviewer-permission').select_option(native_review_mode)
+    expect(page.locator('#reviewer-confirm')).not_to_be_checked();expect(page.locator('#reviewer-confirm')).to_be_disabled()
+    confirm_native_review()
     for width in [1440,390,320]:
         page.set_viewport_size({'width':width,'height':1000});assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'native reviewer overflow at {width}'
+        # Keep screenshot focus on this scenario rather than a prior keyboard target.
+        page.locator('#reviewer-confirm').focus();expect(page.locator('#reviewer-confirm')).to_be_focused()
+        expect(page.locator('#reviewer-permission')).to_have_value(native_review_mode)
         page.locator('#reviewer-settings').screenshot(path=str(SCREENSHOTS / f'relay-codex-native-review-{width}.png'))
     page.locator('#submit-task').click();expect(page.locator('#form-message')).to_contain_text('已确认')
     native_job=submissions[-1]['job'];assert native_job['role_selections']['reviewer']=={'profile':'codex-review','model':{'value':'native-review-model','source':'manual'},'native_permission':native_review_mode,'confirm_permission_expansion':True}
@@ -1120,7 +1139,7 @@ with sync_playwright() as p:
     native_card=page.locator('[data-profile="codex-review"]')
     expect(native_card).to_contain_text('严格无执行审查隔离');expect(native_card).to_contain_text('Read-only reviewer isolation is unavailable')
     expect(native_card).to_contain_text('原生本地只读审查（允许命令）');expect(native_card).to_contain_text('Explicit host opt-in; native local sandbox only')
-    page.locator('#capability-toggle').click();select_task(page,224);page.locator('#review-task').click()
+    page.locator('#capability-toggle').click();select_task(page,native_review_task_id);page.locator('#review-task').click()
     page.locator('#retry-replace').check();page.locator('#replacement-profile').select_option('codex-review')
     expect(page.locator('#replacement-session')).to_contain_text('全新独立 Codex 会话，不恢复旧会话')
     expect(page.locator('#replacement-confirm-text')).to_contain_text(native_review_warning)
@@ -1130,15 +1149,20 @@ with sync_playwright() as p:
     page.locator('#review-task').click();expect(page.locator('#retry-replace')).not_to_be_checked()
     page.locator('#retry-replace').check();page.locator('#replacement-profile').select_option('codex-review')
     expect(page.locator('#replacement-confirm')).not_to_be_checked();expect(page.locator('#replacement-confirm')).to_be_disabled()
+    page.locator('#replacement-permission').select_option(native_review_mode)
     page.locator('#replacement-challenge').click();expect(page.locator('#replacement-confirm')).to_be_enabled();page.locator('#replacement-confirm').check()
     for width in [1440,390,320]:
         page.set_viewport_size({'width':width,'height':1000});assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
         assert page.locator('#retry-dialog').evaluate('(node) => node.scrollWidth <= node.clientWidth')
+        page.locator('#replacement-confirm').focus();expect(page.locator('#replacement-confirm')).to_be_focused()
+        expect(page.locator('#replacement-permission')).to_have_value(native_review_mode)
         page.locator('#replacement-confirm').scroll_into_view_if_needed();page.screenshot(path=str(SCREENSHOTS / f'relay-codex-native-review-replacement-{width}.png'),full_page=True)
     page.locator('#retry-confirm').click();expect(page.locator('#continuation-choice')).to_contain_text('配置 codex-review')
+    assert data['review_requests'][-1][0]==native_review_task_id
     native_replacement=data['review_requests'][-1][1]
     assert native_replacement['replacement']=={'profile':'codex-review','native_permission':native_review_mode,'confirm_permission_expansion':True}
     assert native_replacement['revalidate_tests'] and native_replacement['permission_challenge']
+    assert_unique_task_ids()
     assert not any(path.endswith('/refresh') for _,path,_ in requests[native_request_start:])
     page.locator('#logout').click();after_logout=len(requests);page.wait_for_timeout(2400)
     assert len(requests)==after_logout
