@@ -33,6 +33,7 @@ cargo run -p relay-app -- serve .relay/config.json .relay/relay.db
 GET  /api/config
 GET  /api/capabilities            # 已配置 native profile 的缓存能力目录
 POST /api/capabilities/<name>/refresh # 显式有界目录探测，不发起用户推理回合
+GET  /api/workspaces?before=<id> # 只读工作区占用 / 共享历史 / 现有保留策略预览
 GET  /api/status
 GET  /api/tasks?before=<id>      # 最近 100 项，按 id 倒序
 POST /api/permission-challenge  # 显式扩大权限前读取并核对绑定范围
@@ -50,7 +51,7 @@ POST /api/tasks/<id>/continue-review # 同一候选复验一次测试后只继�
 
 把允许访问的本地仓库、Agent、测试和 PR 命令显式写入配置。请求只引用配置中的名字，不能指定任意程序、路径或 shell。原生 `native_agents` 支持 Codex / Claude CLI 的有界 JSONL 协议与终态校验；可显式开启 [Codex app-server / Claude 会话续接](docs/session-continuity.md)；旧通用命令保持兼容。`relay-app doctor <config.json>` 可只探测版本/参数，不调用模型。网页中的[主机能力与模型目录](docs/agent-capabilities.md)提供显式刷新和已知/未知能力说明；目录可见不代表调用授权；首次提交可按宿主允许范围[分别选择开发与审查角色](docs/native-role-selection.md)。模型与供应商凭据由这些外部 CLI 自行管理，Relay 不存储或代办凭据。命令失败和测试失败作为开发结果保存，内核不理解业务状态。
 
-可选命名 `workflows` 将开发 → 测试 → 只读审查 → 有界修复绑定同一 candidate SHA；每次修复必须重新测试和审查。失败后可 [显式继续保留的工作](docs/workspace-continuation.md)，或在已证明的停止阶段[更换当前角色](docs/adapter-stage-continuation.md)，使用新任务编号但复用固定目录；成功工作区可选按期限清理。GitHub 示例仅推送已批准的精确候选，默认 dry-run。
+可选命名 `workflows` 将开发 → 测试 → 只读审查 → 有界修复绑定同一 candidate SHA；每次修复必须重新测试和审查。失败后可 [显式继续保留的工作](docs/workspace-continuation.md)，或在已证明的停止阶段[更换当前角色](docs/adapter-stage-continuation.md)，使用新任务编号但复用固定目录；成功工作区可选按期限清理；网页提供[只读保留预览](docs/workspace-inventory.md)，区分已分配空间、共享历史和当前 TTL 证据，不提供删除操作。GitHub 示例仅推送已批准的精确候选，默认 dry-run。
 
 审查接受完整 JSON 或单个完整 `json` 代码围栏，总计最多 4096 UTF-8 字节；512 字节仅用于阶段预览。含外围说明的历史响应不会自动获批；可信操作员可通过本机 `adopt-review` 命令显式采纳一份已完整核对的响应，保留原文/摘要及失败记录，并明确接受原测试证据，不调用模型或重跑测试。条件和风险见[操作说明](docs/workspace-continuation.md#显式采纳已检查的历史审查)。
 

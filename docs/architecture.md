@@ -124,3 +124,7 @@ Claude 独立刷新仍因启动隔离未验证而保持目录未知；不为刷�
 ## 已停止阶段的显式角色替换
 
 `app/src/replacement.rs` 将宿主停止阶段、原轮次/剩余修复预算、独立前置结果/工作区证明与新选择接纳分开。唯一后继预留在 immediate transaction 及工作区 lease 内冻结有界交接、紧邻前置摘要与新角色 epoch；执行前再次检查，未改变角色的接纳和会话继续继承。Job 的持久 role_epochs 不随 continuation 规范化删除，旧会话文件不覆盖；首次会话创建允许标记在 provider 启动前消费。缺少阶段证明、无法完整保留反馈、原策略漂移或 reviewer checkout 拓扑转换均明确拒绝，不修改队列内核或初始化备用目录。详见[阶段替换](adapter-stage-continuation.md)。
+
+## 只读工作区保留预览
+
+`workspaces.rs` 在应用/宿主边界提供有界配置根清单和索引续接链；只读 claim 与锁、持久结果、完成标记及既有成功 TTL 共同给出保护/未知/等待/策略符合的观察，不创建清理动作。完成证明检查与原宿主清理复用，未改变核心状态或成功 TTL opt-in 默认关闭策略。`resources.rs` 在现有 fd 锚定 walker 中增加独立的 allocated-block 计量，不改变逻辑配额；硬链接去重不能证明独占或可回收空间。HTTP/UI 不查询 GitHub，不接受路径或策略写入。详见[工作区保留预览](workspace-inventory.md)。

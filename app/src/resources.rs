@@ -1,12 +1,13 @@
 //! Read-only, bounded host inventory and typed failures, outside the durable core.
-//! Logical sizes are observations, not allocated blocks, reservations, or OS quotas.
+//! Logical and allocated sizes are distinct observations, not reservations or OS quotas.
 use crate::host::HostConfig;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions, ReadDir};
+use std::fs::{self, File, Metadata, OpenOptions, ReadDir};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -68,10 +69,25 @@ impl Usage {
             reason: Some(bounded(reason.into())),
         }
     }
-    fn partial(logical_bytes: u64, reason: impl Into<String>) -> Self {
+}
+
+/// Host-reported allocated blocks, counted once per (device, inode) within one
+/// workspace. Shared extents and links outside the root are not attributable, so
+/// this is neither exclusive ownership nor a prediction of reclaimable space.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllocatedUsage {
+    pub allocated_bytes: Option<u64>,
+    pub complete: bool,
+    pub measured_at: u64,
+    pub reason: Option<String>,
+}
+impl AllocatedUsage {
+    pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
+            allocated_bytes: None,
+            complete: false,
+            measured_at: now(),
             reason: Some(bounded(reason.into())),
-            ..Self::observed(logical_bytes, false)
         }
     }
 }
@@ -193,6 +209,38 @@ pub fn failure_from_io(error: &io::Error, stage: &str) -> Failure {
 /// cannot be preempted by the cooperative 100 ms inspection deadline.
 pub fn measure_workspace(root: &Path, config: &HostConfig) -> Usage {
     inspect(root, Selection::All, &mut InspectionBudget::new(config))
+}
+
+/// Metadata-only Unix st_blocks * 512 observation using the same bounded,
+/// fd-anchored walker as logical quota inspection. Includes directory blocks,
+/// symlinks themselves, Git, reviewer copies, and controls; never follows targets.
+/// A complete walk is still a changing-filesystem observation, not a snapshot.
+/// Bounds are cooperative between syscalls; a blocked syscall cannot be preempted.
+pub fn measure_allocated_workspace(root: &Path, config: &HostConfig) -> AllocatedUsage {
+    let mut budget = InspectionBudget::new(config);
+    let file = match open_root(root, &budget) {
+        Ok(file) => file,
+        Err(reason) => return AllocatedUsage::unavailable(reason),
+    };
+    allocated_from_open(file, &mut budget)
+}
+
+/// Observe an already anchored workspace without reopening its mutable path.
+pub(crate) fn measure_allocated_directory(directory: &File, config: &HostConfig) -> AllocatedUsage {
+    match directory.try_clone() {
+        Ok(file) => allocated_from_open(file, &mut InspectionBudget::new(config)),
+        Err(error) => AllocatedUsage::unavailable(format!("workspace fd is unavailable: {error}")),
+    }
+}
+
+fn allocated_from_open(file: File, budget: &mut InspectionBudget) -> AllocatedUsage {
+    let observation = inspect_open_bytes(file, Selection::All, budget, ByteMeasure::allocated());
+    AllocatedUsage {
+        allocated_bytes: observation.bytes,
+        complete: observation.complete,
+        measured_at: now(),
+        reason: observation.reason,
+    }
 }
 
 /// Estimate from trusted allowlisted names without Git commands, copying files,
@@ -401,10 +449,13 @@ struct InspectionBudget {
 }
 impl InspectionBudget {
     fn new(config: &HostConfig) -> Self {
+        Self::with_entry_limit(config.max_snapshot_entries)
+    }
+    fn with_entry_limit(max_entries: usize) -> Self {
         Self {
             started: Instant::now(),
             entries: 0,
-            max_entries: config.max_snapshot_entries.min(100_000),
+            max_entries: max_entries.min(100_000),
             bytes: 0,
         }
     }
@@ -437,7 +488,7 @@ impl Directory {
         Ok(Self { file, entries })
     }
 }
-fn fd_path(file: &File) -> PathBuf {
+pub(crate) fn fd_path(file: &File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 fn open_directory(path: &Path) -> io::Result<File> {
@@ -473,6 +524,12 @@ fn open_root(root: &Path, budget: &InspectionBudget) -> Result<File, String> {
     }
     Ok(file)
 }
+/// Open an inventory root under the same canonical, no-follow, bounded rules.
+/// Callers must retain the fd while enumerating its fd_path and bound enumeration.
+pub(crate) fn open_inventory_root(root: &Path) -> io::Result<File> {
+    open_root(root, &InspectionBudget::with_entry_limit(0)).map_err(io::Error::other)
+}
+
 fn inspect(root: &Path, selection: Selection, budget: &mut InspectionBudget) -> Usage {
     let file = match open_root(root, budget) {
         Ok(file) => file,
@@ -480,16 +537,128 @@ fn inspect(root: &Path, selection: Selection, budget: &mut InspectionBudget) -> 
     };
     inspect_open(file, selection, budget)
 }
+// Keep units out of the common traversal result: logical usage and allocation
+// observations have distinct public fields and never share quota semantics.
+struct Inspection {
+    bytes: Option<u64>,
+    complete: bool,
+    reason: Option<String>,
+}
+impl Inspection {
+    fn observed(bytes: u64) -> Self {
+        Self {
+            bytes: Some(bytes),
+            complete: true,
+            reason: None,
+        }
+    }
+    fn partial(bytes: u64, reason: impl Into<String>) -> Self {
+        Self {
+            bytes: Some(bytes),
+            complete: false,
+            reason: Some(bounded(reason.into())),
+        }
+    }
+    fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            bytes: None,
+            complete: false,
+            reason: Some(bounded(reason.into())),
+        }
+    }
+}
+
+enum ByteMeasure {
+    Logical,
+    Allocated(HashSet<(u64, u64)>),
+}
+impl ByteMeasure {
+    fn allocated() -> Self {
+        Self::Allocated(HashSet::new())
+    }
+    fn observe(
+        &mut self,
+        metadata: &Metadata,
+        budget: &mut InspectionBudget,
+        bytes: &mut u64,
+    ) -> Result<(), &'static str> {
+        let size = match self {
+            Self::Logical if metadata.is_file() => metadata.len(),
+            Self::Logical => return Ok(()),
+            Self::Allocated(seen) => {
+                if !seen.insert((metadata.dev(), metadata.ino())) {
+                    return Ok(());
+                }
+                metadata
+                    .blocks()
+                    .checked_mul(512)
+                    .ok_or("allocated-byte count overflow; observation is partial")?
+            }
+        };
+        let observed = size.min(MAX_INSPECTION_BYTES - budget.bytes);
+        *bytes += observed;
+        budget.bytes += observed;
+        if budget.bytes >= MAX_INSPECTION_BYTES {
+            return Err(match self {
+                Self::Logical => {
+                    "inspection logical-byte limit reached (1 TiB + 1); bytes are a lower bound"
+                }
+                Self::Allocated(_) => {
+                    "inspection allocated-byte limit reached (1 TiB + 1); observation is partial"
+                }
+            });
+        }
+        Ok(())
+    }
+}
+
 fn inspect_open(file: File, selection: Selection, budget: &mut InspectionBudget) -> Usage {
+    let observation = inspect_open_bytes(file, selection, budget, ByteMeasure::Logical);
+    Usage {
+        logical_bytes: observation.bytes,
+        complete: observation.complete,
+        measured_at: now(),
+        reason: observation.reason,
+    }
+}
+fn inspect_open_bytes(
+    file: File,
+    selection: Selection,
+    budget: &mut InspectionBudget,
+    mut measure: ByteMeasure,
+) -> Inspection {
+    let mut bytes = 0u64;
+    if matches!(measure, ByteMeasure::Allocated(_)) {
+        if let Err(reason) = budget.check_time() {
+            return Inspection::unavailable(reason);
+        }
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return Inspection::unavailable(format!("root metadata is unavailable: {error}"));
+            }
+        };
+        if let Err(reason) = measure.observe(&metadata, budget, &mut bytes) {
+            return Inspection::partial(bytes, reason);
+        }
+    }
     let directory = match Directory::new(file) {
         Ok(directory) => directory,
-        Err(error) => return Usage::unavailable(format!("directory cannot be listed: {error}")),
+        Err(error) => {
+            return match measure {
+                ByteMeasure::Logical => {
+                    Inspection::unavailable(format!("directory cannot be listed: {error}"))
+                }
+                ByteMeasure::Allocated(_) => {
+                    Inspection::partial(bytes, format!("directory cannot be listed: {error}"))
+                }
+            };
+        }
     };
     let mut directories = vec![directory];
-    let mut bytes = 0u64;
     while let Some(directory) = directories.last_mut() {
         if let Err(reason) = budget.check_time() {
-            return Usage::partial(bytes, reason);
+            return Inspection::partial(bytes, reason);
         }
         let entry = match directory.entries.next() {
             None => {
@@ -498,14 +667,14 @@ fn inspect_open(file: File, selection: Selection, budget: &mut InspectionBudget)
             }
             Some(Ok(entry)) => entry,
             Some(Err(error)) => {
-                return Usage::partial(
+                return Inspection::partial(
                     bytes,
                     format!("directory changed or cannot be read: {error}"),
                 );
             }
         };
         if let Err(reason) = budget.entry() {
-            return Usage::partial(bytes, reason);
+            return Inspection::partial(bytes, reason);
         }
         let name = entry.file_name();
         if selection.excludes(&name) {
@@ -515,20 +684,44 @@ fn inspect_open(file: File, selection: Selection, budget: &mut InspectionBudget)
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) => {
-                return Usage::partial(
+                return Inspection::partial(
                     bytes,
                     format!("entry changed or cannot be inspected: {error}"),
                 );
             }
         };
+        if let Err(reason) = measure.observe(&metadata, budget, &mut bytes) {
+            return Inspection::partial(bytes, reason);
+        }
         if metadata.is_dir() {
             if directories.len() >= MAX_DIRECTORY_DEPTH {
-                return Usage::partial(bytes, "inspection directory-depth limit reached");
+                return Inspection::partial(bytes, "inspection directory-depth limit reached");
             }
             match open_directory(&path).and_then(Directory::new) {
-                Ok(directory) => directories.push(directory),
+                Ok(directory) => {
+                    if matches!(measure, ByteMeasure::Allocated(_)) {
+                        match directory.file.metadata() {
+                            Ok(opened)
+                                if (opened.dev(), opened.ino())
+                                    == (metadata.dev(), metadata.ino()) => {}
+                            Ok(_) => {
+                                return Inspection::partial(
+                                    bytes,
+                                    "directory changed during allocation inspection",
+                                );
+                            }
+                            Err(error) => {
+                                return Inspection::partial(
+                                    bytes,
+                                    format!("opened directory cannot be inspected: {error}"),
+                                );
+                            }
+                        }
+                    }
+                    directories.push(directory);
+                }
                 Err(error) => {
-                    return Usage::partial(
+                    return Inspection::partial(
                         bytes,
                         format!(
                             "directory changed or cannot be opened without following symlinks: {error}"
@@ -536,20 +729,11 @@ fn inspect_open(file: File, selection: Selection, budget: &mut InspectionBudget)
                     );
                 }
             }
-        } else if metadata.is_file() {
-            let observed = metadata.len().min(MAX_INSPECTION_BYTES - budget.bytes);
-            bytes += observed;
-            budget.bytes += observed;
-            if budget.bytes >= MAX_INSPECTION_BYTES {
-                return Usage::partial(
-                    bytes,
-                    "inspection logical-byte limit reached (1 TiB + 1); bytes are a lower bound",
-                );
-            }
         }
-        // Symlink targets and special files have no regular-file logical bytes.
+        // Logical mode ignores symlinks/special files; allocation mode records
+        // their own metadata blocks without opening them or following targets.
     }
-    Usage::observed(bytes, true)
+    Inspection::observed(bytes)
 }
 fn git_reference(source: &Path, budget: &mut InspectionBudget) -> Usage {
     let source = match open_root(source, budget) {
@@ -694,6 +878,62 @@ mod tests {
         );
         assert_eq!(usage.logical_bytes, Some(0));
         assert!(!usage.complete);
+    }
+    #[test]
+    fn allocated_deadline_and_byte_limits_report_incomplete_evidence() {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("file"), vec![1u8; 8192]).unwrap();
+        let mut budget = InspectionBudget::new(&config(temp.path()));
+        budget.started = Instant::now() - INSPECTION_TIME;
+        let usage = allocated_from_open(open_directory(temp.path()).unwrap(), &mut budget);
+        assert_eq!(usage.allocated_bytes, None);
+        assert!(!usage.complete);
+        assert!(usage.reason.unwrap().contains("time limit"));
+
+        let mut budget = InspectionBudget::new(&config(temp.path()));
+        budget.bytes = MAX_INSPECTION_BYTES - 1;
+        let usage = allocated_from_open(open_directory(temp.path()).unwrap(), &mut budget);
+        assert_eq!(usage.allocated_bytes, Some(1));
+        assert!(!usage.complete);
+        assert!(usage.reason.unwrap().contains("allocated-byte limit"));
+    }
+    #[test]
+    fn allocated_directory_fd_survives_root_path_replacement() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let file = root.join("file");
+        fs::write(&file, vec![1u8; 8192]).unwrap();
+        let expected = fs::metadata(&root).unwrap().blocks() * 512
+            + fs::metadata(&file).unwrap().blocks() * 512;
+        let anchored = open_inventory_root(&root).unwrap();
+        fs::rename(&root, temp.path().join("retained")).unwrap();
+        std::os::unix::fs::symlink("/", &root).unwrap();
+        let usage = measure_allocated_directory(&anchored, &config(temp.path()));
+        assert!(usage.complete);
+        assert_eq!(usage.allocated_bytes, Some(expected));
+        assert!(
+            measure_allocated_workspace(&root, &config(temp.path()))
+                .allocated_bytes
+                .is_none()
+        );
+    }
+    #[test]
+    fn allocated_directory_depth_limit_is_partial() {
+        let temp = TempDir::new().unwrap();
+        let mut directory = temp.path().to_path_buf();
+        for _ in 0..=MAX_DIRECTORY_DEPTH {
+            directory.push("d");
+            fs::create_dir(&directory).unwrap();
+        }
+        // Isolate the depth limit from scheduler contention in the parallel
+        // suite; the deadline is independently tested with an expired budget.
+        let mut budget = InspectionBudget::new(&config(temp.path()));
+        budget.started += Duration::from_secs(30);
+        let usage = allocated_from_open(open_directory(temp.path()).unwrap(), &mut budget);
+        assert!(!usage.complete);
+        assert!(usage.allocated_bytes.is_some());
+        assert!(usage.reason.unwrap().contains("directory-depth limit"));
     }
     #[test]
     fn empty_existing_directory_is_known_zero_and_missing_estimate_is_unknown() {
