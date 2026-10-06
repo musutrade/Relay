@@ -24,6 +24,8 @@ pub struct Continuation {
     pub predecessor_generation: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_only: Option<crate::workflow::ReviewContinuation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_adoption: Option<crate::workflow::PinnedReviewAdoption>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -400,6 +402,7 @@ pub(crate) fn continuation_under_lease(
         predecessor_task_id: task.id,
         predecessor_generation: task.generation,
         review_only: None,
+        operator_adoption: None,
     })
 }
 pub(crate) fn consume_fresh_role_epoch(path: &Path, reviewer: bool) -> io::Result<()> {

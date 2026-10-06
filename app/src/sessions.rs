@@ -216,6 +216,25 @@ impl Session {
         attempt: u64,
         epoch: Option<&str>,
     ) -> io::Result<()> {
+        Self::verify_reviewer_checkpoint(workspace, cwd, profile, attempt, epoch, false)
+    }
+    pub(crate) fn verify_reviewer_adoption(
+        workspace: &Path,
+        cwd: &Path,
+        profile: &NativeProfile,
+        attempt: u64,
+        epoch: Option<&str>,
+    ) -> io::Result<()> {
+        Self::verify_reviewer_checkpoint(workspace, cwd, profile, attempt, epoch, true)
+    }
+    fn verify_reviewer_checkpoint(
+        workspace: &Path,
+        cwd: &Path,
+        profile: &NativeProfile,
+        attempt: u64,
+        epoch: Option<&str>,
+        adoption: bool,
+    ) -> io::Result<()> {
         let root = workspace.join("sessions");
         let path = session_path(&root, "reviewer", epoch)?;
         if !fs::symlink_metadata(&root)?.is_dir() || root.canonicalize()? != root {
@@ -246,6 +265,7 @@ impl Session {
             || record.cwd != cwd.canonicalize()?
             || record.profile_binding != binding(profile)?
             || (!record.ready && record.attempt >= attempt)
+            || (adoption && (!record.ready || record.attempt.checked_add(1) != Some(attempt)))
         {
             return Err(io::Error::other(
                 "reviewer session binding changed or prior turn is not confirmed complete",

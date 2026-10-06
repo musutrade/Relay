@@ -89,6 +89,16 @@ pub struct ReviewContinuationRequest {
     pub review_focus: Option<String>,
 }
 
+/// Local operator acceptance of one complete, previously inspected response.
+/// This is not a new model run or automatic reuse of test evidence.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewAdoptionRequest {
+    pub key: String,
+    pub confirm_stopped_and_reconciled: bool,
+    pub adoption: workflow::ReviewAdoption,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplacementChallengeRequest {
@@ -357,7 +367,7 @@ impl Application {
     /// One explicit successor per predecessor. Reservation precedes core submission,
     /// and its stable key/payload make a crash between the two operations retryable.
     pub fn retry(&self, id: i64, input: RetryRequest) -> Result<Task> {
-        self.continue_task(id, input, None)
+        self.continue_task(id, input, None, None)
     }
     /// Explicit operator action: preserve the candidate, revalidate host tests once,
     /// and resume only the compatible reviewer. No developer or repair phase runs.
@@ -376,6 +386,22 @@ impl Application {
                 confirm_stopped_and_reconciled: input.confirm_stopped_and_reconciled,
             },
             Some(input.review_focus),
+            None,
+        )
+    }
+    pub fn adopt_review(&self, id: i64, input: ReviewAdoptionRequest) -> Result<Task> {
+        input.adoption.validate().map_err(Error::Invalid)?;
+        self.continue_task(
+            id,
+            RetryRequest {
+                replacement: None,
+                permission_challenge: None,
+                workspace_quota_bytes: None,
+                key: input.key,
+                confirm_stopped_and_reconciled: input.confirm_stopped_and_reconciled,
+            },
+            None,
+            Some(input.adoption),
         )
     }
     fn continue_task(
@@ -383,6 +409,7 @@ impl Application {
         id: i64,
         input: RetryRequest,
         review_focus: Option<Option<String>>,
+        adoption: Option<workflow::ReviewAdoption>,
     ) -> Result<Task> {
         if !input.confirm_stopped_and_reconciled {
             return Err(Error::Invalid("confirm inspection of the stopped run and its possible side effects before continuing".into()));
@@ -402,6 +429,30 @@ impl Application {
             )
             .optional()?;
         let (key, payload) = if let Some(reservation) = reservation {
+            // An adoption retry must not silently accept a different response,
+            // candidate, or an earlier reservation for a different action.
+            let reserved: Job =
+                serde_json::from_str(&reservation.1).map_err(|e| Error::Invalid(e.to_string()))?;
+            if adoption.is_none()
+                && reserved
+                    .continuation
+                    .as_ref()
+                    .is_some_and(|c| c.operator_adoption.is_some())
+            {
+                return Err(Error::Invalid("an operator-adoption reservation must be resumed with the same local adopt-review request".into()));
+            }
+            if let Some(request) = &adoption
+                && reserved
+                    .continuation
+                    .as_ref()
+                    .and_then(|c| c.operator_adoption.as_ref())
+                    .map(|pinned| &pinned.request)
+                    != Some(request)
+            {
+                return Err(Error::Invalid(
+                    "predecessor already has a different continuation reservation".into(),
+                ));
+            }
             reservation
         } else {
             if predecessor.state != relay::State::Finished {
@@ -528,11 +579,23 @@ impl Application {
                     .expect("continuation recorded")
                     .review_only = Some(review);
             }
+            if let Some(request) = adoption {
+                let pinned =
+                    workflow::pin_review_adoption(&result, request).map_err(Error::Invalid)?;
+                if job.workflow.is_none() {
+                    return Err(Error::Invalid("review adoption requires a workflow".into()));
+                }
+                job.continuation
+                    .as_mut()
+                    .expect("continuation recorded")
+                    .operator_adoption = Some(pinned);
+            }
+
             if input.replacement.is_none()
                 && job
                     .continuation
                     .as_ref()
-                    .is_some_and(|c| c.review_only.is_none())
+                    .is_some_and(|c| c.review_only.is_none() && c.operator_adoption.is_none())
                 && replacement::requires_stage_retry(&job)
             {
                 let stage =
@@ -884,22 +947,30 @@ impl Application {
             blocked_reason = Some(format!("continuation already created as task #{successor}"));
         } else if let Some((key, payload)) = reservation {
             if let Ok(reserved) = serde_json::from_str::<Job>(&payload) {
-                let review = reserved
+                if reserved
                     .continuation
                     .as_ref()
-                    .and_then(|continuation| continuation.review_only.as_ref());
-                let action = if review.is_some() {
-                    "continue_review"
+                    .is_some_and(|c| c.operator_adoption.is_some())
+                {
+                    blocked_reason = Some("operator review adoption is reserved; resume with the same local adopt-review request after inspecting the complete response and accepting prior host tests".into());
                 } else {
-                    "retry"
-                };
-                reserved_request = json!({"action_id":action,"key":key,"workspace_quota_bytes":reserved.continuation.as_ref().and_then(|c| c.quota_increase.as_ref()).map(|q|q.new_bytes),"revalidate_tests":review.is_some(),"review_focus":review.and_then(|review|review.review_focus.as_ref())});
-                if let Some(proof) = replacement::current(&reserved) {
-                    reserved_request["replacement"] =
-                        serde_json::to_value(selection::role(&reserved, proof.role.reviewer()))
-                            .expect("role serializable");
+                    let review = reserved
+                        .continuation
+                        .as_ref()
+                        .and_then(|continuation| continuation.review_only.as_ref());
+                    let action = if review.is_some() {
+                        "continue_review"
+                    } else {
+                        "retry"
+                    };
+                    reserved_request = json!({"action_id":action,"key":key,"workspace_quota_bytes":reserved.continuation.as_ref().and_then(|c| c.quota_increase.as_ref()).map(|q|q.new_bytes),"revalidate_tests":review.is_some(),"review_focus":review.and_then(|review|review.review_focus.as_ref())});
+                    if let Some(proof) = replacement::current(&reserved) {
+                        reserved_request["replacement"] =
+                            serde_json::to_value(selection::role(&reserved, proof.role.reviewer()))
+                                .expect("role serializable");
+                    }
+                    actions.push(json!({"allowed":true,"ordinary_allowed":true,"id":action,"quota_increase_allowed":false,"quota_increase_required":false,"min_quota_bytes":null,"max_quota_bytes":self.config.workspace_byte_limit(),"requires_test_revalidation":review.is_some()}));
                 }
-                actions.push(json!({"allowed":true,"ordinary_allowed":true,"id":action,"quota_increase_allowed":false,"quota_increase_required":false,"min_quota_bytes":null,"max_quota_bytes":self.config.workspace_byte_limit(),"requires_test_revalidation":review.is_some()}));
             } else {
                 blocked_reason = Some("reserved continuation payload cannot be verified".into());
             }

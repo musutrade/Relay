@@ -374,6 +374,12 @@ impl RunResult {
                 }
             }
             if !reduced {
+                reduced = value
+                    .workflow
+                    .as_mut()
+                    .is_some_and(WorkflowResult::shrink_review_evidence);
+            }
+            if !reduced {
                 value.workspace = None;
                 value.error = Some("result metadata exceeded the persistence budget".into());
                 value.failure = Some(Failure::new(

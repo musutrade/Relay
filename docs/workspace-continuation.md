@@ -75,6 +75,43 @@ MCP 使用 `relay_continue_review`，参数同上并增加 `id`。`review_focus`
 
 普通继续和仅继续审查共享每个前置任务的唯一预留。并发点击不同模式时首个成功预留决定操作；其他请求返回已有后继，不改变其模式或审查重点。刷新、双标签页和不确定请求重发不会产生第二个任务。
 
+## 显式采纳已检查的历史审查
+
+当原审查命令成功退出、同一候选的宿主测试成功，却只因输出格式失败时，可信本机操作员可显式采纳已完整检查的原始响应。此操作不运行开发、测试、模型或原生 CLI 探测，不修改原失败任务；它只创建一个采用原发布选择的后继，交给已有 worker 执行。它不是通用导入、自动审批或测试缓存。
+
+普通审查解析只接受完整 JSON 对象或整个响应仅有一个 `json` 围栏，最多 4096 UTF-8 字节。summary 不再有独立的 512 字节验收限制；阶段摘要仍显示最多 512 字节预览，末轮完整 review 保留在有界结果中。结果超过 16 KiB 时先缩减日志和阶段预览；仅当多轮历史本身仍超限，才缩减较早修复轮的诊断内容并标记 evidence_truncated，末轮结论和发布说明保留完整。approved 仍必须无 findings，changes_requested 仍必须有 findings，字段、重复键和精确候选 SHA 均严格检查。
+
+旧宿主记录只保存 reviewer 预览，不能验证完整终态来源，也不能证明任意测试的外部输入未变化。操作员必须检查真正的原始成功响应（包括所有外围说明、条件和结尾保留意见），确认没有被截断、失败或缺失终态，并明确决定接受前置任务的成功测试而不复验。缺少这些证据时请停下核对，不能将确认字段作为自动绕过措施。新结果会标记 `operator_attested`，不会声称重新运行模型或证明来源真实性。
+
+准备本机 JSON 请求文件（raw_response 必须是完整原文，不能只粘贴围栏中的获批部分；raw_sha256 是这段字符串解码后 UTF-8 原始字节的 SHA-256）：
+
+```json
+{
+  "key": "review-adoption-unique-key",
+  "confirm_stopped_and_reconciled": true,
+  "adoption": {
+    "candidate_sha": "<完整候选 SHA>",
+    "raw_response": "<完整已检查的原始响应>",
+    "raw_sha256": "<64 位小写十六进制 SHA-256>",
+    "confirm_complete_successful_response": true,
+    "confirm_entire_response_reviewed": true,
+    "accept_prior_host_tests": true
+  }
+}
+```
+
+```sh
+relay-app adopt-review config.json relay.db <失败任务ID> request.json
+```
+
+命令只入队并输出 JSON task；使用同一 DB/config 的正常服务 worker 执行。它不提供 HTTP/MCP/网页一键采纳按钮。请求文件上限 16 KiB，原文上限 4096 UTF-8 字节；不接受符号链接或非普通文件。外围说明只能通过此显式动作处理：恰好一个 JSON 围栏，不接受多个对象、多个围栏、错误 SHA、缺失字段、未知字段、重复键或 changes_requested。是否存在文字冲突由操作员检查整份原文，系统不会猜测“第一份 approved”就是最终判断。
+
+提交时将原文与其 SHA-256 放入不可变后继 payload 的 `continuation.operator_adoption.request`，并固定前置宿主结果摘要。原文前 512 UTF-8 字节必须与历史 reviewer 预览一致；这只是局部一致性检查，不是全文来源认证。执行时重新读取宿主结果、核对原绑定和原候选的 HEAD/index/原始文件；启用会话续接时还要求原 reviewer checkout、profile、候选 checkpoint 和上一 attempt 的 completed session 完整匹配。错误、截断、未完成、旧结果被替换、profile/现场漂移均拒绝，绝不自动重新开发或测试来补证。
+
+后继结果的 `workflow.operator_adoption` 包含手工采纳来源、前置任务号、原文/前置结果摘要及接受旧测试的标记。`tests` 保留的是已明确接受的历史宿主证据；`agent` 与新轮次 `reviewer` 为 null，避免伪造调用和重复计量。完整采纳 summary 不参与结果缩减；原文可从该任务 payload 读取，原失败记录始终不变。
+
+采纳与其他继续操作共享唯一后继。相同原文和确认的重试返回原后继；不同原文或先前已经预留另一模式则拒绝。采纳预留后的提交若中断，只能用同一本机 `adopt-review` 请求恢复；HTTP/MCP 普通继续与仅继续审查不能改用或恢复该采纳预留，网页会显示本机核对提示。worker 重启不会重复已结束任务；未知 claim 仍需既有人工停机恢复。原任务未要求发布则不发布；原任务要求发布且当前所有身份/候选检查通过、没有任何先前发布尝试时，才使用原配置的 exact-candidate draft PR adapter。存在 publication-attempt 标记一律拒绝重放；不会自动合并或发布新目标。
+
 ## 同一停止阶段更换角色
 
-新版宿主记录包含权威停止阶段时，可在上述入口附加单个 `replacement`，显式更换当前 developer 或 reviewer；未提供时仍按原配置和会话继续。它保留工作区与候选，失败修复不重置轮次；新角色创建独立 epoch，旧会话不覆盖。细节、权限 challenge 与不支持情况见[在已停止阶段显式更换 Agent](adapter-stage-continuation.md)。
+新版宿主记录包含权威停止阶段时，可在普通继续 `retry` 或仅继续审查 `continue-review` 入口附加单个 `replacement`，显式更换当前 developer 或 reviewer；未提供时仍按原配置和会话继续。它保留工作区与候选，失败修复不重置轮次；新角色创建独立 epoch，旧会话不覆盖。采纳历史审查不接受角色替换，而是继承原任务已经接纳的 reviewer 选择与会话 epoch。细节、权限 challenge 与不支持情况见[在已停止阶段显式更换 Agent](adapter-stage-continuation.md)。

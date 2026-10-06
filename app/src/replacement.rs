@@ -430,6 +430,7 @@ mod tests {
                 predecessor_task_id: index,
                 predecessor_generation: 1,
                 review_only: None,
+                operator_adoption: None,
             });
             freeze(&job, &mut next, &result, "host", false, &config).unwrap();
             verify_transition(&normalized(&job), &next, &result, "host", &config).unwrap();
