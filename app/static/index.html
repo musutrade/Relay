@@ -269,6 +269,7 @@
       const consequences = mode?.id === 'codex_native_sandboxed_review' ? '我确认本次审查允许在 Codex 本地只读沙箱中执行命令，原生审批设为 never。原生 hooks、MCP、插件和远程工具不受此本地沙箱约束，仅可使用我信任的启动配置和集成。此模式不等同于严格无执行审查。'
         : mode?.id === 'codex_full_access' ? '我确认 Full access 将扩大文件系统访问和网络访问（expanded filesystem AND network access），且没有原生批准提示（no native approval prompts）。'
         : mode?.id === 'claude_bypass_permissions' ? '我确认绕过原生权限检查，并扩大此进程的文件系统和网络访问（expanded filesystem AND network access）。'
+        : mode?.id === 'codex_auto_review' ? '我确认使用 Codex 原生 Auto-review；它可自动批准工作区之外的文件、网络或工具权限请求，不是绝对只读或禁止网络。审批模型由 Codex 选择，与开发或代码审查模型分开；托管策略仍生效。'
         : mode?.id === 'claude_auto' ? '我确认使用 Claude 原生分类器 auto；它不是 bypass，账户、模型或托管策略可能拒绝或回退，实际可用性仍未知。'
         : '我确认本次开发者原生权限模式变更；原生策略仍决定允许的访问。';
       return consequences + (mode?.confirmation_text ? ' ' + mode.confirmation_text.slice(0, 600) : '');
@@ -328,7 +329,7 @@
         if (state.pending && choice.native_permission && !Array.from(permissions.children).some(option => option.value === choice.native_permission)) { const option = catalogNode('option', choice.native_permission + '（原提交）'); option.value = choice.native_permission; permissions.append(option); }
         permissions.value = choice.native_permission || '';
         const mode = roleMode(role), confirmation = mode?.requires_confirmation === true || Boolean(state.pending && choice.confirm_permission_expansion);
-        $(role + '-permission-note').textContent = role === 'reviewer' ? reviewerContractText(profile) : mode?.id === 'claude_auto' ? 'Claude auto 是原生分类器，不是 bypass；可能因账户、模型或策略不满足而拒绝或回退。执行证据将分别呈现请求和观测' : '宿主授权与原生能力分别判断；未知不保证 CLI 支持、隔离或实际执行约束';
+        $(role + '-permission-note').textContent = role === 'reviewer' ? reviewerContractText(profile) : mode?.id === 'codex_auto_review' ? 'Codex 原生 Auto-review：workspace-write + on-request，可能自动批准越界请求。不是绝对只读；审批模型由 Codex 选择，可用性需运行时回传验证' : mode?.id === 'claude_auto' ? 'Claude auto 是原生分类器，不是 bypass；可能因账户、模型或策略不满足而拒绝或回退。执行证据将分别呈现请求和观测' : '宿主授权与原生能力分别判断；未知不保证 CLI 支持、隔离或实际执行约束';
         $(role + '-confirm-field').hidden = !confirmation;
         $(role + '-confirm-text').textContent = permissionRisk(mode) + (permissionState.text ? ' 服务端确认：' + permissionState.text.slice(0, 1000) : ''); $(role + '-confirm').checked = choice.confirm_permission_expansion === true;
         $(role + '-challenge').disabled = locked || permissionState.loading;
@@ -411,13 +412,15 @@
       for (const round of rounds) for (const [role, label] of [['developer', '开发者'], ['reviewer', '审查者']]) if (isRecord(round?.[role]?.selection)) stages.push(['轮次 ' + (Number.isSafeInteger(round.round) ? round.round : '未知') + ' · ' + label, round[role].selection]);
       for (const [label, evidence] of stages) {
         const section = catalogNode('section', undefined, 'usage-stage'), requested = evidence.requested, settings = evidence.session_settings, observed = evidence.observed, verification = evidence.verification;
-        section.append(catalogNode('h4', label), catalogNode('p', '请求：配置 ' + selectionText(requested?.profile) + '；适配器 ' + selectionText(requested?.provider) + '；模型 ' + selectionText(requested?.model) + '；effort ' + selectionText(requested?.effort) + '；模式 ' + selectionText(requested?.native_permission) + '；模型来源 ' + selectionText(requested?.model_source)));
-        section.append(catalogNode('p', '服务端解析的会话设置（不是每回合证明）：模型 ' + selectionText(settings?.model) + '；effort ' + selectionText(settings?.effort) + '；approval_policy ' + selectionText(settings?.approval_policy) + '；sandbox ' + selectionText(settings?.sandbox) + '；permission_mode ' + selectionText(settings?.permission_mode) + '；来源 ' + selectionText(settings?.source)));
+        section.append(catalogNode('h4', label), catalogNode('p', '请求：配置 ' + selectionText(requested?.profile) + '；适配器 ' + selectionText(requested?.provider) + '；模型 ' + selectionText(requested?.model) + '；effort ' + selectionText(requested?.effort) + '；模式 ' + selectionText(requested?.native_permission) + '；审批路由 ' + selectionText(requested?.approvals_reviewer) + '；模型来源 ' + selectionText(requested?.model_source)));
+        section.append(catalogNode('p', '服务端解析的会话设置（不是每回合证明）：模型 ' + selectionText(settings?.model) + '；effort ' + selectionText(settings?.effort) + '；approval_policy ' + selectionText(settings?.approval_policy) + '；approvals_reviewer ' + selectionText(settings?.approvals_reviewer) + '；cwd ' + selectionText(settings?.cwd) + '；sandbox ' + selectionText(settings?.sandbox) + '；permission_mode ' + selectionText(settings?.permission_mode) + '；来源 ' + selectionText(settings?.source)));
         section.append(catalogNode('p', '实际消息 / reroute 观测：模型 ' + selectionText(observed?.model) + '；来源 ' + selectionText(observed?.source)));
         const reroutes = Array.isArray(observed?.reroutes) ? observed.reroutes : [];
         for (const reroute of reroutes.slice(0, 8)) section.append(catalogNode('p', 'Reroute：' + selectionText(reroute?.from_model) + ' → ' + selectionText(reroute?.to_model) + '；原因 ' + selectionText(reroute?.reason) + '；thread ' + selectionText(reroute?.thread_id) + '；turn ' + selectionText(reroute?.turn_id)));
+        const approvals = Array.isArray(observed?.native_approval_reviews) ? observed.native_approval_reviews : [];
+        for (const review of approvals.slice(0, 8)) section.append(catalogNode('p', '原生审批观测（不证明操作已执行）：' + selectionText(review?.status) + '；动作类型 ' + selectionText(review?.action_type) + '；原因 ' + selectionText(review?.rationale) + '；review ' + selectionText(review?.review_id) + '；来源 ' + selectionText(review?.source)));
         section.append(catalogNode('p', '验证状态：模型 ' + selectionText(verification?.model) + '；effort ' + selectionText(verification?.effort) + '；权限 ' + selectionText(verification?.permission)));
-        if (evidence.truncated === true || reroutes.length > 8) section.append(catalogNode('p', '证据已截断；未显示部分不能据此判断'));
+        if (evidence.truncated === true || reroutes.length > 8 || approvals.length > 8) section.append(catalogNode('p', '证据已截断；未显示部分不能据此判断'));
         box.append(section);
       }
       if (task && jobFor(task).continuation?.replacement) {
@@ -616,7 +619,7 @@
       }
       if (pending && choice.native_permission && !Array.from($('replacement-permission').children).some(option => option.value === choice.native_permission)) { const option = catalogNode('option', choice.native_permission + '（已冻结）'); option.value = choice.native_permission; $('replacement-permission').append(option); }
       $('replacement-permission').value = choice.native_permission || '';
-      $('replacement-permission-note').textContent = role === 'reviewer' ? reviewerContractText(profile) : choice.native_permission === 'claude_auto' ? 'Claude auto 是原生分类器，不是 bypass；账户、模型或策略可能拒绝或回退' : '宿主允许与原生能力分别判断；未知不保证隔离或生效';
+      $('replacement-permission-note').textContent = role === 'reviewer' ? reviewerContractText(profile) : choice.native_permission === 'codex_auto_review' ? 'Codex 原生 Auto-review 可能自动批准文件、网络或工具越界请求；不是绝对只读，审批模型由 Codex 选择' : choice.native_permission === 'claude_auto' ? 'Claude auto 是原生分类器，不是 bypass；账户、模型或策略可能拒绝或回退' : '宿主允许与原生能力分别判断；未知不保证隔离或生效';
       const mode = pending ? null : replacementMode(), confirmation = Boolean(pending?.body.replacement?.confirm_permission_expansion || mode?.requires_confirmation);
       $('replacement-confirm-field').hidden = !confirmation; $('replacement-confirm').checked = choice.confirm_permission_expansion === true;
       $('replacement-confirm').disabled = locked || !validReplacementChallenge(); $('replacement-challenge').disabled = locked || replacementState.loading;

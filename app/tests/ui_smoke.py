@@ -873,7 +873,7 @@ with sync_playwright() as p:
     def native_profile(name, provider='claude_cli'):
         return {'name':name,'provider':provider,'model':None,'effort':None,'native_permission':None,
             'reviewer_supported':provider=='claude_cli','permission_modes':
-                [permission_mode('codex_workspace_write'),permission_mode('codex_full_access')] if provider=='codex_app_server'
+                [permission_mode('codex_workspace_write'),permission_mode('codex_full_access'),permission_mode('codex_auto_review')] if provider=='codex_app_server'
                 else [permission_mode('claude_dont_ask'),permission_mode('claude_auto'),permission_mode('claude_bypass_permissions',False),permission_mode('claude_restricted')]}
     data['config']={'repositories':['relay-demo'],'agents':['codex','claude','other-review'],'tests':['unit'],
         'native_agents':[native_profile('codex','codex_app_server'),native_profile('claude'),native_profile('other-review')],
@@ -960,6 +960,17 @@ with sync_playwright() as p:
     page.locator('#requirements').fill('Risk confirmation fixture');count=len(submissions)
     page.locator('#submit-task').click();expect(page.locator('#form-message')).to_contain_text('风险确认');assert len(submissions)==count
     confirm_permission()
+    # Codex native auto approval is separate from full access and has fresh consent.
+    page.locator('#developer-permission').select_option('codex_auto_review')
+    expect(page.locator('#developer-confirm')).not_to_be_checked()
+    expect(page.locator('#developer-confirm')).to_be_disabled()
+    expect(page.locator('#developer-permission-note')).to_contain_text('可能自动批准越界请求')
+    expect(page.locator('#developer-confirm-text')).to_contain_text('审批模型由 Codex 选择')
+    page.locator('#submit-task').click();assert len(submissions)==count
+    confirm_permission()
+    page.locator('#submit-task').click();expect(page.locator('#form-message')).to_contain_text('已确认')
+    assert submissions[-1]['job']['role_selections']['developer']['native_permission']=='codex_auto_review'
+    assert submissions[-1]['job']['role_selections']['developer']['confirm_permission_expansion'] is True
     # A profile change drops confirmation, mode and model. Auto is a classifier, not bypass.
     page.locator('#agent').select_option('claude');expect(page.locator('#developer-confirm')).not_to_be_checked()
     expect(page.locator('#developer-permission')).to_have_value('')
@@ -982,6 +993,8 @@ with sync_playwright() as p:
     confirm_permission();page.locator('#developer-manual-model').fill('manual-unverified')
     expect(page.locator('#developer-confirm')).not_to_be_checked();expect(page.locator('#developer-confirm')).to_be_disabled()
     confirm_permission()
+    # The preceding successful Auto-review submission cleared the form.
+    page.locator('#requirements').fill('Preserve role retry after Auto-review submission')
     data['post']='401';page.locator('#submit-task').click();expect(page.locator('#auth-panel')).to_be_visible()
     original=json.loads(json.dumps(submissions[-1]));assert len(original['permission_challenge'])==64;assert original['job']['role_selections']['developer']['model']=={'value':'manual-unverified','source':'manual'}
     assert 'effort' not in original['job']['role_selections']['developer']
@@ -993,12 +1006,14 @@ with sync_playwright() as p:
     page.locator('#submit-task').click();expect(page.locator('#form-message')).to_contain_text('已确认');assert submissions[-1]==original
     # Missing observed evidence stays unknown even with server-resolved session values.
     evidence={'requested':{'profile':'<img src=x>','provider':'claude_cli','model':'requested-model'},
-        'session_settings':{'model':'session-only','source':'native session'},'observed':{'model':None,'reroutes':[{'from_model':'requested-model','to_model':'rerouted-model','reason':'<script>not HTML</script>','thread_id':'thread','turn_id':'turn'}]},
+        'session_settings':{'model':'session-only','source':'native session','approvals_reviewer':'auto_review'},'observed':{'model':None,'native_approval_reviews':[{'status':'denied','action_type':'networkAccess','rationale':'<img src=x> blocked','review_id':'native-review-1','source':'codex.item/autoApprovalReview/completed'}],'reroutes':[{'from_model':'requested-model','to_model':'rerouted-model','reason':'<script>not HTML</script>','thread_id':'thread','turn_id':'turn'}]},
         'verification':{'model':'unknown','effort':'unknown','permission':'unknown'},'truncated':True}
     role_task=data['tasks'][-1];role_task['state']='finished';role_task['result']=json.dumps({'agent':{'provider':{'selection':evidence}},'workflow':{'rounds':[{'round':0,'reviewer':{'outcome':'failure','exit_code':1,'summary':'Serialized StageSummary','selection':{'requested':{'model':'review-request'}}}}]}},ensure_ascii=False)
     page.locator('#refresh').click();expect(page.locator('#selection-stages')).to_contain_text('实际消息 / reroute 观测：模型 未知')
     expect(page.locator('#selection-stages')).to_contain_text('不是每回合证明')
     expect(page.locator('#selection-stages')).to_contain_text('review-request')
+    expect(page.locator('#selection-stages')).to_contain_text('approvals_reviewer auto_review')
+    expect(page.locator('#selection-stages')).to_contain_text('原生审批观测（不证明操作已执行）：denied')
     expect(page.locator('#selection-stages')).to_contain_text('证据已截断')
     assert page.locator('#selection-stages img, #selection-stages script').count()==0
     for width in [1440,390,320]:

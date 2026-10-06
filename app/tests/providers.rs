@@ -290,6 +290,71 @@ fn native_modes_compile_exact_flags_and_keep_reviewer_contract_fixed() {
 }
 
 #[test]
+fn codex_auto_review_is_an_explicit_app_server_developer_only_mode() {
+    let mode = NativePermission::CodexAutoReview;
+    assert_eq!(
+        serde_json::to_value(mode).unwrap(),
+        json!("codex_auto_review")
+    );
+    assert_eq!(
+        serde_json::from_value::<NativePermission>(json!("codex_auto_review")).unwrap(),
+        mode
+    );
+    assert!(mode.requires_confirmation());
+    assert!(mode.compatible(ProviderKind::CodexAppServer, false));
+    for kind in [
+        ProviderKind::CodexCli,
+        ProviderKind::CodexAppServer,
+        ProviderKind::ClaudeCli,
+    ] {
+        assert!(!mode.compatible(kind, true));
+        let mut p = profile(kind);
+        p.native_permission = Some(mode);
+        if kind == ProviderKind::CodexAppServer {
+            p.validate().unwrap();
+            // The bounded app-server protocol supplies the per-thread policy.
+            assert_eq!(p.compile(false).unwrap().args, ["app-server"]);
+            assert!(p.compile(true).is_err());
+            p.native_permission = None;
+            p.allowed_permission_modes = vec![mode];
+            p.validate().unwrap();
+        } else {
+            assert!(!mode.compatible(kind, false));
+            assert!(p.validate().is_err());
+            assert!(p.compile(false).is_err());
+            p.native_permission = None;
+            p.allowed_permission_modes = vec![mode];
+            assert!(p.validate().is_err());
+        }
+    }
+}
+
+#[test]
+fn codex_auto_review_keeps_the_stable_app_server_version_gate() {
+    let mut p = profile(ProviderKind::CodexAppServer);
+    p.native_permission = Some(NativePermission::CodexAutoReview);
+    for version in ["codex-cli 0.159.9", "0.160.0-beta", "unrecognized"] {
+        assert!(
+            p.validate_probe(version, "codex app-server --help", false)
+                .is_err()
+        );
+    }
+    assert!(
+        p.validate_probe("0.160.0", "codex exec --help", false)
+            .is_err()
+    );
+    assert_eq!(
+        p.validate_probe("codex-cli 0.160.0", "codex app-server --help", false)
+            .unwrap(),
+        "0.160.0"
+    );
+    assert!(
+        p.validate_probe("0.160.0", "codex app-server --help", true)
+            .is_err()
+    );
+}
+
+#[test]
 fn explicit_mode_probes_require_compiled_flags_without_auto_fallback() {
     let mut p = profile(ProviderKind::CodexCli);
     p.native_permission = Some(NativePermission::CodexWorkspaceWrite);
