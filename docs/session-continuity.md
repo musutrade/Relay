@@ -14,11 +14,11 @@
 
 ## 两种适配器
 
-- `codex_app_server`：真实双向 stdio 协议，依次 initialize、initialized、thread/start 或显式 thread/resume、turn/start。每轮恢复同一 thread ID；线程和 turn ID 必须匹配，成功不能从日志片段推断。恢复请求使用 `excludeTurns:true`，避免回传完整历史。当前验证下限是 Codex 0.160.0，之后版本仍须满足协议，不锁死单一版本
+- 开发者的 `codex_app_server`：真实双向 stdio 协议，依次 initialize、initialized、thread/start 或显式 thread/resume、turn/start。开发者每轮恢复同一 thread ID；线程和 turn ID 必须匹配，成功不能从日志片段推断。恢复请求使用 `excludeTurns:true`，避免回传完整历史。当前验证下限是 Codex 0.160.0，之后版本仍须满足协议，不锁死单一版本
 - `claude_cli` + `session_continuity:true`：首轮由宿主生成 UUID 并传 `--session-id`，后续仅传 `--resume <精确 ID>`；不用全局最近会话 `--continue`。模型、effort、环境及预算仍来自可信 profile，审查每轮重新施加 `--restricted`、只读工具与空 MCP 配置
-- 旧 `codex_cli` 和未打开续接的 Claude 保留无会话模式，方便分阶段迁移。Codex 只读审查仍不支持，不会用 app-server 绕过限制
+- 旧 `codex_cli` 和未打开续接的 Claude 保留无会话模式，方便分阶段迁移。Codex 严格无执行审查仍不支持；独立 [原生沙箱审查档](native-sandboxed-review.md) 允许本地只读命令，但每次使用新 ephemeral 线程，不支持 provider 会话续接
 
-app-server 每轮有一个受监管进程。收到成功终态后，宿主结束并回收进程树，下一轮重新启动进程并恢复同一线程；测试期间不保留空闲进程。收到 approval、用户输入或动态工具请求时返回不支持并停止，不自动授权。每个 thread/turn 都设置原有 workspace-write 边界，网络保持关闭；不修改用户配置或凭据。自定义端点、认证、模型接受参数及服务端缓存收益，必须经单独授权的真实烟测确认，离线 fixture 不证明这些能力。
+app-server 每轮有一个受监管进程。收到成功终态后，宿主结束并回收进程树，开发者下一轮重新启动进程并恢复同一线程，fresh 原生 reviewer 每轮新建线程；测试期间不保留空闲进程。收到 approval、用户输入或动态工具请求时返回不支持并停止，不自动授权。每个 thread/turn 显式指定已选择的原生策略；默认开发者是 workspace-write，fresh 原生 reviewer 是本地 read-only / networkAccess false，原生集成不因此受到全局沙箱约束；不修改用户配置或凭据。自定义端点、认证、模型接受参数及服务端缓存收益，必须经单独授权的真实烟测确认，离线 fixture 不证明这些能力。
 
 Codex 冷恢复可在 `thread/resume` 响应后回放旧 turn 的 `thread/tokenUsage/updated`，即使设置了 `excludeTurns:true`。仅在恢复已确认且新 turn ID 尚未确定的窗口，适配器保留至多 32 条有界用量快照。用量不能确定 turn ID 或证明成功；跨线程通知、已确定 turn 后的错误 ID，以及旧 turn 的正文或终态仍失败关闭。对应上游测试见 [冷恢复用量回放](https://github.com/openai/codex/blob/main/codex-rs/app-server/tests/suite/v2/thread_resume.rs)。
 
@@ -32,7 +32,7 @@ Codex app-server 的 `usage` 旧字段继续保留 `tokenUsage.last`（最后一
 
 ## 工作区与绑定
 
-同一任务链的修复与显式继续沿用开发 checkout。启用续接的审查使用同一任务内固定 `reviewer-repository/`，只导入精确候选提交和本轮 diff，不复制开发者的 Git 元数据、未提交文件或会话。审查前后同时校验候选；任何候选改变都须重新测试和审查。仍然是可信本机进程管理，不是对恶意程序的 OS 沙箱。
+同一任务链的修复与显式继续沿用开发 checkout。启用续接的审查和 fresh 原生审查均使用同一任务内固定 `reviewer-repository/`，只导入精确候选提交和本轮 diff，不复制开发者的 Git 元数据、未提交文件或会话。审查前后同时校验候选；任何候选改变都须重新测试和审查。仍然是可信本机进程管理，不是对恶意程序的 OS 沙箱。
 
 宿主把开发、审查会话分别绑定到 role、规范化 cwd 和 profile 指纹。仅保存有界 ID 与元数据，不复制环境变量秘密；指纹用于防止意外串用配置，不是认证凭据。CLI 自己保存的历史仍受其原有本机存储策略管理。Relay 不读取或代管其登录材料。
 
@@ -50,4 +50,6 @@ Codex app-server 的 `usage` 旧字段继续保留 `tokenUsage.last`（最后一
 
 ## 显式更换角色的独立 epoch
 
-[阶段替换](adapter-stage-continuation.md)给每个改变的角色创建服务器所有的 `role_epochs`。仅 Codex app-server 或设置 `session_continuity:true` 的原生 profile 创建独立 `sessions/<role>-<epoch>.json` 与由 Relay 管理的新 provider thread/session ID；通用命令与其他无状态原生 profile 使用新的调用，没有 Relay 管理的 resume 历史。未改变的角色保留原 epoch，旧有状态记录继续使用原文件名。新 epoch 的会话记录本身也绑定 epoch，拒绝复制旧记录或另一个 epoch 的 ID。跨供应商与同供应商改模型都不复用旧会话 ID；有状态 profile 的后续普通 retry 只恢复已接受的新 epoch，不回退到 legacy 文件。旧 session 及任务结果原样保留。
+[阶段替换](adapter-stage-continuation.md)给每个改变的角色创建服务器所有的 `role_epochs`。仅会话型 Codex app-server（不含 fresh 原生审查档）或设置 `session_continuity:true` 的原生 profile 创建独立 `sessions/<role>-<epoch>.json` 与由 Relay 管理的新 provider thread/session ID；通用命令与其他无状态原生 profile 使用新的调用，没有 Relay 管理的 resume 历史。未改变的角色保留原 epoch，旧有状态记录继续使用原文件名。新 epoch 的会话记录本身也绑定 epoch，拒绝复制旧记录或另一个 epoch 的 ID。跨供应商与同供应商改模型都不复用旧会话 ID；有状态 profile 的后续普通 retry 只恢复已接受的新 epoch，不回退到 legacy 文件。旧 session 及任务结果原样保留。
+
+原生沙箱审查的独立 checkout 不依赖 provider 会话保留。修复/显式继续沿用已验证候选和工作区，每次产生新线程；不把旧线程 ID 当作可恢复记录。角色替换仍保留新的角色 epoch，且只允许相同 checkout 拓扑。

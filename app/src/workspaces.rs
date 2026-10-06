@@ -940,7 +940,7 @@ pub(crate) fn verify_review_candidate_checkpoint(
         .map_err(io::Error::other)?
         .ok_or_else(|| io::Error::other("review continuation has no configured reviewer"))?;
     let profile = &profile;
-    if crate::sessions::enabled(profile) {
+    if crate::sessions::reviewer_checkout(profile) {
         let repository = path.join("reviewer-repository");
         if read_marker(&path.join("reviewer-candidate.txt"))? != review.candidate_sha
             || git_head(&repository)? != review.candidate_sha

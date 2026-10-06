@@ -141,7 +141,7 @@
       const workflows = data.workflows === undefined ? [] : data.workflows;
       if (!Array.isArray(workflows) || !workflows.every(workflow => workflow && typeof workflow.name === 'string' && workflow.name.length && data.repositories.includes(workflow.repository) && data.agents.includes(workflow.developer) && data.agents.includes(workflow.reviewer) && data.tests.includes(workflow.test) && Number.isSafeInteger(workflow.max_repairs) && workflow.max_repairs >= 0) || new Set(workflows.map(workflow => workflow.name)).size !== workflows.length) throw new ApiError('服务端工作流配置格式不符合预期');
       const native_agents = data.native_agents === undefined ? [] : data.native_agents;
-      if (!Array.isArray(native_agents) || !native_agents.every(profile => isRecord(profile) && typeof profile.name === 'string' && data.agents.includes(profile.name) && typeof profile.provider === 'string' && (profile.allow_startup_discovery === undefined || typeof profile.allow_startup_discovery === 'boolean') && (profile.allow_startup_discovery !== true || profile.provider === 'claude_cli')) || new Set(native_agents.map(profile => profile.name)).size !== native_agents.length) throw new ApiError('服务端原生 Agent 配置格式不符合预期');
+      if (!Array.isArray(native_agents) || !native_agents.every(profile => isRecord(profile) && typeof profile.name === 'string' && data.agents.includes(profile.name) && typeof profile.provider === 'string' && (profile.allow_startup_discovery === undefined || typeof profile.allow_startup_discovery === 'boolean') && (profile.allow_startup_discovery !== true || profile.provider === 'claude_cli') && (profile.reviewer_contract === undefined || ['strict_no_execution', 'native_local_read_only', 'unsupported'].includes(profile.reviewer_contract))) || new Set(native_agents.map(profile => profile.name)).size !== native_agents.length) throw new ApiError('服务端原生 Agent 配置格式不符合预期');
       for (const workflow of workflows) for (const [key, pinned] of [['selectable_developers', 'developer'], ['selectable_reviewers', 'reviewer']]) {
         if (workflow[key] !== undefined && (!Array.isArray(workflow[key]) || !workflow[key].includes(workflow[pinned]) || !workflow[key].every(name => data.agents.includes(name)) || new Set(workflow[key]).size !== workflow[key].length)) throw new ApiError('角色允许列表格式不符合预期');
       }
@@ -229,7 +229,7 @@
       populateSelect('reviewer', roleNames('reviewer'), null); $('reviewer').value = workflow?.reviewer || '';
       for (const option of $('reviewer').children) {
         const profile = state.config?.native_agents.find(profile => profile.name === option.value);
-        if (profile?.reviewer_supported === false) { option.disabled = true; option.textContent += '（审查不支持）'; }
+        if (profile?.reviewer_supported === false || (Array.isArray(profile?.permission_modes) && reviewerContract(profile) === 'unsupported')) { option.disabled = true; option.textContent += '（审查不支持）'; }
       }
     }
     function freshRoleCatalog(role) { return freshProfileCatalog(roleProfile(role)); }
@@ -243,12 +243,31 @@
       return envelope.catalog.models.find(model => isRecord(model) && model.model === choice.value) || null;
     }
     function roleEfforts(role) { const efforts = roleCatalogModel(role)?.supported_efforts; return Array.isArray(efforts) ? efforts.filter(item => isRecord(item) && typeof item.effort === 'string').slice(0, 64) : []; }
-    function reviewerUnavailableReason(profile) { return profile?.provider === 'claude_cli' ? '此 Claude 配置的默认权限模式不符合 Relay 固定只读审查契约；不能在页面放宽或静默替换' : '此配置不支持审查。Codex reviewer 尚缺少单独的只读隔离技术证明；不会自动替换为其他适配器'; }
+    function reviewerContract(profile) {
+      if (profile?.reviewer_supported !== true) return 'unsupported';
+      if (profile.provider === 'claude_cli' && [undefined, 'strict_no_execution'].includes(profile.reviewer_contract) && (!profile.native_permission || profile.native_permission === 'claude_restricted')) return 'strict_no_execution';
+      const mode = profile.permission_modes?.find(mode => mode.id === 'codex_native_sandboxed_review');
+      return profile.provider === 'codex_app_server' && profile.reviewer_contract === 'native_local_read_only' && profile.native_permission === mode?.id && mode?.host_allowed === true && mode.availability !== 'unsupported' && mode.reviewer_only === true && mode.requires_confirmation === true ? 'native_local_read_only' : 'unsupported';
+    }
+    function reviewerUnavailableReason(profile) { return profile?.provider === 'claude_cli' ? '此 Claude 配置的默认权限模式不符合 Relay 严格无执行审查契约；不能在页面放宽或静默替换' : '此配置不支持审查。Codex 严格无执行审查仍缺少独立隔离技术证明；仅宿主明确允许并配置的 Codex app-server 原生本地只读审查可选，不会自动替换适配器或契约'; }
+    function reviewerContractText(profile) {
+      const contract = reviewerContract(profile);
+      return contract === 'native_local_read_only' ? 'Codex 原生审查（本地只读，允许命令）：独立 checkout 与全新独立会话，不恢复旧会话。允许在本地只读沙箱内执行命令，原生审批 never；hooks、MCP、插件和远程工具不受本地沙箱约束，只可使用可信启动配置和集成。此模式不等同于严格无执行审查'
+        : contract === 'strict_no_execution' ? 'Relay 严格无执行审查契约；不能切换为 Full access。claude_restricted 不是原生 --permission-mode 值'
+        : profile?.reviewer_supported === undefined && !Array.isArray(profile?.permission_modes) ? '沿用固定审查配置；旧服务未提供新的选择元数据' : reviewerUnavailableReason(profile);
+    }
+    function nativeModeLabel(mode) { return mode.id === 'codex_native_sandboxed_review' ? 'Codex 原生审查（本地只读，允许命令）' : mode.label.slice(0, 150); }
     function roleMode(role) { const profile = roleConfig(role); return profile?.permission_modes?.find(mode => mode.id === (roleState[role].native_permission || profile.native_permission)); }
     function modeAllowed(role, mode) { return allowedNativeMode(role, roleConfig(role), mode); }
-    function allowedNativeMode(role, profile, mode) { return mode.host_allowed && mode.availability !== 'unsupported' && (role === 'reviewer' ? profile?.reviewer_supported === true && mode.id === 'claude_restricted' : !mode.reviewer_only && mode.id !== 'claude_restricted'); }
+    function allowedNativeMode(role, profile, mode) {
+      if (!mode.host_allowed || mode.availability === 'unsupported') return false;
+      if (role !== 'reviewer') return !mode.reviewer_only && !['claude_restricted', 'codex_native_sandboxed_review'].includes(mode.id);
+      const contract = reviewerContract(profile);
+      return contract === 'strict_no_execution' && mode.id === 'claude_restricted' || contract === 'native_local_read_only' && mode.id === 'codex_native_sandboxed_review';
+    }
     function permissionRisk(mode) {
-      const consequences = mode?.id === 'codex_full_access' ? '我确认 Full access 将扩大文件系统访问和网络访问（expanded filesystem AND network access），且没有原生批准提示（no native approval prompts）。'
+      const consequences = mode?.id === 'codex_native_sandboxed_review' ? '我确认本次审查允许在 Codex 本地只读沙箱中执行命令，原生审批设为 never。原生 hooks、MCP、插件和远程工具不受此本地沙箱约束，仅可使用我信任的启动配置和集成。此模式不等同于严格无执行审查。'
+        : mode?.id === 'codex_full_access' ? '我确认 Full access 将扩大文件系统访问和网络访问（expanded filesystem AND network access），且没有原生批准提示（no native approval prompts）。'
         : mode?.id === 'claude_bypass_permissions' ? '我确认绕过原生权限检查，并扩大此进程的文件系统和网络访问（expanded filesystem AND network access）。'
         : mode?.id === 'claude_auto' ? '我确认使用 Claude 原生分类器 auto；它不是 bypass，账户、模型或托管策略可能拒绝或回退，实际可用性仍未知。'
         : '我确认本次开发者原生权限模式变更；原生策略仍决定允许的访问。';
@@ -268,7 +287,7 @@
         $(role + '-native-settings').hidden = !native && !pendingChoice;
         if (role === 'reviewer') {
           $('reviewer').disabled = locked || !Array.isArray(workflow?.selectable_reviewers);
-          $('reviewer-support').textContent = profile?.reviewer_supported === false ? reviewerUnavailableReason(profile) : profile?.reviewer_supported === true ? 'Relay 固定只读审查契约；不能切换为 Full access。claude_restricted 不是原生 --permission-mode 值' : '沿用固定审查配置；旧服务未提供新的选择元数据';
+          $('reviewer-support').textContent = reviewerContractText(profile);
         }
         for (const suffix of ['model-source', 'model', 'manual-model', 'effort', 'permission', 'confirm']) $(role + '-' + suffix).disabled = locked || !native;
         if (!visible) {
@@ -299,15 +318,17 @@
         if (state.pending && choice.effort && !efforts.some(item => item.effort === choice.effort)) { const option = catalogNode('option', choice.effort + '（原提交）'); option.value = choice.effort; $(role + '-effort').append(option); }
         $(role + '-effort').value = choice.effort || ''; $(role + '-effort').disabled = locked || !native || source !== 'catalog' || !model || !efforts.length;
         const permissions = $(role + '-permission'); populateSelect(role + '-permission', [], '沿用配置模式');
+        const inheritedMode = profile?.permission_modes?.find(mode => mode.id === profile.native_permission);
+        permissions.children[0].disabled = Boolean(profile?.native_permission && (!inheritedMode || !modeAllowed(role, inheritedMode)));
         const reasons = $(role + '-mode-reasons'); reasons.replaceChildren();
         for (const mode of (profile?.permission_modes || []).slice(0, 16)) {
-          const option = catalogNode('option', mode.label.slice(0, 150) + (modeAllowed(role, mode) ? ' · 原生可用性未知' : ' · 不可选')); option.value = mode.id; option.disabled = !modeAllowed(role, mode); permissions.append(option);
-          reasons.append(catalogNode('li', mode.label.slice(0, 150) + '：宿主' + (mode.host_allowed ? '允许' : '未允许') + '；原生' + (mode.availability === 'unsupported' ? '不可用' : '可用性未知') + '。' + mode.reason.slice(0, 600)));
+          const option = catalogNode('option', nativeModeLabel(mode) + (modeAllowed(role, mode) ? ' · 原生可用性未知' : ' · 不可选')); option.value = mode.id; option.disabled = !modeAllowed(role, mode); permissions.append(option);
+          reasons.append(catalogNode('li', nativeModeLabel(mode) + '：宿主' + (mode.host_allowed ? '允许' : '未允许') + '；原生' + (mode.availability === 'unsupported' ? '不可用' : '可用性未知') + '。' + mode.reason.slice(0, 600)));
         }
         if (state.pending && choice.native_permission && !Array.from(permissions.children).some(option => option.value === choice.native_permission)) { const option = catalogNode('option', choice.native_permission + '（原提交）'); option.value = choice.native_permission; permissions.append(option); }
         permissions.value = choice.native_permission || '';
         const mode = roleMode(role), confirmation = mode?.requires_confirmation === true || Boolean(state.pending && choice.confirm_permission_expansion);
-        $(role + '-permission-note').textContent = role === 'reviewer' ? '只读审查契约不能由本次选择放宽；不会把 claude_restricted 作为原生 permission-mode 参数' : mode?.id === 'claude_auto' ? 'Claude auto 是原生分类器，不是 bypass；可能因账户、模型或策略不满足而拒绝或回退。执行证据将分别呈现请求和观测' : '宿主授权与原生能力分别判断；未知不保证 CLI 支持、隔离或实际执行约束';
+        $(role + '-permission-note').textContent = role === 'reviewer' ? reviewerContractText(profile) : mode?.id === 'claude_auto' ? 'Claude auto 是原生分类器，不是 bypass；可能因账户、模型或策略不满足而拒绝或回退。执行证据将分别呈现请求和观测' : '宿主授权与原生能力分别判断；未知不保证 CLI 支持、隔离或实际执行约束';
         $(role + '-confirm-field').hidden = !confirmation;
         $(role + '-confirm-text').textContent = permissionRisk(mode) + (permissionState.text ? ' 服务端确认：' + permissionState.text.slice(0, 1000) : ''); $(role + '-confirm').checked = choice.confirm_permission_expansion === true;
         $(role + '-challenge').disabled = locked || permissionState.loading;
@@ -344,6 +365,10 @@
         const response = await api('/api/permission-challenge', { method: 'POST', body: { job }, signal: controller.signal });
         if (session !== state.session || version !== permissionState.version || key !== permissionIntentKey()) return;
         if (!isRecord(response) || typeof response.challenge !== 'string' || !response.challenge || response.challenge.length > 1024 || !Number.isSafeInteger(response.expires_at_unix_ms) || response.expires_at_unix_ms <= Date.now() || typeof response.confirmation_text !== 'string' || !isRecord(response.scope) || !isRecord(response.scope.developer)) throw new ApiError('权限范围凭证格式不符合预期');
+        if (reviewerContract(roleConfig('reviewer')) === 'native_local_read_only') {
+          const scope = response.scope.reviewer, profile = roleConfig('reviewer'), choice = roleState.reviewer;
+          if (response.scope.repository !== job.repository || response.scope.workflow !== job.workflow || !isRecord(scope) || scope.profile !== roleProfile('reviewer') || scope.provider !== 'codex_app_server' || scope.native_permission !== 'codex_native_sandboxed_review' || scope.model !== (choice.model?.value ?? profile.model) || scope.effort !== (choice.effort || profile.effort)) throw new ApiError('Codex 原生审查范围与本次角色选择不匹配');
+        }
         permissionState.challenge = response.challenge; permissionState.expires = response.expires_at_unix_ms; permissionState.key = key; permissionState.text = response.confirmation_text; permissionState.scope = response.scope;
       } catch (error) {
         if (session !== state.session || version !== permissionState.version || isAborted(error)) return;
@@ -365,13 +390,13 @@
         if (role === 'reviewer' && !selectedWorkflow()) continue;
         const label = role === 'developer' ? '开发者' : '审查者', profile = roleConfig(role), choice = roleState[role];
         if (!roleNames(role).includes(roleProfile(role))) return label + '必须使用当前工作流允许的配置';
-        if (role === 'reviewer' && profile?.reviewer_supported === false) return reviewerUnavailableReason(profile);
+        if (role === 'reviewer' && (profile?.reviewer_supported === false || (Array.isArray(profile?.permission_modes) && reviewerContract(profile) === 'unsupported'))) return reviewerUnavailableReason(profile);
         if ((choice.source || choice.model?.source) && !choice.model?.value) return label + '请选择模型，或改回沿用配置';
         if (choice.model && (!choice.model.value.trim() || choice.model.value.startsWith('-') || /[\u0000-\u001f\u007f]/.test(choice.model.value) || new TextEncoder().encode(choice.model.value).length > 256)) return label + '模型 ID 应为 1–256 UTF-8 字节，不能含控制字符或以 - 开头';
         if (choice.model?.source === 'catalog' && !roleCatalogModel(role)) return label + '目录已变化或陈旧，请重新选择模型';
         if (choice.effort && !roleEfforts(role).some(item => item.effort === choice.effort)) return label + ' effort 必须来自当前目录模型已报告的支持列表';
         const mode = roleMode(role);
-        if (choice.native_permission && (!mode || !modeAllowed(role, mode))) return label + '原生模式不受宿主允许、不可用或不符合只读角色';
+        if ((choice.native_permission || profile?.native_permission) && (!mode || !modeAllowed(role, mode))) return label + '原生模式不受宿主允许、不可用或不符合只读角色';
         if (requireConfirmation && mode?.requires_confirmation && (!validPermissionChallenge() || choice.confirm_permission_expansion !== true)) return label + '请先读取权限范围，再勾选原生权限变更的明确风险确认';
       }
       return '';
@@ -520,14 +545,14 @@
       if (capability?.allowed !== true || !capability.stopped_stage) return capability?.reason || '缺少宿主同阶段证明，不能替换或自动重启';
       const choice = replacementState.choice, profile = replacementProfile(), role = replacementRole();
       if (!capability.profiles.includes(choice.profile) || !state.config?.agents.includes(choice.profile)) return '替换必须使用宿主为此阶段允许的配置';
-      if (role === 'reviewer' && profile?.reviewer_supported !== true) return reviewerUnavailableReason(profile);
+      if (role === 'reviewer' && reviewerContract(profile) === 'unsupported') return reviewerUnavailableReason(profile);
       if (!profile && (choice.model || choice.effort || choice.native_permission)) return '通用命令配置只支持选择 profile，不支持原生模型、effort 或权限覆盖';
       if ((choice.source || choice.model?.source) && !choice.model?.value) return '请选择替换模型，或改回沿用配置';
       if (choice.model && (!choice.model.value.trim() || choice.model.value.startsWith('-') || /[\u0000-\u001f\u007f]/.test(choice.model.value) || new TextEncoder().encode(choice.model.value).length > 256)) return '替换模型 ID 应为 1–256 UTF-8 字节，不能含控制字符或以 - 开头';
       if (choice.model?.source === 'catalog' && !replacementCatalogModel()) return '替换目录已变化或陈旧，请重新选择模型';
       if (choice.effort && !replacementEfforts().some(item => item.effort === choice.effort)) return '替换 effort 必须来自当前目录模型已报告的支持列表';
       const mode = replacementMode();
-      if (choice.native_permission && (!mode || !allowedNativeMode(role, profile, mode))) return '替换原生模式不受宿主允许、不可用或不符合只读角色';
+      if ((choice.native_permission || profile?.native_permission) && (!mode || !allowedNativeMode(role, profile, mode))) return '替换原生模式不受宿主允许、不可用或不符合只读角色';
       if (requireConfirmation && mode?.requires_confirmation && (!validReplacementChallenge() || choice.confirm_permission_expansion !== true)) return replacementConsentError;
       return '';
     }
@@ -560,10 +585,10 @@
       $('replacement-profile').value = choice.profile || ''; $('replacement-profile').disabled = locked;
       for (const option of $('replacement-profile').children) {
         const item = state.config?.native_agents.find(item => item.name === option.value);
-        if (role === 'reviewer' && item?.reviewer_supported !== true) { option.disabled = true; if (option.value) option.textContent += '（缺少只读隔离证明，不可审查）'; }
+        if (role === 'reviewer' && reviewerContract(item) === 'unsupported') { option.disabled = true; if (option.value) option.textContent += '（审查契约不可用）'; }
       }
       const stage = capability?.stopped_stage;
-      $('replacement-session').textContent = (native || !choice.profile || pending ? '将建立新的执行调用；原生角色使用新会话与有界交接，旧原生历史不能跨供应商兼容恢复' : '通用命令配置使用新的执行调用与有界交接，没有可恢复的原生会话') + '。保留原工作区、候选与原结果，不重新复制或清理现场';
+      $('replacement-session').textContent = role === 'reviewer' && reviewerContract(profile) === 'native_local_read_only' ? '本次审查使用独立 checkout 与全新独立 Codex 会话，不恢复旧会话。保留原工作区、候选与原结果，不从源仓库重新复制或清理现场' : (native || !choice.profile || pending ? '将建立新的执行调用；原生角色使用新会话与有界交接，旧原生历史不能跨供应商兼容恢复' : '通用命令配置使用新的执行调用与有界交接，没有可恢复的原生会话') + '。保留原工作区、候选与原结果，不重新复制或清理现场';
       $('replacement-stage').textContent = role === 'reviewer' ? '同一候选 ' + (stage?.candidate_sha || '见服务端已冻结候选') + '；原配置测试只运行一次，通过后仅审查，不开发、不修复'
         : '保留原轮次 ' + (stage?.round ?? '不适用 / 未提供') + ' 与剩余修复预算 ' + (stage?.remaining_repairs ?? '不适用 / 未提供') + '；不重置修复次数';
       $('replacement-defaults').textContent = pending ? '实际冻结选择：' + replacementSelectionText(choice) : '配置 ' + selectionText(choice.profile) + ' · ' + selectionText(profile?.provider) + '；默认模型 ' + catalogText(profile?.model, '由 CLI 决定') + '；默认 effort ' + catalogText(profile?.effort, '由 CLI 决定') + '；默认模式 ' + catalogText(profile?.native_permission, '沿用原生配置');
@@ -583,13 +608,15 @@
       if (pending && choice.effort) { const option = catalogNode('option', choice.effort + '（已冻结）'); option.value = choice.effort; $('replacement-effort').append(option); }
       $('replacement-effort').value = choice.effort || ''; $('replacement-effort').disabled = locked || !native || source !== 'catalog' || !efforts.length;
       populateSelect('replacement-permission', [], '沿用配置模式'); $('replacement-mode-reasons').replaceChildren();
+      const inheritedMode = profile?.permission_modes?.find(mode => mode.id === profile.native_permission);
+      $('replacement-permission').children[0].disabled = Boolean(profile?.native_permission && (!inheritedMode || !allowedNativeMode(role, profile, inheritedMode)));
       for (const mode of (profile?.permission_modes || []).slice(0, 16)) {
-        const allowed = allowedNativeMode(role, profile, mode), option = catalogNode('option', mode.label.slice(0, 150) + (allowed ? ' · 原生可用性未知' : ' · 不可选')); option.value = mode.id; option.disabled = !allowed; $('replacement-permission').append(option);
-        $('replacement-mode-reasons').append(catalogNode('li', mode.label.slice(0, 150) + '：' + mode.reason.slice(0, 600)));
+        const allowed = allowedNativeMode(role, profile, mode), option = catalogNode('option', nativeModeLabel(mode) + (allowed ? ' · 原生可用性未知' : ' · 不可选')); option.value = mode.id; option.disabled = !allowed; $('replacement-permission').append(option);
+        $('replacement-mode-reasons').append(catalogNode('li', nativeModeLabel(mode) + '：' + mode.reason.slice(0, 600)));
       }
       if (pending && choice.native_permission && !Array.from($('replacement-permission').children).some(option => option.value === choice.native_permission)) { const option = catalogNode('option', choice.native_permission + '（已冻结）'); option.value = choice.native_permission; $('replacement-permission').append(option); }
       $('replacement-permission').value = choice.native_permission || '';
-      $('replacement-permission-note').textContent = role === 'reviewer' ? (profile?.reviewer_supported === false ? reviewerUnavailableReason(profile) : '只使用固定只读审查契约；claude_restricted 不是原生 permission-mode 值。Codex reviewer 仍缺少独立只读隔离技术证明，不能选择') : choice.native_permission === 'claude_auto' ? 'Claude auto 是原生分类器，不是 bypass；账户、模型或策略可能拒绝或回退' : '宿主允许与原生能力分别判断；未知不保证隔离或生效';
+      $('replacement-permission-note').textContent = role === 'reviewer' ? reviewerContractText(profile) : choice.native_permission === 'claude_auto' ? 'Claude auto 是原生分类器，不是 bypass；账户、模型或策略可能拒绝或回退' : '宿主允许与原生能力分别判断；未知不保证隔离或生效';
       const mode = pending ? null : replacementMode(), confirmation = Boolean(pending?.body.replacement?.confirm_permission_expansion || mode?.requires_confirmation);
       $('replacement-confirm-field').hidden = !confirmation; $('replacement-confirm').checked = choice.confirm_permission_expansion === true;
       $('replacement-confirm').disabled = locked || !validReplacementChallenge(); $('replacement-challenge').disabled = locked || replacementState.loading;
@@ -608,6 +635,10 @@
         const response = await api('/api/tasks/' + encodeURIComponent(id) + '/replacement-challenge', { method: 'POST', body: { action, replacement }, signal: controller.signal });
         if (session !== state.session || selection !== state.selection || id !== state.retryTarget || version !== replacementState.version || key !== replacementIntentKey()) return;
         if (!isRecord(response) || typeof response.challenge !== 'string' || !response.challenge || response.challenge.length > 1024 || !Number.isSafeInteger(response.expires_at_unix_ms) || response.expires_at_unix_ms <= Date.now() || typeof response.confirmation_text !== 'string' || response.scope?.predecessor_task_id !== id || response.scope?.action !== action || response.scope?.role !== role || response.scope?.[role]?.profile !== replacement.profile || (replacement.model && response.scope[role].model !== replacement.model.value) || (replacement.effort && response.scope[role].effort !== replacement.effort) || (replacement.native_permission && response.scope[role].native_permission !== replacement.native_permission)) throw new ApiError('替换权限范围与前置任务、动作或角色不匹配');
+        if (role === 'reviewer' && reviewerContract(replacementProfile()) === 'native_local_read_only') {
+          const scope = response.scope.reviewer, profile = replacementProfile();
+          if (scope.provider !== 'codex_app_server' || scope.model !== (replacement.model?.value ?? profile.model) || scope.effort !== (replacement.effort || profile.effort)) throw new ApiError('Codex 原生审查范围与本次替换选择不匹配');
+        }
         Object.assign(replacementState, { challenge: response.challenge, expires: response.expires_at_unix_ms, key, text: response.confirmation_text, scope: response.scope });
       } catch (error) {
         if (session !== state.session || version !== replacementState.version || isAborted(error)) return;
@@ -806,7 +837,7 @@
         }
         selected.append(pairs, catalogNode('p', '配置验证：' + (catalogEvidence(selection?.status).state === 'unknown' ? '未验证' : catalogEvidence(selection?.status).state === 'supported' ? '目录已验证' : '不支持') + '。目录匹配不等于实际生效或调用授权')); card.append(selected);
         const evidence = catalogNode('ul', undefined, 'catalog-evidence');
-        for (const [key, label] of [['executable', '安装 / 已配置可执行文件'], ['compatibility', 'CLI 协议兼容'], ['authentication', '账户认证'], ['reviewer_isolation', '只读审查隔离'], ['permission_control', '权限控制'], ['session_continuity', '会话续接'], ['startup_context', '发现启动上下文'], ['process_cleanup', '发现进程已回收'], ['model_catalog', '模型目录'], ['selection', '请求配置匹配']]) evidence.append(catalogEvidenceRow(label, key === 'selection' ? selection?.status : catalog?.[key]));
+        for (const [key, label] of [['executable', '安装 / 已配置可执行文件'], ['compatibility', 'CLI 协议兼容'], ['authentication', '账户认证'], ['reviewer_isolation', '严格无执行审查隔离'], ['native_reviewer', '原生本地只读审查（允许命令）'], ['permission_control', '权限控制'], ['session_continuity', '会话续接'], ['startup_context', '发现启动上下文'], ['process_cleanup', '发现进程已回收'], ['model_catalog', '模型目录'], ['selection', '请求配置匹配']]) evidence.append(catalogEvidenceRow(label, key === 'selection' ? selection?.status : catalog?.[key]));
         card.append(evidence);
         card.append(catalogModelsSection(catalog?.models || []));
         if (envelope?.task_observation) card.append(taskObservationSection(envelope.task_observation, envelope.task_observation_stale));

@@ -43,9 +43,9 @@ MCP 为 `relay_replacement_challenge`。返回 `challenge`、到期时间、确�
 
 同一 immediate transaction 和独占工作区 lease 内，验证不可变前置结果、claim 所有者、现场 checkpoint 与允许的唯一角色差异，再冻结后继。首个成功预留固定所有选择、动作与额度；其他标签页、不同 key、跨连接请求返回该后继。重启或预留/核心提交间隙也恢复同一冻结 payload，不依赖旧 challenge 或目录仍新鲜。不会重新复制现场。后继 payload 超过核心 64 KiB 上限时在预留前拒绝。
 
-新的 `job.role_epochs` 是服务器专用的持久角色身份；每个改变的角色都获得随机 epoch。仅 Codex app-server 或设置 `session_continuity:true` 的原生 profile 创建 `sessions/<role>-<epoch>.json` 和由 Relay 管理的新 provider thread/session ID；通用命令与其他未启用续接的原生 profile 使用新的调用，不创建这些会话记录，也没有 Relay 管理的 resume 历史。未改变角色沿用自己的 epoch；没有 epoch 的旧有状态任务继续使用 `sessions/<role>.json`。旧文件不覆盖，旧绑定和历史保留。跨供应商不把旧 ID 交给新适配器；启用续接时新建 Codex thread 或 Claude session-id，同供应商改模型同样使用新 epoch。后续普通继续沿用这个新 epoch。有状态会话第一次创建的允许标记在 provider 启动前被持久消费；损坏、缺失 ID、缺失已用 epoch 文件均拒绝，不静默新建。
+新的 `job.role_epochs` 是服务器专用的持久角色身份；每个改变的角色都获得随机 epoch。仅会话型 Codex app-server（不含 fresh 原生审查档）或设置 `session_continuity:true` 的原生 profile 创建 `sessions/<role>-<epoch>.json` 和由 Relay 管理的新 provider thread/session ID；通用命令与其他未启用续接的原生 profile 使用新的调用，不创建这些会话记录，也没有 Relay 管理的 resume 历史。未改变角色沿用自己的 epoch；没有 epoch 的旧有状态任务继续使用 `sessions/<role>.json`。旧文件不覆盖，旧绑定和历史保留。跨供应商不把旧 ID 交给新适配器；启用续接时新建 Codex thread 或 Claude session-id，同供应商改模型同样使用新 epoch。后续普通继续沿用这个新 epoch。有状态会话第一次创建的允许标记在 provider 启动前被持久消费；损坏、缺失 ID、缺失已用 epoch 文件均拒绝，不静默新建。
 
-执行前在 lease 下再次验证前置证明、当前策略和 candidate。普通 continuation 仍要求原 reviewer 会话可续接；显式 reviewer 替换可在旧 session ID 缺失时开始新 epoch，但仍要求原候选和 checkout 可证明。当前更换 reviewer 必须保留原 checkout 拓扑：有状态独立审查副本与无状态审查工作目录之间的转换返回 `reviewer_topology_change_unsupported`，不会重置/复制已有 checkout。Codex/astra reviewer 仍为 `review_profile_unsupported`，本阶段不宣称完成未验证的只读隔离。
+执行前在 lease 下再次验证前置证明、当前策略和 candidate。会话型 reviewer 的普通 continuation 仍要求原 reviewer 会话可续接；显式 reviewer 替换可在旧 session ID 缺失时开始新 epoch，但仍要求原候选和 checkout 可证明。当前更换 reviewer 必须保留原 checkout 拓扑：有状态独立审查副本与无状态审查工作目录之间的转换返回 `reviewer_topology_change_unsupported`，不会重置/复制已有 checkout。严格无执行 Codex/astra reviewer 仍为 `review_profile_unsupported`，本阶段不宣称完成未验证的只读隔离。
 
 未知进程、发布已尝试/结果不明、原 host-policy 漂移、被修改的 base/candidate/HEAD/index/原始文件，均保持原有拒绝条件；替换不能迁移主机策略或绕过恢复核对。
 
@@ -54,3 +54,5 @@ MCP 为 `relay_replacement_challenge`。返回 `challenge`、到期时间、确�
 `recovery.actions[]` 的 `ordinary_allowed` 说明是否可普通继续；`replacement` 单独提供 `allowed`、角色、原因、可用 profile 名称和 stopped_stage。只有旧 session 缺失时，两种可用性可以不同。预留状态的 `reserved_request.replacement` 显示真正胜出的选择；无需保存或暴露原 challenge。页面在提交前说明保留原工作、建立新原生会话、继续原阶段；审查操作始终说明复验测试一次。
 
 验证全部使用本机 fake 原生脚本，无真实模型、付费调用、部署或主机权限变更。
+
+默认关闭的[原生沙箱审查](native-sandboxed-review.md)不保存 provider 恢复记录，但始终使用独立 reviewer checkout。它与启用续接的 Claude 可在相同 checkout 拓扑下显式替换，各自使用新角色 epoch；与复用开发目录的旧无状态 Claude 不能直接替换。

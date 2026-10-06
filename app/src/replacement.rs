@@ -203,8 +203,12 @@ pub(crate) fn compose(
         return Err(HostError::Job("replacement must change effective execution settings; provenance-only changes cannot reset a session".into()));
     }
     if reviewer
-        && old_native.as_ref().is_some_and(crate::sessions::enabled)
-            != new_native.as_ref().is_some_and(crate::sessions::enabled)
+        && old_native
+            .as_ref()
+            .is_some_and(crate::sessions::reviewer_checkout)
+            != new_native
+                .as_ref()
+                .is_some_and(crate::sessions::reviewer_checkout)
     {
         return Err(HostError::Job("reviewer_topology_change_unsupported: replacement must preserve the existing reviewer checkout topology; no checkout is reset or copied".into()));
     }
@@ -365,13 +369,10 @@ pub(crate) fn capability(
             .ok()
             .flatten()
             .as_ref()
-            .is_some_and(crate::sessions::enabled);
+            .is_some_and(crate::sessions::reviewer_checkout);
         profiles.retain(|name| {
             config.native_agents.get(name).is_some_and(|p| {
-                p.provider == crate::providers::ProviderKind::ClaudeCli
-                    && crate::sessions::enabled(p) == isolated
-                    && p.native_permission
-                        .is_none_or(|m| m.compatible(p.provider, true))
+                p.reviewer_supported() && crate::sessions::reviewer_checkout(p) == isolated
             })
         });
     }

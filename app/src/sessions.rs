@@ -326,7 +326,12 @@ impl Checkpoint {
     }
 }
 pub(crate) fn enabled(profile: &NativeProfile) -> bool {
-    profile.provider == ProviderKind::CodexAppServer || profile.session_continuity
+    !profile.native_sandboxed_review()
+        && (profile.provider == ProviderKind::CodexAppServer || profile.session_continuity)
+}
+/// Checkout isolation is independent of retaining a provider conversation.
+pub(crate) fn reviewer_checkout(profile: &NativeProfile) -> bool {
+    enabled(profile) || profile.native_sandboxed_review()
 }
 fn binding(profile: &NativeProfile) -> io::Result<String> {
     let mut profile = profile.clone();
