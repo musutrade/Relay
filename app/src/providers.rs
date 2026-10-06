@@ -27,6 +27,7 @@ pub enum ProviderKind {
 pub enum NativePermission {
     CodexWorkspaceWrite,
     CodexFullAccess,
+    CodexAutoReview,
     ClaudeDontAsk,
     ClaudeAuto,
     ClaudeBypassPermissions,
@@ -43,11 +44,13 @@ impl NativePermission {
                 Self::CodexWorkspaceWrite | Self::CodexFullAccess,
                 ProviderKind::CodexCli | ProviderKind::CodexAppServer,
                 false,
-            ) | (
-                Self::ClaudeDontAsk | Self::ClaudeAuto | Self::ClaudeBypassPermissions,
-                ProviderKind::ClaudeCli,
-                false,
-            ) | (Self::ClaudeRestricted, ProviderKind::ClaudeCli, true)
+            ) | (Self::CodexAutoReview, ProviderKind::CodexAppServer, false)
+                | (
+                    Self::ClaudeDontAsk | Self::ClaudeAuto | Self::ClaudeBypassPermissions,
+                    ProviderKind::ClaudeCli,
+                    false,
+                )
+                | (Self::ClaudeRestricted, ProviderKind::ClaudeCli, true)
         )
     }
     pub(crate) fn claude_mode(self) -> Option<&'static str> {
@@ -468,15 +471,23 @@ pub struct RequestedSelection {
     pub effort: Option<String>,
     pub native_permission: Option<NativePermission>,
     pub model_source: Option<String>,
+    /// Native reviewer requested by the selected mode, not a chosen model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<String>,
 }
 
 /// Provider-reported session configuration is not necessarily the model or effort
 /// used for the current turn, particularly after a turn override or reroute.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub approval_policy: Option<String>,
+    /// Public app-server setting; absent telemetry remains unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<String>,
     /// Native string kind or bounded serialized object, never turn-execution proof.
     pub sandbox: Option<String>,
     pub permission_mode: Option<String>,
@@ -492,12 +503,26 @@ pub struct ModelReroute {
     pub reason: String,
 }
 
+/// A native approval decision, not Relay authorization or proof that the action ran.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeApprovalReview {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub review_id: String,
+    pub status: String,
+    pub action_type: Option<String>,
+    pub rationale: Option<String>,
+    pub source: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ObservedSelection {
     pub model: Option<String>,
     pub source: Option<String>,
     #[serde(default)]
     pub reroutes: Vec<ModelReroute>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_approval_reviews: Vec<NativeApprovalReview>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -534,6 +559,7 @@ impl SelectionEvidence {
             &mut self.requested.model,
             &mut self.requested.effort,
             &mut self.requested.model_source,
+            &mut self.requested.approvals_reviewer,
             &mut self.observed.model,
             &mut self.observed.source,
         ]
@@ -556,6 +582,7 @@ impl SelectionEvidence {
                 &mut settings.model,
                 &mut settings.effort,
                 &mut settings.permission_mode,
+                &mut settings.approvals_reviewer,
             ]
             .into_iter()
             .flatten()
@@ -563,15 +590,40 @@ impl SelectionEvidence {
                 self.truncated |= text.len() > MAX_FIELD;
                 truncate(text, MAX_FIELD);
             }
-            for text in [&mut settings.approval_policy, &mut settings.sandbox]
-                .into_iter()
-                .flatten()
+            for text in [
+                &mut settings.cwd,
+                &mut settings.approval_policy,
+                &mut settings.sandbox,
+            ]
+            .into_iter()
+            .flatten()
             {
                 self.truncated |= text.len() > MAX_SESSION_POLICY;
                 truncate(text, MAX_SESSION_POLICY);
             }
             self.truncated |= settings.source.len() > MAX_FIELD;
             truncate(&mut settings.source, MAX_FIELD);
+        }
+        self.truncated |= self.observed.native_approval_reviews.len() > 8;
+        self.observed.native_approval_reviews.truncate(8);
+        for review in &mut self.observed.native_approval_reviews {
+            for text in [
+                &mut review.thread_id,
+                &mut review.turn_id,
+                &mut review.review_id,
+                &mut review.status,
+                &mut review.source,
+            ] {
+                self.truncated |= text.len() > MAX_FIELD;
+                truncate(text, MAX_FIELD);
+            }
+            for text in [&mut review.action_type, &mut review.rationale]
+                .into_iter()
+                .flatten()
+            {
+                self.truncated |= text.len() > MAX_FIELD;
+                truncate(text, MAX_FIELD);
+            }
         }
         self.truncated |= self.observed.reroutes.len() > 8;
         self.observed.reroutes.truncate(8);
@@ -590,6 +642,12 @@ impl SelectionEvidence {
     }
     pub(crate) fn shrink(&mut self) -> bool {
         let mut changed = false;
+        if !self.observed.native_approval_reviews.is_empty() {
+            self.observed
+                .native_approval_reviews
+                .truncate(self.observed.native_approval_reviews.len() / 2);
+            changed = true;
+        }
         if !self.observed.reroutes.is_empty() {
             self.observed
                 .reroutes
@@ -601,6 +659,7 @@ impl SelectionEvidence {
             &mut self.requested.model,
             &mut self.requested.effort,
             &mut self.requested.model_source,
+            &mut self.requested.approvals_reviewer,
             &mut self.observed.model,
             &mut self.observed.source,
         ] {
@@ -611,8 +670,10 @@ impl SelectionEvidence {
                 &mut settings.model,
                 &mut settings.effort,
                 &mut settings.approval_policy,
+                &mut settings.cwd,
                 &mut settings.sandbox,
                 &mut settings.permission_mode,
+                &mut settings.approvals_reviewer,
             ] {
                 changed |= shrink_optional(text);
             }
@@ -667,6 +728,9 @@ impl ProviderResult {
                     effort: profile.effort.clone(),
                     native_permission: profile.native_permission,
                     model_source: None,
+                    approvals_reviewer: (profile.native_permission
+                        == Some(NativePermission::CodexAutoReview))
+                    .then(|| "auto_review".into()),
                 },
                 session_settings: None,
                 observed: ObservedSelection::default(),
@@ -1148,9 +1212,11 @@ impl ProtocolParser {
                         self.active()?;
                         self.result.session_id = string_field(event, "session_id", MAX_FIELD)?;
                         let settings = SessionSettings {
+                            cwd: None,
                             model: optional_string_field(event, "model", MAX_FIELD)?,
                             effort: optional_string_field(event, "effort", MAX_FIELD)?,
                             approval_policy: None,
+                            approvals_reviewer: None,
                             sandbox: None,
                             permission_mode: optional_string_field(
                                 event,
@@ -1419,9 +1485,11 @@ mod tests {
         let evidence = result.selection.as_mut().unwrap();
         evidence.requested.profile = Some("界".repeat(256));
         evidence.session_settings = Some(SessionSettings {
+            cwd: None,
             model: Some("界".repeat(256)),
             effort: Some("x".repeat(500)),
             approval_policy: None,
+            approvals_reviewer: None,
             sandbox: None,
             permission_mode: Some("auto".into()),
             source: "claude.system/init".into(),

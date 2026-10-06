@@ -332,9 +332,8 @@ pub(crate) fn annotate(
 pub(crate) fn permission_choices(profile: &NativeProfile) -> Vec<Value> {
     use NativePermission::*;
     let choices: &[NativePermission] = match profile.provider {
-        ProviderKind::CodexCli | ProviderKind::CodexAppServer => {
-            &[CodexWorkspaceWrite, CodexFullAccess]
-        }
+        ProviderKind::CodexCli => &[CodexWorkspaceWrite, CodexFullAccess],
+        ProviderKind::CodexAppServer => &[CodexWorkspaceWrite, CodexFullAccess, CodexAutoReview],
         ProviderKind::ClaudeCli => &[
             ClaudeDontAsk,
             ClaudeAuto,
@@ -347,6 +346,7 @@ pub(crate) fn permission_choices(profile: &NativeProfile) -> Vec<Value> {
         let allowed = safe || profile.allowed_permission_modes.contains(mode);
         let (label, reason) = match mode {
             CodexWorkspaceWrite => ("Workspace write", "Sandboxed workspace-write; approval never; runtime version/help checks still apply"),
+            CodexAutoReview => ("Codex Auto-review", "Developer only: workspace-write + on-request + native auto_review; eligible sandbox escalations may be approved automatically. Not absolute read-only; availability and approval-model selection belong to Codex"),
             CodexFullAccess => ("Full access", "Expands filesystem AND network access; danger-full-access and approval never"),
             ClaudeDontAsk => ("Claude dontAsk", "Native policy decides allowed tools; unanswered permissions are denied"),
             ClaudeAuto => ("Claude auto", "Native classifier availability is unknown until execution; model, provider, account and managed policy may reject or fall back"),
@@ -355,7 +355,7 @@ pub(crate) fn permission_choices(profile: &NativeProfile) -> Vec<Value> {
         };
         json!({"id":mode,"label":label,"host_allowed":allowed,"availability":if allowed {"unknown"} else {"unsupported"},
             "reason":if allowed {reason} else {"Not allowed by the configured host policy"},"reviewer_only":*mode == ClaudeRestricted,
-            "requires_confirmation":mode.requires_confirmation(),"confirmation_text":if mode.requires_confirmation() {Some(if *mode == CodexFullAccess || *mode == ClaudeBypassPermissions {"I confirm expanded filesystem AND network access for this developer execution"} else {"I confirm this developer native permission-mode change; native policy still controls allowed access"})} else {None::<&str>}})
+            "requires_confirmation":mode.requires_confirmation(),"confirmation_text":if mode.requires_confirmation() {Some(if *mode == CodexAutoReview {"I confirm native automatic approval of eligible developer sandbox escalations; this is not an absolute read-only or no-network guarantee"} else if *mode == CodexFullAccess || *mode == ClaudeBypassPermissions {"I confirm expanded filesystem AND network access for this developer execution"} else {"I confirm this developer native permission-mode change; native policy still controls allowed access"})} else {None::<&str>}})
     }).collect()
 }
 
@@ -526,6 +526,8 @@ impl PermissionChallenges {
             Some(NativePermission::CodexFullAccess | NativePermission::ClaudeBypassPermissions)
         ) {
             "This expands filesystem AND network access for this developer execution."
+        } else if role.native_permission == Some(NativePermission::CodexAutoReview) {
+            "Codex native Auto-review may approve eligible filesystem, network and tool escalations beyond workspace-write. This is not absolute read-only or no-network access. Codex chooses the approval reviewer independently of the developer/code-review model; native account and managed policy still apply."
         } else {
             "This changes the developer's native access decisions. Native policy and model/provider eligibility still apply; Claude auto is a classifier, not bypassPermissions."
         };

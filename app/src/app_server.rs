@@ -1,8 +1,9 @@
 //! Bounded Codex app-server stdio client. The supervisor owns the process tree;
 //! this driver owns only request correlation and one explicitly identified turn.
 use crate::providers::{
-    MAX_PROTOCOL_LINE, MAX_SESSION_POLICY, ModelReroute, NativePermission, ProviderKind,
-    ProviderResult, ProviderUsage, SessionSettings, TokenCounts, optional_string_field,
+    MAX_PROTOCOL_LINE, MAX_SESSION_POLICY, ModelReroute, NativeApprovalReview, NativePermission,
+    ProviderKind, ProviderResult, ProviderUsage, SessionSettings, TokenCounts,
+    optional_string_field,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -77,6 +78,16 @@ impl Driver {
         }}));
         driver
     }
+    fn auto_review(&self) -> bool {
+        self.start.native_permission == Some(NativePermission::CodexAutoReview)
+    }
+    fn approval_policy(&self) -> &'static str {
+        if self.auto_review() {
+            "on-request"
+        } else {
+            "never"
+        }
+    }
     fn send(&mut self, message: Value) {
         let bytes = serde_json::to_vec(&message).expect("JSON value");
         if self.pending.len() + bytes.len() + 1 > MAX_PENDING {
@@ -98,6 +109,8 @@ impl Driver {
     fn fail(&mut self, text: &str) {
         if self.error.is_none() {
             self.error = Some(text.to_owned());
+            // A queued turn can share a drain with a later policy failure.
+            self.pending.clear();
         }
     }
     fn bind_turn(&mut self, id: String) {
@@ -187,8 +200,7 @@ impl Driver {
         if let Some(id) = event.get("id") {
             if method.is_some() {
                 // Never grant new permissions, supply credentials/user answers, or
-                // dispatch dynamic tools. Unsupported requests are answered, then stopped.
-                self.send(json!({"id":id,"error":{"code":-32601,"message":"Relay does not authorize server requests"}}));
+                // dispatch dynamic tools. Stop and close stdin without flushing any queued prompt.
                 return Err(
                     "app-server requested approval, input, or unsupported client action".into(),
                 );
@@ -213,7 +225,16 @@ impl Driver {
                     } else {
                         "workspace-write"
                     };
-                    let mut params = json!({"cwd":self.start.cwd,"approvalPolicy":"never","sandbox":sandbox,"model":self.start.model});
+                    let mut params = json!({"cwd":self.start.cwd,"approvalPolicy":self.approval_policy(),"sandbox":sandbox,"model":self.start.model});
+                    if self.auto_review() {
+                        params["approvalsReviewer"] = json!("auto_review");
+                        params["config"] = json!({
+                            "sandbox_workspace_write.network_access": false,
+                            "sandbox_workspace_write.writable_roots": [self.start.cwd],
+                            "sandbox_workspace_write.exclude_tmpdir_env_var": false,
+                            "sandbox_workspace_write.exclude_slash_tmp": false
+                        });
+                    }
                     let method = if let Some(id) = &self.start.resume {
                         valid_id(id)?;
                         params["threadId"] = json!(id);
@@ -240,7 +261,14 @@ impl Driver {
                             .map_err(|e| format!("cannot persist started thread: {e}"))?;
                     }
                     self.result.session_id = Some(id.clone());
-                    self.session_settings(result)?;
+                    self.session_settings(
+                        result,
+                        if self.start.resume.is_some() {
+                            "codex.thread/resume"
+                        } else {
+                            "codex.thread/start"
+                        },
+                    )?;
                     let sandbox_policy = if self.start.native_permission
                         == Some(NativePermission::CodexFullAccess)
                     {
@@ -249,12 +277,16 @@ impl Driver {
                         json!({"type":"workspaceWrite","writableRoots":[self.start.cwd],
                             "networkAccess":false,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false})
                     };
-                    self.send(json!({"id":3,"method":"turn/start","params":{
+                    let mut params = json!({
                         "threadId":id,"input":[{"type":"text","text":self.start.prompt}],
-                        "cwd":self.start.cwd,"approvalPolicy":"never","model":self.start.model,
+                        "cwd":self.start.cwd,"approvalPolicy":self.approval_policy(),"model":self.start.model,
                         "effort":self.start.effort,
                         "sandboxPolicy":sandbox_policy
-                    }}));
+                    });
+                    if self.auto_review() {
+                        params["approvalsReviewer"] = json!("auto_review");
+                    }
+                    self.send(json!({"id":3,"method":"turn/start","params":params}));
                 }
                 3 => {
                     let id = id_field(&result["turn"], "id")?;
@@ -273,6 +305,26 @@ impl Driver {
             return Err("app-server method exceeds its bound".into());
         }
         let params = &event["params"];
+        if method == "thread/settings/updated" && self.auto_review() {
+            // Early startup notifications cannot establish a session. The correlated
+            // start/resume response must still report the complete requested mode.
+            if self.result.session_id.is_none() {
+                return Ok(());
+            }
+            if params.get("threadId").and_then(Value::as_str) != self.result.session_id.as_deref()
+                || self.terminal
+            {
+                return Err(
+                    "app-server settings update belongs to another or completed thread".into(),
+                );
+            }
+            let settings = &params["threadSettings"];
+            let normalized = json!({"cwd":settings.get("cwd"), "model":settings.get("model"), "reasoningEffort":settings.get("effort"),
+                "approvalPolicy":settings.get("approvalPolicy"), "approvalsReviewer":settings.get("approvalsReviewer"),
+                "sandbox":settings.get("sandboxPolicy")});
+            self.session_settings(&normalized, "codex.thread/settings/updated")?;
+            return Ok(());
+        }
         if matches!(
             method,
             "turn/started"
@@ -286,6 +338,7 @@ impl Driver {
                 | "turn/plan/updated"
                 | "turn/moderationMetadata"
                 | "model/rerouted"
+                | "item/autoApprovalReview/completed"
         ) {
             if self.result.session_id.is_none()
                 || params.get("threadId").and_then(Value::as_str)
@@ -325,6 +378,32 @@ impl Driver {
             }
         }
         match method {
+            "item/autoApprovalReview/completed" => {
+                // Observe native decisions only. Relay neither replaces the reviewer
+                // nor authorizes a retry when native policy denies an action.
+                let review = NativeApprovalReview {
+                    thread_id: id_field(params, "threadId")?,
+                    turn_id: id_field(params, "turnId")?,
+                    review_id: id_field(params, "reviewId")?,
+                    status: optional_string_field(&params["review"], "status", 256)?
+                        .ok_or("app-server approval review requires status")?,
+                    action_type: optional_string_field(&params["action"], "type", 256)?,
+                    rationale: optional_string_field(
+                        &params["review"],
+                        "rationale",
+                        MAX_PROTOCOL_LINE,
+                    )?,
+                    source: "codex.item/autoApprovalReview/completed".into(),
+                };
+                if let Some(selection) = &mut self.result.selection {
+                    if selection.observed.native_approval_reviews.len() == 8 {
+                        selection.observed.native_approval_reviews.remove(0);
+                        selection.truncated = true;
+                    }
+                    selection.observed.native_approval_reviews.push(review);
+                    selection.bound();
+                }
+            }
             "turn/completed" => {
                 let status = params["turn"]["status"]
                     .as_str()
@@ -405,21 +484,18 @@ impl Driver {
         }
         Ok(())
     }
-    fn session_settings(&mut self, result: &Value) -> Result<(), String> {
+    fn session_settings(&mut self, result: &Value, source: &str) -> Result<(), String> {
         let (approval_policy, approval_truncated) = reported_setting(result, "approvalPolicy")?;
         let (sandbox, sandbox_truncated) = reported_setting(result, "sandbox")?;
         let settings = SessionSettings {
+            cwd: optional_string_field(result, "cwd", MAX_SESSION_POLICY)?,
             model: optional_string_field(result, "model", 256)?,
             effort: optional_string_field(result, "reasoningEffort", 256)?,
             approval_policy,
+            approvals_reviewer: optional_string_field(result, "approvalsReviewer", 256)?,
             sandbox,
             permission_mode: None,
-            source: if self.start.resume.is_some() {
-                "codex.thread/resume"
-            } else {
-                "codex.thread/start"
-            }
-            .into(),
+            source: source.into(),
         };
         let actual_sandbox = result.get("sandbox").filter(|value| !value.is_null());
         let sandbox_kind = actual_sandbox.and_then(|value| {
@@ -431,7 +507,7 @@ impl Driver {
             .get("approvalPolicy")
             .filter(|value| !value.is_null());
         let expected_sandbox = match self.start.native_permission {
-            Some(NativePermission::CodexWorkspaceWrite) => {
+            Some(NativePermission::CodexWorkspaceWrite | NativePermission::CodexAutoReview) => {
                 Some(["workspace-write", "workspaceWrite"])
             }
             Some(NativePermission::CodexFullAccess) => {
@@ -439,20 +515,40 @@ impl Driver {
             }
             _ => None,
         };
-        let permission_mismatch = expected_sandbox.is_some_and(|expected| {
-            actual_sandbox.is_some()
-                && sandbox_kind.is_none_or(|actual| !expected.contains(&actual))
-                || actual_approval.is_some_and(|actual| actual.as_str() != Some("never"))
-        });
+        let (baseline_mismatch, baseline_missing) = if self.auto_review() {
+            auto_review_baseline(result, &self.start.cwd)
+        } else {
+            (false, false)
+        };
+        let permission_mismatch = baseline_mismatch
+            || expected_sandbox.is_some_and(|expected| {
+                (!self.auto_review()
+                    && actual_sandbox.is_some()
+                    && sandbox_kind.is_none_or(|actual| !expected.contains(&actual)))
+                    || actual_approval
+                        .is_some_and(|actual| actual.as_str() != Some(self.approval_policy()))
+            });
+        let reviewer_mismatch = self.auto_review()
+            && settings
+                .approvals_reviewer
+                .as_deref()
+                .is_some_and(|value| value != "auto_review");
+        let missing_auto_settings = self.auto_review()
+            && (settings.approvals_reviewer.is_none()
+                || settings.approval_policy.is_none()
+                || settings.sandbox.is_none()
+                || baseline_missing);
         if let Some(selection) = &mut self.result.selection {
             selection.truncated |= approval_truncated || sandbox_truncated;
-            if settings.model.is_some() {
+            if settings.model.is_some() && selection.observed.model.is_none() {
                 selection.verification.model = "session_reported".into();
             }
             // Thread config predates the requested turn effort override. Neither
             // this response nor turn/start certifies the current turn's effort.
-            if permission_mismatch {
+            if permission_mismatch || reviewer_mismatch {
                 selection.verification.permission = "mismatch".into();
+            } else if missing_auto_settings {
+                selection.verification.permission = "unknown".into();
             } else if expected_sandbox.is_some()
                 && settings.sandbox.is_some()
                 && settings.approval_policy.is_some()
@@ -461,8 +557,11 @@ impl Driver {
             }
             selection.session_settings = Some(settings);
         }
-        if permission_mismatch {
-            return Err("native permission mismatch: Codex session reported a different sandbox or approval policy".into());
+        if permission_mismatch || reviewer_mismatch {
+            return Err("native permission mismatch: Codex session reported a different workspace baseline, sandbox, approval policy, or approvals reviewer".into());
+        }
+        if missing_auto_settings {
+            return Err("native Auto-review unavailable: Codex did not report the complete workspace baseline, approval policy, and approvals reviewer; requested mode is unverified".into());
         }
         Ok(())
     }
@@ -479,6 +578,43 @@ impl Driver {
         (self.result, self.error)
     }
 }
+/// Validate the concrete native baseline. workspaceWrite implicitly includes cwd;
+/// an empty writableRoots array is therefore equivalent to listing cwd only.
+/// Missing evidence is unknown, never an assumption about native defaults.
+fn auto_review_baseline(result: &Value, cwd: &std::path::Path) -> (bool, bool) {
+    let mut mismatch = false;
+    let mut missing = false;
+    match result.get("cwd").filter(|value| !value.is_null()) {
+        Some(value) => mismatch |= value.as_str() != cwd.to_str(),
+        None => missing = true,
+    }
+    let Some(policy) = result.get("sandbox").filter(|value| !value.is_null()) else {
+        return (mismatch, true);
+    };
+    if !policy.is_object() {
+        return (true, missing);
+    }
+    match policy.get("type").filter(|value| !value.is_null()) {
+        Some(value) => mismatch |= value.as_str() != Some("workspaceWrite"),
+        None => missing = true,
+    }
+    for key in ["networkAccess", "excludeTmpdirEnvVar", "excludeSlashTmp"] {
+        match policy.get(key).filter(|value| !value.is_null()) {
+            Some(value) => mismatch |= value.as_bool() != Some(false),
+            None => missing = true,
+        }
+    }
+    match policy.get("writableRoots").filter(|value| !value.is_null()) {
+        Some(value) => {
+            mismatch |= value
+                .as_array()
+                .is_none_or(|roots| roots.iter().any(|root| root.as_str() != cwd.to_str()))
+        }
+        None => missing = true,
+    }
+    (mismatch, missing)
+}
+
 fn reported_setting(value: &Value, key: &str) -> Result<(Option<String>, bool), String> {
     match value.get(key) {
         None | Some(Value::Null) => Ok((None, false)),
@@ -1033,8 +1169,7 @@ mod tests {
                 json!({"id":"server-request","method":method,"params":{}}),
             );
             let response = String::from_utf8(d.take_pending()).unwrap();
-            assert!(response.contains("-32601"));
-            assert!(!response.contains("accept"));
+            assert!(response.is_empty());
             assert!(d.finish().1.is_some());
         }
         let mut d = driver(None);
@@ -1289,6 +1424,149 @@ mod tests {
             );
             d.result.bound();
             assert_eq!(d.result.selection.as_ref().unwrap().truncated, long);
+        }
+    }
+    fn native_review(status: &str, index: usize) -> Value {
+        json!({"method":"item/autoApprovalReview/completed","params":{
+            "threadId":"thread-1","turnId":"turn-1","reviewId":format!("review-{index}"),
+            "action":{"type":"networkAccess","host":"must-not-be-copied.example"},
+            "review":{"status":status,"rationale":"Native policy reason","model":"not-the-developer-model"}
+        }})
+    }
+    #[test]
+    fn native_approval_decisions_are_bounded_observations_not_relay_approvals() {
+        let mut d = driver(None);
+        start(&mut d);
+        d.take_pending();
+        for (index, status) in [
+            "approved",
+            "denied",
+            "timedOut",
+            "aborted",
+            "futureStatus",
+            "denied",
+            "approved",
+            "denied",
+            "approved",
+            "denied",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut event = native_review(status, index);
+            event["params"]["review"]["rationale"] = json!("界".repeat(200));
+            feed(&mut d, event);
+        }
+        assert!(d.failure().is_none());
+        // Native denials do not send an approval, grant access, or cause a Relay
+        // retry. Codex may finish after a materially safer path in the same turn.
+        assert!(d.take_pending().is_empty());
+        let evidence = d.result.selection.as_ref().unwrap();
+        let reviews = &evidence.observed.native_approval_reviews;
+        assert_eq!(reviews.len(), 8);
+        assert_eq!(reviews[0].review_id, "review-2");
+        assert_eq!(reviews[7].status, "denied");
+        assert!(reviews[0].rationale.as_ref().unwrap().len() <= 256);
+        assert!(evidence.truncated);
+        assert!(evidence.observed.model.is_none());
+        assert!(
+            !serde_json::to_string(evidence)
+                .unwrap()
+                .contains("must-not-be-copied")
+        );
+        answer(&mut d);
+        complete(&mut d, "completed");
+        let (mut result, error) = d.finish();
+        assert!(error.is_none());
+        result.shrink();
+        assert_eq!(
+            result
+                .selection
+                .unwrap()
+                .observed
+                .native_approval_reviews
+                .len(),
+            4
+        );
+    }
+    #[test]
+    fn native_approval_evidence_cannot_cross_threads_turns_or_terminal_boundaries() {
+        for (field, value) in [
+            ("threadId", "other-thread"),
+            ("turnId", "old-turn"),
+            ("reviewId", ""),
+        ] {
+            let mut d = driver(None);
+            start(&mut d);
+            let mut event = native_review("approved", 0);
+            event["params"][field] = json!(value);
+            feed(&mut d, event);
+            assert!(d.failure().is_some());
+            assert!(
+                d.result
+                    .selection
+                    .as_ref()
+                    .unwrap()
+                    .observed
+                    .native_approval_reviews
+                    .is_empty()
+            );
+        }
+        let mut d = driver(None);
+        start(&mut d);
+        answer(&mut d);
+        complete(&mut d, "completed");
+        feed(&mut d, native_review("approved", 0));
+        assert!(d.failure().unwrap().contains("terminal"));
+    }
+    #[test]
+    fn native_auto_settings_do_not_overwrite_stronger_model_observations() {
+        for message_observed in [false, true] {
+            let mut d = driver(None);
+            start(&mut d);
+            select_permission(&mut d, NativePermission::CodexAutoReview);
+            feed(&mut d, reroute("thread-1", "turn-1", "rerouted-model"));
+            if message_observed {
+                feed(
+                    &mut d,
+                    json!({"method":"item/completed","params":{
+                        "threadId":"thread-1","turnId":"turn-1",
+                        "item":{"type":"agentMessage","text":"done", "model":"message-model"}
+                    }}),
+                );
+            }
+            let cwd = d.start.cwd.clone();
+            feed(
+                &mut d,
+                json!({"method":"thread/settings/updated","params":{
+                    "threadId":"thread-1","threadSettings":{
+                        "cwd":cwd,"model":"configured-only", "effort":"low", "approvalPolicy":"on-request", "approvalsReviewer":"auto_review",
+                        "sandboxPolicy":{"type":"workspaceWrite", "writableRoots":[cwd], "networkAccess":false, "excludeSlashTmp":false,"excludeTmpdirEnvVar":false}
+                    }
+                }}),
+            );
+            assert!(d.failure().is_none());
+            let evidence = d.result.selection.as_ref().unwrap();
+            assert_eq!(
+                evidence.verification.model,
+                if message_observed {
+                    "message_reported"
+                } else {
+                    "rerouted"
+                }
+            );
+            assert_eq!(
+                evidence.session_settings.as_ref().unwrap().model.as_deref(),
+                Some("configured-only")
+            );
+            assert_eq!(
+                evidence.observed.model.as_deref(),
+                Some(if message_observed {
+                    "message-model"
+                } else {
+                    "rerouted-model"
+                })
+            );
         }
     }
 }

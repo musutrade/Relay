@@ -95,3 +95,5 @@ Codex thread/start 或 resume 返回的 model、reasoningEffort、approvalPolicy
 Claude system/init 的 model、permissionMode 和可选 effort 属于会话配置；assistant.message.model 属于消息证据，带非空 parent_tool_use_id 的子 Agent 消息不能覆盖主角色模型。缺失字段保持未知。原生权限拒绝或明确模式不匹配会失败并保留原因，不静默降级。`claude_restricted` 不与原生 permissionMode 比较。
 
 所有证据有界，并共享既有 16 KiB 结果预算；压缩以 `truncated` / `evidence_truncated` 标示。能力目录不是认证、授权、账户权益或实际执行证据。Claude 自动模型发现的受管理启动隔离仍未验证，见[能力目录说明](agent-capabilities.md)。
+
+Codex app-server 开发角色另可由宿主显式允许 [原生 Auto-review](native-auto-review.md)：`codex_auto_review` 使用 workspace-write + on-request + 原生 auto_review，须单独确认可能获批的文件、网络和工具越界。它与代码审查模型分开，不适用于只读 reviewer，也不代表某个账户已具备原生自动审批能力。

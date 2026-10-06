@@ -2161,7 +2161,7 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
             outcome = Outcome::TimedOut;
             break;
         }
-        if spec.claude_control
+        if bidirectional
             && protocol
                 .as_ref()
                 .and_then(ProtocolParser::failure)

@@ -664,6 +664,232 @@ fn accepted_replay_survives_restart_and_policy_drift_but_launch_is_rejected() {
     assert!(result["workspace"].is_null());
     assert!(!temp.path().join("runs/task-1").exists());
 }
+fn auto_review_config(root: &Path) -> HostConfig {
+    let mut config = expanded_config(root);
+    let profile = config.native_agents.get_mut("dev").unwrap();
+    profile.provider = relay_app::providers::ProviderKind::CodexAppServer;
+    profile.allowed_permission_modes = vec![
+        NativePermission::CodexAutoReview,
+        NativePermission::CodexFullAccess,
+    ];
+    config
+}
+
+fn auto_review_job() -> Value {
+    let mut selected = expanded_job();
+    selected["role_selections"]["developer"]["native_permission"] = json!("codex_auto_review");
+    selected
+}
+
+#[test]
+fn codex_auto_review_requires_host_opt_in_and_developer_role() {
+    let temp = Fixture::new();
+    let mut config = auto_review_config(temp.path());
+    let mut selected = auto_review_job();
+    selected["role_selections"]["developer"]["confirm_permission_expansion"] = json!(true);
+    assert!(validate(selected.clone(), &config).is_ok());
+    config
+        .native_agents
+        .get_mut("dev")
+        .unwrap()
+        .allowed_permission_modes
+        .clear();
+    assert!(
+        validate(selected.clone(), &config)
+            .unwrap_err()
+            .contains("host policy")
+    );
+    config
+        .native_agents
+        .get_mut("dev")
+        .unwrap()
+        .allowed_permission_modes = vec![NativePermission::CodexAutoReview];
+    for provider in [
+        relay_app::providers::ProviderKind::CodexCli,
+        relay_app::providers::ProviderKind::ClaudeCli,
+    ] {
+        config.native_agents.get_mut("dev").unwrap().provider = provider;
+        assert!(validate(selected.clone(), &config).is_err());
+    }
+    config.native_agents.get_mut("dev").unwrap().provider =
+        relay_app::providers::ProviderKind::CodexAppServer;
+    for reviewer in ["review", "other"] {
+        config
+            .workflows
+            .get_mut("checked")
+            .unwrap()
+            .selectable_reviewers = Some(vec![reviewer.into()]);
+        let mut rejected = job();
+        rejected["role_selections"] = json!({"reviewer":{
+            "profile":reviewer,"native_permission":"codex_auto_review",
+            "confirm_permission_expansion":true
+        }});
+        assert!(validate(rejected, &config).is_err());
+    }
+    // A host default does not silently opt an ordinary job into automatic review.
+    config
+        .native_agents
+        .get_mut("dev")
+        .unwrap()
+        .native_permission = Some(NativePermission::CodexAutoReview);
+    assert!(
+        validate(job(), &config)
+            .unwrap_err()
+            .contains("explicit confirmation")
+    );
+}
+
+#[test]
+fn codex_auto_review_challenge_binds_mode_and_still_needs_explicit_confirmation() {
+    let temp = Fixture::new();
+    let app = Application::open(
+        temp.path().join("queue.db"),
+        auto_review_config(temp.path()),
+    )
+    .unwrap();
+    let selected = auto_review_job();
+    let issued = challenge(&app, selected.clone());
+    assert_eq!(
+        issued["scope"]["developer"]["native_permission"],
+        "codex_auto_review"
+    );
+    assert!(
+        issued["confirmation_text"]
+            .as_str()
+            .unwrap()
+            .contains("Auto-review")
+    );
+    assert!(app.list(None).unwrap().is_empty());
+    assert!(
+        !issued
+            .to_string()
+            .contains("never-persist-this-credential-value")
+    );
+    let no_confirmation = app.submit(
+        serde_json::from_value(json!({
+            "key":"auto-missing-confirmation","job":selected,
+            "permission_challenge":issued["challenge"]
+        }))
+        .unwrap(),
+    );
+    assert!(
+        no_confirmation
+            .unwrap_err()
+            .to_string()
+            .contains("explicit confirmation")
+    );
+    let mut confirmed = selected.clone();
+    confirmed["role_selections"]["developer"]["confirm_permission_expansion"] = json!(true);
+    assert!(
+        submit(&app, "auto-missing-challenge", confirmed)
+            .unwrap_err()
+            .to_string()
+            .contains("server-issued challenge")
+    );
+    let mut full_access = selected.clone();
+    full_access["role_selections"]["developer"]["native_permission"] = json!("codex_full_access");
+    assert!(
+        confirmed_submit(&app, "changed-to-full", full_access.clone(), &issued)
+            .unwrap_err()
+            .to_string()
+            .contains("no longer matches")
+    );
+    let full_challenge = challenge(&app, full_access);
+    assert!(
+        confirmed_submit(&app, "changed-to-auto", selected.clone(), &full_challenge)
+            .unwrap_err()
+            .to_string()
+            .contains("no longer matches")
+    );
+    let task = confirmed_submit(&app, "auto-accepted", selected.clone(), &issued).unwrap();
+    let accepted: Value = serde_json::from_str(&task.payload).unwrap();
+    assert_eq!(
+        accepted["role_binding"]["developer"]["native_permission"],
+        "codex_auto_review"
+    );
+    assert!(!task.payload.contains("never-persist-this-credential-value"));
+    assert!(confirmed_submit(&app, "auto-reused-challenge", selected.clone(), &issued).is_err());
+    assert_eq!(
+        confirmed_submit(&app, "auto-accepted", selected, &issued)
+            .unwrap()
+            .id,
+        task.id
+    );
+}
+
+#[test]
+fn codex_auto_review_accepted_replay_survives_policy_revocation_but_cannot_launch() {
+    let temp = Fixture::new();
+    let db = temp.path().join("queue.db");
+    let config = auto_review_config(temp.path());
+    let app = Application::open(&db, config.clone()).unwrap();
+    let selected = auto_review_job();
+    let issued = challenge(&app, selected.clone());
+    let accepted = confirmed_submit(&app, "auto-accepted", selected.clone(), &issued).unwrap();
+    drop(app);
+    let mut changed = config;
+    changed
+        .native_agents
+        .get_mut("dev")
+        .unwrap()
+        .allowed_permission_modes
+        .clear();
+    let app = Application::open(&db, changed).unwrap();
+    assert_eq!(
+        confirmed_submit(&app, "auto-accepted", selected.clone(), &issued)
+            .unwrap()
+            .id,
+        accepted.id
+    );
+    assert!(confirmed_submit(&app, "auto-new-key", selected, &issued).is_err());
+    assert!(app.work_once().unwrap());
+    let result: Value =
+        serde_json::from_str(app.get(accepted.id).unwrap().result.as_deref().unwrap()).unwrap();
+    assert_eq!(result["outcome"], "failure", "{result}");
+    assert!(result["workspace"].is_null());
+    assert!(!temp.path().join("runs/task-1").exists());
+    assert_eq!(app.list(None).unwrap().len(), 1);
+}
+
+#[test]
+fn codex_auto_review_public_choices_reflect_provider_and_host_policy() {
+    let temp = Fixture::new();
+    let mut config = config(temp.path());
+    let app = Application::open(temp.path().join("queue.db"), config.clone()).unwrap();
+    let public = app.public_config();
+    for profile in public["native_agents"].as_array().unwrap() {
+        let modes = profile["permission_modes"].as_array().unwrap();
+        let auto = modes.iter().find(|mode| mode["id"] == "codex_auto_review");
+        if profile["name"] == "other" {
+            let auto = auto.unwrap();
+            assert_eq!(auto["host_allowed"], false);
+            assert_eq!(auto["requires_confirmation"], true);
+        } else {
+            assert!(auto.is_none(), "{profile}");
+        }
+    }
+    drop(app);
+    config
+        .native_agents
+        .get_mut("other")
+        .unwrap()
+        .allowed_permission_modes = vec![NativePermission::CodexAutoReview];
+    let app = Application::open(temp.path().join("queue.db"), config).unwrap();
+    let public = app.public_config();
+    let auto = public["native_agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|profile| profile["name"] == "other")
+        .unwrap()["permission_modes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|mode| mode["id"] == "codex_auto_review")
+        .unwrap();
+    assert_eq!(auto["host_allowed"], true);
+}
+
 #[test]
 fn selected_jobs_bind_inherited_defaults_and_executable_identity_without_expansion() {
     let temp = Fixture::new();
