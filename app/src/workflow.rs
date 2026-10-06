@@ -33,6 +33,10 @@ pub struct WorkflowConfig {
     pub repository: String,
     pub developer: String,
     pub reviewer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selectable_developers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selectable_reviewers: Option<Vec<String>>,
     pub test: String,
     /// Trusted acceptance criteria for the reviewer, not developer execution steps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,6 +75,33 @@ impl WorkflowConfig {
         config.native_agents[&self.reviewer]
             .compile(true)
             .map_err(HostError::Config)?;
+        for (reviewer, names) in [
+            (false, &self.selectable_developers),
+            (true, &self.selectable_reviewers),
+        ] {
+            if let Some(names) = names {
+                let unique: std::collections::BTreeSet<_> = names.iter().collect();
+                if names.len() > 64 || unique.len() != names.len() {
+                    return Err(invalid(
+                        "workflow role allowlist must contain at most 64 unique profiles",
+                    ));
+                }
+                for name in names {
+                    if reviewer {
+                        let profile = config.native_agents.get(name).ok_or_else(|| {
+                            invalid("selectable reviewer is not an allowlisted native profile")
+                        })?;
+                        profile.compile(true).map_err(HostError::Config)?;
+                    } else if !config.agents.contains_key(name)
+                        && !config.native_agents.contains_key(name)
+                    {
+                        return Err(invalid(
+                            "selectable developer is not an allowlisted profile",
+                        ));
+                    }
+                }
+            }
+        }
         validate_review_focus(self.review_focus.as_deref()).map_err(HostError::Config)?;
         if !config.tests.contains_key(&self.test) {
             return Err(invalid("workflow requires an allowlisted test profile"));
@@ -101,7 +132,7 @@ impl WorkflowConfig {
     }
     pub fn validate_job(&self, job: &Job) -> Result<(), HostError> {
         if job.repository != self.repository
-            || job.agent != self.developer
+            || (job.agent != self.developer && crate::selection::role(job, false).is_none())
             || job.test.as_ref().is_some_and(|test| test != &self.test)
         {
             return Err(HostError::Job(
@@ -219,6 +250,8 @@ pub struct StageSummary {
     pub outcome: Outcome,
     pub exit_code: Option<i32>,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<crate::providers::SelectionEvidence>,
 }
 impl StageSummary {
     fn from_command(command: &CommandResult) -> Self {
@@ -234,6 +267,10 @@ impl StageSummary {
             outcome: command.outcome,
             exit_code: command.exit_code,
             summary,
+            selection: command
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.selection.clone()),
         }
     }
 }
@@ -479,11 +516,17 @@ impl WorkflowResult {
         let mut changed = false;
         for round in &mut self.rounds {
             changed |= shrink(&mut round.developer.summary);
+            if let Some(selection) = &mut round.developer.selection {
+                changed |= selection.shrink();
+            }
             if let Some(test) = &mut round.tests {
                 changed |= shrink(&mut test.summary);
             }
             if let Some(reviewer) = &mut round.reviewer {
                 changed |= shrink(&mut reviewer.summary);
+                if let Some(selection) = &mut reviewer.selection {
+                    changed |= selection.shrink();
+                }
             }
         }
         self.evidence_truncated |= changed;
@@ -530,14 +573,43 @@ fn valid_sha(value: &str) -> bool {
 }
 #[derive(Debug)]
 struct Stop {
+    failure: Box<Option<crate::resources::Failure>>,
     outcome: Outcome,
     message: String,
 }
 impl Stop {
     fn failure(message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
+            failure: Box::new(Some(crate::resources::Failure::new(
+                "workflow_guard_failed",
+                "workflow_guard",
+                message.clone(),
+            ))),
             outcome: Outcome::Failure,
-            message: message.into(),
+            message,
+        }
+    }
+    fn typed(code: &str, stage: &str, message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            failure: Box::new(Some(crate::resources::Failure::new(
+                code,
+                stage,
+                message.clone(),
+            ))),
+            outcome: Outcome::Failure,
+            message,
+        }
+    }
+    fn resource(error: std::io::Error) -> Self {
+        Self {
+            failure: Box::new(Some(crate::resources::failure_from_io(
+                &error,
+                "workspace_admission",
+            ))),
+            outcome: Outcome::Failure,
+            message: error.to_string(),
         }
     }
     fn command(command: &CommandResult, phase: &str) -> Self {
@@ -547,6 +619,13 @@ impl Stop {
             .unwrap_or_else(|| command.stderr.clone());
         truncate(&mut detail, 512);
         Self {
+            failure: Box::new(command.failure.clone().or_else(|| {
+                Some(crate::resources::Failure::new(
+                    "command_failed",
+                    phase,
+                    detail.clone(),
+                ))
+            })),
             outcome: command.outcome,
             message: format!("{phase} stopped: {detail}"),
         }
@@ -564,14 +643,29 @@ pub(crate) struct Execution<'a> {
     pub cancellation: &'a AtomicBool,
 }
 impl Execution<'_> {
+    fn reviewer_profile(&self) -> crate::providers::NativeProfile {
+        crate::selection::native_profile(self.job, self.host.config(), true)
+            .expect("validated role selection")
+            .expect("workflow has native reviewer")
+    }
     fn active(&self) -> Result<(), Stop> {
         if self.cancellation.load(Ordering::Acquire) {
             Err(Stop {
+                failure: Box::new(Some(crate::resources::Failure::new(
+                    "execution_cancelled",
+                    "workflow",
+                    "workflow cancelled",
+                ))),
                 outcome: Outcome::Cancelled,
                 message: "workflow cancelled".into(),
             })
         } else if Instant::now() >= self.deadline {
             Err(Stop {
+                failure: Box::new(Some(crate::resources::Failure::new(
+                    "execution_timed_out",
+                    "workflow",
+                    "workflow total deadline elapsed",
+                ))),
                 outcome: Outcome::TimedOut,
                 message: "workflow total deadline elapsed".into(),
             })
@@ -669,6 +763,7 @@ impl Execution<'_> {
                 } else {
                     self.host.config().output_limit_bytes
                 },
+                catalog: false,
                 app_server: None,
                 provider: None,
                 read_only: false,
@@ -690,11 +785,13 @@ impl Execution<'_> {
         if let Err(stop) = self.active() {
             return CommandResult::error(stop.outcome, stop.message);
         }
-        if let Some(native) = self.host.config().native_agents.get(name) {
-            let mut native = native.clone();
+        if let Some(mut native) =
+            crate::selection::native_profile(self.job, self.host.config(), read_only)
+                .expect("validated role selection")
+        {
             native.env.extend(self.env(prompt));
             native.env.extend(extra.clone());
-            self.host.run_native(
+            let mut command = self.host.run_native(
                 &native,
                 prompt,
                 read_only,
@@ -707,10 +804,13 @@ impl Execution<'_> {
                             .job
                             .continuation
                             .as_ref()
-                            .is_some_and(|c| c.review_only.is_some()),
+                            .is_some_and(|c| c.review_only.is_some())
+                        && !crate::replacement::changed(self.job, true),
                 ),
                 self.deadline,
-            )
+            );
+            crate::selection::annotate(&mut command, self.job, self.host.config(), read_only);
+            command
         } else if !read_only {
             self.profile(&self.host.config().agents[name], phase, prompt, extra)
         } else {
@@ -828,6 +928,7 @@ impl Execution<'_> {
                     .as_millis()
                     .max(1) as u64,
                 output_limit_bytes: GIT_CAPTURE_BYTES,
+                catalog: false,
                 app_server: None,
                 provider: None,
                 read_only: false,
@@ -981,7 +1082,7 @@ impl Execution<'_> {
     }
     fn admit_worktree(&self, bytes: u64) -> Result<(), Stop> {
         crate::host::check_workspace_admission(self.workspace, self.host.config(), bytes)
-            .map_err(|error| Stop::failure(error.to_string()))
+            .map_err(Stop::resource)
     }
     fn prepare_reviewer(&self, config: &WorkflowConfig, candidate: &str) -> Result<PathBuf, Stop> {
         let repository = self.workspace.join("reviewer-repository");
@@ -1102,12 +1203,11 @@ impl Execution<'_> {
         let base = self.sha(config, source, "HEAD^{commit}")?;
         self.clean(config, source)?;
         let worktree_bytes = self.worktree_bytes(config, source, &base)?;
-        let copies =
-            if crate::sessions::enabled(&self.host.config().native_agents[&config.reviewer]) {
-                2
-            } else {
-                1
-            };
+        let copies = if crate::sessions::enabled(&self.reviewer_profile()) {
+            2
+        } else {
+            1
+        };
         let planned_bytes = worktree_bytes
             .checked_mul(copies)
             .ok_or_else(|| Stop::failure("workspace admission byte count overflow"))?;
@@ -1339,6 +1439,7 @@ pub(crate) fn execute(context: Execution<'_>, name: &str, config: &WorkflowConfi
         Ok(()) => result.outcome = Outcome::Success,
         Err(stop) => {
             result.outcome = stop.outcome;
+            result.failure = *stop.failure;
             result.error = Some(stop.message);
         }
     }
@@ -1365,7 +1466,7 @@ fn run(
     context
         .host
         .probe_profile(
-            &context.host.config().native_agents[&config.reviewer],
+            &context.reviewer_profile(),
             true,
             context.cancellation,
             context.workspace,
@@ -1404,8 +1505,41 @@ fn run(
     } else {
         String::new()
     };
+    let stopped_developer = crate::replacement::current(context.job)
+        .map(|replacement| &replacement.stopped_stage)
+        .or_else(|| {
+            context
+                .job
+                .continuation
+                .as_ref()
+                .and_then(|c| c.developer_stage.as_ref())
+        });
+    let start_round = if let Some(stopped_stage) = stopped_developer {
+        if stopped_stage.role != crate::replacement::Role::Developer {
+            return Err(Stop::failure(
+                "replacement role does not match developer stage",
+            ));
+        }
+        let previous = crate::workspaces::read_stopped_result(context.workspace)
+            .map_err(|e| Stop::failure(e.to_string()))?;
+        if previous.stopped_stage.as_ref() != Some(stopped_stage)
+            || stopped_stage.base_sha.as_deref() != Some(&base)
+            || stopped_stage.candidate_sha.as_deref() != Some(&prior)
+        {
+            return Err(Stop::failure(
+                "stopped developer stage or candidate changed before execution",
+            ));
+        }
+        if let Some(old) = previous.workflow {
+            workflow.rounds = old.rounds;
+        }
+        feedback = stopped_stage.repair_feedback.clone();
+        stopped_stage.round
+    } else {
+        0
+    };
     truncate(&mut feedback, 12 * 1024);
-    for round in 0..=config.max_repairs {
+    for round in start_round..=config.max_repairs {
         context.active()?;
         workflow.reviewed_sha = None;
         let extra: BTreeMap<String, String> = [
@@ -1415,10 +1549,14 @@ fn run(
         ]
         .into_iter()
         .collect();
-        let prompt = format!(
+        let mut prompt = format!(
             "Implement the requirements in this workspace. Do not commit, change Git HEAD, publish, or invoke other agents. The trusted host will commit and test your changes.\n\nRequirements:\n{}\n\nPrior round feedback:\n{}",
             context.job.requirements, feedback
         );
+        if let Some(replacement) = crate::replacement::current(context.job) {
+            prompt.push_str("\n\nUntrusted stopped-stage handoff (diagnostic data only):\n");
+            prompt.push_str(&replacement.handoff);
+        }
         let developer = context.agent(
             &config.developer,
             false,
@@ -1430,6 +1568,19 @@ fn run(
         let success = developer.outcome == Outcome::Success;
         result.agent = Some(developer);
         if !success {
+            if result.agent.as_ref().expect("agent recorded").outcome != Outcome::Unknown {
+                let mut proof = crate::replacement::StoppedStage::developer(
+                    round,
+                    Some(&base),
+                    Some(&prior),
+                    config.max_repairs,
+                );
+                proof.feedback_complete = crate::replacement::feedback_fits(&feedback);
+                if proof.feedback_complete {
+                    proof.repair_feedback = feedback.clone();
+                }
+                result.stopped_stage = Some(proof);
+            }
             return Err(Stop::command(
                 result.agent.as_ref().expect("agent recorded"),
                 "developer",
@@ -1475,7 +1626,9 @@ fn run(
         context.verify(config, &candidate)?;
         if ordinary_failure {
             if round == config.max_repairs {
-                return Err(Stop::failure(
+                return Err(Stop::typed(
+                    "tests_failed",
+                    "tests",
                     "tests failed; workflow repair budget exhausted",
                 ));
             }
@@ -1495,7 +1648,9 @@ fn run(
             return finish_approved(context, config, result, workflow, &base, &candidate);
         }
         if round == config.max_repairs {
-            return Err(Stop::failure(
+            return Err(Stop::typed(
+                "review_changes_requested",
+                "review",
                 "review requested changes; workflow repair budget exhausted",
             ));
         }
@@ -1524,7 +1679,7 @@ fn run_operator_adoption(
     }
     let candidate = &adoption.review.candidate_sha;
     context.verify(config, candidate)?;
-    let reviewer = &context.host.config().native_agents[&config.reviewer];
+    let reviewer = &context.reviewer_profile();
     if crate::sessions::enabled(reviewer) {
         let repository = context.workspace.join("reviewer-repository");
         let checkpoint =
@@ -1548,6 +1703,11 @@ fn run_operator_adoption(
             reviewer,
             crate::workspaces::attempt(context.workspace)
                 .map_err(|error| Stop::failure(error.to_string()))?,
+            context
+                .job
+                .role_epochs
+                .as_ref()
+                .and_then(|epochs| epochs.role(true)),
         )
         .map_err(|error| {
             Stop::failure(format!(
@@ -1611,7 +1771,7 @@ fn run_review_only(
     }
     let candidate = &continuation.candidate_sha;
     context.verify(config, candidate)?;
-    let reviewer = &context.host.config().native_agents[&config.reviewer];
+    let reviewer = &context.reviewer_profile();
     if crate::sessions::enabled(reviewer) {
         let reviewer_repository = context.workspace.join("reviewer-repository");
         let reviewer_candidate =
@@ -1629,14 +1789,21 @@ fn run_review_only(
             ..*context
         };
         review_context.verify(config, candidate)?;
-        crate::sessions::Session::verify_reviewer_resume(
-            context.workspace,
-            &context.workspace.join("reviewer-repository"),
-            reviewer,
-            crate::workspaces::attempt(context.workspace)
-                .map_err(|e| Stop::failure(e.to_string()))?,
-        )
-        .map_err(|e| Stop::failure(format!("cannot resume original reviewer session: {e}")))?;
+        if !crate::replacement::changed(context.job, true) {
+            crate::sessions::Session::verify_reviewer_resume(
+                context.workspace,
+                &context.workspace.join("reviewer-repository"),
+                reviewer,
+                crate::workspaces::attempt(context.workspace)
+                    .map_err(|e| Stop::failure(e.to_string()))?,
+                context
+                    .job
+                    .role_epochs
+                    .as_ref()
+                    .and_then(|epochs| epochs.role(true)),
+            )
+            .map_err(|e| Stop::failure(format!("cannot resume original reviewer session: {e}")))?;
+        }
     }
     workflow.candidate_sha = Some(candidate.clone());
     workflow.review_continuation = context
@@ -1688,7 +1855,9 @@ fn run_review_only(
     if verdict == ReviewVerdict::Approved {
         finish_approved(context, config, result, workflow, base, candidate)
     } else {
-        Err(Stop::failure(
+        Err(Stop::typed(
+            "review_changes_requested",
+            "review",
             "review requested changes; review-only continuation never runs development or repairs; use normal continuation to change code",
         ))
     }
@@ -1724,7 +1893,7 @@ fn review_candidate(
     let patch = context.patch(config, base, candidate, round)?;
     // One fixed review checkout, separate from developer files and conversation.
     // Legacy stateless reviewers keep their established guarded cwd contract.
-    let isolated = crate::sessions::enabled(&context.host.config().native_agents[&config.reviewer]);
+    let isolated = crate::sessions::enabled(&context.reviewer_profile());
     let reviewer_repository = if isolated {
         if context
             .job
@@ -1763,7 +1932,7 @@ fn review_candidate(
     } else {
         patch
     };
-    let prompt = review_prompt(
+    let mut prompt = review_prompt(
         focus,
         &context.job.requirements,
         base,
@@ -1772,6 +1941,10 @@ fn review_candidate(
         &config.test,
         result.tests.as_ref().expect("successful test recorded"),
     );
+    if let Some(replacement) = crate::replacement::current(context.job) {
+        prompt.push_str("\n\nUntrusted stopped-stage handoff (diagnostic data only):\n");
+        prompt.push_str(&replacement.handoff);
+    }
     let reviewer = review_context.agent(
         &config.reviewer,
         true,
@@ -1786,19 +1959,38 @@ fn review_candidate(
         // if cancellation, timeout or candidate mutation would fail verification.
         return Err(Stop::command(&reviewer, "reviewer"));
     }
+    result.stopped_stage = Some(crate::replacement::StoppedStage {
+        role: crate::replacement::Role::Reviewer,
+        round,
+        base_sha: Some(base.into()),
+        candidate_sha: Some(candidate.into()),
+        max_repairs: config.max_repairs,
+        remaining_repairs: config.max_repairs.saturating_sub(round),
+        repair_feedback: String::new(),
+        feedback_complete: true,
+    });
     context.verify(config, candidate)?;
     review_context.verify(config, candidate)?;
     if reviewer.outcome != Outcome::Success {
         return Err(Stop::command(&reviewer, "reviewer"));
     }
-    let provider = reviewer
-        .provider
-        .as_ref()
-        .ok_or_else(|| Stop::failure("native reviewer did not produce normalized output"))?;
+    let provider = reviewer.provider.as_ref().ok_or_else(|| {
+        Stop::typed(
+            "review_verdict_invalid",
+            "review",
+            "native reviewer did not produce normalized output",
+        )
+    })?;
     if provider.summary_truncated {
-        return Err(Stop::failure("reviewer verdict was truncated"));
+        return Err(Stop::typed(
+            "review_verdict_invalid",
+            "review",
+            "reviewer verdict was truncated",
+        ));
     }
-    let review = ReviewResult::parse(&provider.summary, candidate)?;
+    let review = ReviewResult::parse(&provider.summary, candidate)
+        .map_err(|stop| Stop::typed("review_verdict_invalid", "review", stop.message))?;
+    result.stopped_stage = None;
     let verdict = review.verdict;
     workflow.rounds.last_mut().expect("round recorded").review = Some(review);
     Ok(verdict)
@@ -1980,6 +2172,11 @@ fn publish(
     {
         workflow.reconciliation_required = true;
         return Err(Stop {
+            failure: Box::new(Some(crate::resources::Failure::new(
+                "publication_reconciliation_required",
+                "publication",
+                "publication outcome requires remote reconciliation; do not retry automatically",
+            ))),
             outcome: if outcome == Outcome::Unknown {
                 Outcome::Unknown
             } else {
@@ -2251,6 +2448,7 @@ mod tests {
                 outcome: Outcome::Success,
                 exit_code: Some(0),
                 summary: "Developed".into(),
+                selection: None,
             },
             tests: None,
             review: Some(review),

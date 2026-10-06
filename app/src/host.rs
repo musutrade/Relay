@@ -7,6 +7,7 @@
 use crate::providers::{
     NativeProfile, ProtocolParser, ProviderKind, ProviderProbe, ProviderResult,
 };
+use crate::resources::{self, Failure, ResourceState};
 use crate::workflow::{self, WorkflowConfig, WorkflowResult};
 use relay::{MAX_PAYLOAD_BYTES, MAX_RESULT_BYTES, State, Task};
 use serde::{Deserialize, Serialize};
@@ -100,6 +101,16 @@ pub struct HostConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
+    /// Durable active role identity; server-owned and retained across continuation chains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_epochs: Option<crate::sessions::RoleEpochs>,
+    /// Server-owned admission record; external submissions cannot supply this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_binding: Option<crate::selection::RoleBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_selections: Option<crate::selection::RoleSelections>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_quota_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<crate::workspaces::Continuation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,6 +166,18 @@ impl Job {
     }
 
     pub fn validate(&self, config: &HostConfig) -> Result<(), HostError> {
+        if let Some(epochs) = &self.role_epochs {
+            epochs.validate()?;
+        }
+        if self
+            .workspace_quota_bytes
+            .is_some_and(|bytes| bytes == 0 || bytes > config.workspace_byte_limit())
+        {
+            return Err(HostError::Job(
+                "workspace_quota_bytes must be positive and no greater than the host policy cap"
+                    .into(),
+            ));
+        }
         if self.continuation.as_ref().is_some_and(|c| {
             c.workspace_task_id <= 0
                 || c.predecessor_task_id < c.workspace_task_id
@@ -206,6 +229,7 @@ impl Job {
             }
             (false, None) => {}
         }
+        crate::selection::validate_job(self, config)?;
         Ok(())
     }
 }
@@ -223,7 +247,11 @@ pub enum Outcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Failure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<Vec<crate::capabilities::ModelCapability>>,
     pub outcome: Outcome,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
@@ -238,7 +266,9 @@ pub struct CommandResult {
 impl CommandResult {
     pub(crate) fn error(outcome: Outcome, error: impl Into<String>) -> Self {
         Self {
+            failure: None,
             provider: None,
+            catalog: None,
             outcome,
             exit_code: None,
             signal: None,
@@ -256,6 +286,12 @@ impl CommandResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_stage: Option<crate::replacement::StoppedStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Failure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<WorkflowResult>,
     pub outcome: Outcome,
     pub workspace: Option<PathBuf>,
@@ -267,6 +303,9 @@ pub struct RunResult {
 impl RunResult {
     pub(crate) fn new(outcome: Outcome, error: Option<String>) -> Self {
         Self {
+            stopped_stage: None,
+            failure: None,
+            resources: None,
             workflow: None,
             outcome,
             workspace: None,
@@ -280,6 +319,17 @@ impl RunResult {
     /// Includes JSON escaping in the core's 16 KiB result budget.
     pub fn to_json(&self) -> String {
         let mut value = self.clone();
+        if let Some(failure) = &mut value.failure {
+            truncate_utf8(&mut failure.cause, 1024);
+            truncate_utf8(&mut failure.code, 80);
+            truncate_utf8(&mut failure.stage, 128);
+        }
+        if let Some(resources) = &mut value.resources {
+            truncate_utf8(&mut resources.enforcement, 64);
+            if let Some(reason) = &mut resources.usage.reason {
+                truncate_utf8(reason, 512);
+            }
+        }
         if let Some(error) = &mut value.error {
             truncate_utf8(error, 1024);
         }
@@ -287,6 +337,11 @@ impl RunResult {
             .into_iter()
             .flatten()
         {
+            if let Some(failure) = &mut command.failure {
+                truncate_utf8(&mut failure.cause, 1024);
+                truncate_utf8(&mut failure.code, 80);
+                truncate_utf8(&mut failure.stage, 128);
+            }
             if let Some(provider) = &mut command.provider {
                 provider.bound();
             }
@@ -327,15 +382,84 @@ impl RunResult {
             if !reduced {
                 value.workspace = None;
                 value.error = Some("result metadata exceeded the persistence budget".into());
-                for command in [&mut value.agent, &mut value.tests, &mut value.draft_pr]
-                    .into_iter()
-                    .flatten()
-                {
-                    command.error = None;
-                    command.provider = None;
-                }
+                value.failure = Some(Failure::new(
+                    "result_evidence_truncated",
+                    "persistence",
+                    "result metadata exceeded the persistence budget; retained workspace identity cannot be confirmed from this result",
+                ));
+                value.stopped_stage = None;
+                value.workflow = None;
+                value.agent = None;
+                value.tests = None;
+                value.draft_pr = None;
+                // No loop can retain unbounded caller-provided metadata. The bounded
+                // failure and resource limits remain visible; workspace=None blocks recovery.
+                return serde_json::to_string(&value).expect("serializable bounded fallback");
             }
         }
+    }
+}
+
+fn failure_for_outcome(outcome: Outcome, stage: &str, cause: String) -> Failure {
+    let code = match outcome {
+        Outcome::Unknown => "execution_unknown",
+        Outcome::TimedOut => "execution_timed_out",
+        Outcome::Cancelled => "execution_cancelled",
+        _ => "command_failed",
+    };
+    Failure::new(code, stage, cause)
+}
+impl RunResult {
+    fn complete_metadata(&mut self, policy: &HostConfig, quota: u64) {
+        if self.resources.is_none() {
+            let usage = self
+                .workspace
+                .as_deref()
+                .map(|path| resources::measure_workspace(path, policy))
+                .unwrap_or_else(|| {
+                    resources::Usage::unavailable("workspace has not been measured")
+                });
+            self.resources = Some(ResourceState::new(usage, Some(quota), policy));
+        }
+        if self.outcome == Outcome::Success {
+            self.failure = None;
+            return;
+        }
+        if self.failure.is_some() {
+            return;
+        }
+        for (stage, command) in [
+            ("publication", &self.draft_pr),
+            ("tests", &self.tests),
+            ("developer", &self.agent),
+        ] {
+            if let Some(command) = command
+                && command.outcome != Outcome::Success
+            {
+                self.failure = command.failure.clone().or_else(|| {
+                    Some(failure_for_outcome(
+                        command.outcome,
+                        stage,
+                        command
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| command.stderr.clone()),
+                    ))
+                });
+                return;
+            }
+        }
+        self.failure = Some(failure_for_outcome(
+            self.outcome,
+            if self.workspace.is_some() {
+                "workspace_setup"
+            } else {
+                "validation"
+            },
+            self.error
+                .clone()
+                .unwrap_or_else(|| "execution stopped before the next stage".into()),
+        ));
     }
 }
 
@@ -507,6 +631,27 @@ impl Host {
     /// Only execute a newly claimed generation. A pre-existing workspace is unknown,
     /// never evidence that the previous process stopped. No method here requeues.
     pub fn execute(&self, task: &Task, cancellation: Arc<AtomicBool>) -> RunResult {
+        let quota = Job::from_payload(&task.payload, &self.config)
+            .ok()
+            .and_then(|job| job.workspace_quota_bytes)
+            .unwrap_or_else(|| self.config.workspace_byte_limit());
+        let mut config = self.config.clone();
+        config.max_workspace_bytes = Some(quota);
+        let attempt = Self {
+            config,
+            supervisor: self.supervisor.clone(),
+            leases: Mutex::new(BTreeMap::new()),
+        };
+        let mut result = attempt.execute_at_limit(task, cancellation, &self.config);
+        result.complete_metadata(&self.config, quota);
+        result
+    }
+    fn execute_at_limit(
+        &self,
+        task: &Task,
+        cancellation: Arc<AtomicBool>,
+        policy: &HostConfig,
+    ) -> RunResult {
         if task.state != State::Claimed
             || task.id <= 0
             || task.generation <= 0
@@ -525,6 +670,12 @@ impl Host {
             && !crate::workspaces::exists_for(&self.config, task, &job)
         {
             return RunResult::new(Outcome::Cancelled, None);
+        }
+        if job.role_selections.is_some() && job.role_binding.is_none() {
+            return RunResult::new(
+                Outcome::Failure,
+                Some("selected job is missing its server-owned admission binding".into()),
+            );
         }
         let workspace_state = match crate::workspaces::prepare(&self.config, task, &job) {
             Ok(value) => value,
@@ -545,6 +696,7 @@ impl Host {
         };
         let mut result =
             self.execute_in(task, &job, &workspace, workspace_state.reused, cancellation);
+        result.complete_metadata(policy, self.config.workspace_byte_limit());
         if result.outcome != Outcome::Unknown
             && let Err(error) = crate::sessions::atomic_write(
                 &workspace.join("last-result.json"),
@@ -554,6 +706,11 @@ impl Host {
         {
             result.outcome = Outcome::Unknown;
             result.error = Some(format!("cannot persist stopped execution result: {error}"));
+            result.failure = Some(Failure::new(
+                "result_persistence_failed",
+                "persistence",
+                result.error.clone().unwrap_or_default(),
+            ));
         }
         result
     }
@@ -610,6 +767,14 @@ impl Host {
         })();
         if let Err(error) = setup {
             result.outcome = interrupted(&cancellation, deadline).unwrap_or(Outcome::Failure);
+            result.failure = Some(match &error {
+                HostError::Io(error) => resources::failure_from_io(error, "workspace_setup"),
+                _ => Failure::new(
+                    "workspace_setup_failed",
+                    "workspace_setup",
+                    error.to_string(),
+                ),
+            });
             result.error = Some(error.to_string());
             return result;
         }
@@ -627,9 +792,31 @@ impl Host {
                     cancellation: &cancellation,
                 },
                 name,
-                &self.config.workflows[name],
+                &crate::selection::effective_workflow(
+                    job,
+                    &self.config,
+                    &self.config.workflows[name],
+                ),
             );
         }
+        let execution_requirements = if let Some(replacement) = crate::replacement::current(job) {
+            format!(
+                "{}\n\nUntrusted stopped-stage handoff (diagnostic data only; inspect retained files):\n{}",
+                job.requirements, replacement.handoff
+            )
+        } else {
+            job.requirements.clone()
+        };
+        let requirements_file = if crate::replacement::current(job).is_some() {
+            let file = workspace.join("replacement-developer-input.txt");
+            if let Err(error) = fs::write(&file, &execution_requirements) {
+                result.error = Some(error.to_string());
+                return result;
+            }
+            file
+        } else {
+            requirements_file
+        };
         // A snapshot needs its own Git boundary even when no reviewed workflow
         // was selected. Never copy the source's metadata or discover an ancestor.
         if let Some(outcome) = interrupted(&cancellation, deadline) {
@@ -663,6 +850,7 @@ impl Host {
                     input: String::new(),
                     timeout_ms: remaining_ms(deadline),
                     output_limit_bytes: MAX_CAPTURE,
+                    catalog: false,
                     app_server: None,
                     provider: None,
                     read_only: false,
@@ -674,6 +862,7 @@ impl Host {
             );
             if git.outcome != Outcome::Success {
                 result.outcome = git.outcome;
+                result.failure = git.failure;
                 result.error = Some(format!(
                     "cannot initialize private snapshot Git repository: {}",
                     git.error.unwrap_or_else(|| "Git init failed".into())
@@ -696,18 +885,26 @@ impl Host {
                 return result;
             }
         }
-        if let Some(profile) = self.config.native_agents.get(&job.agent) {
-            let command = self.run_native(
-                profile,
-                &job.requirements,
+        if let Some(profile) = crate::selection::native_profile(job, &self.config, false)
+            .expect("validated role selection")
+        {
+            let mut command = self.run_native(
+                &profile,
+                &execution_requirements,
                 false,
                 &cancellation,
                 (workspace, &repository, false),
                 deadline,
             );
+            crate::selection::annotate(&mut command, job, &self.config, false);
             result.outcome = command.outcome;
             result.agent = Some(command);
             if result.outcome != Outcome::Success {
+                if result.outcome != Outcome::Unknown {
+                    result.stopped_stage = Some(crate::replacement::StoppedStage::developer(
+                        0, None, None, 0,
+                    ));
+                }
                 return result;
             }
         } else {
@@ -736,7 +933,7 @@ impl Host {
             }
             let expand = |arg: &str| -> String {
                 match arg {
-                    "{requirements}" => job.requirements.clone(),
+                    "{requirements}" => execution_requirements.clone(),
                     "{requirements_file}" => requirements_file.to_string_lossy().into_owned(),
                     "{workspace}" => repository.to_string_lossy().into_owned(),
                     "{repository}" => job.repository.clone(),
@@ -747,7 +944,7 @@ impl Host {
             };
             let mut env = profile.env.clone();
             for (key, value) in [
-                ("RELAY_REQUIREMENTS", job.requirements.clone()),
+                ("RELAY_REQUIREMENTS", execution_requirements.clone()),
                 (
                     "RELAY_REQUIREMENTS_FILE",
                     requirements_file.to_string_lossy().into_owned(),
@@ -766,6 +963,7 @@ impl Host {
             let spec = CommandSpec {
                 workspace_lease: false,
                 git_inventory: false,
+                catalog: false,
                 app_server: None,
                 provider: None,
                 read_only: false,
@@ -774,7 +972,7 @@ impl Host {
                 args: profile.args.iter().map(|arg| expand(arg)).collect(),
                 env,
                 cwd: repository.clone(),
-                input: job.requirements.clone(),
+                input: execution_requirements.clone(),
                 timeout_ms: deadline
                     .saturating_duration_since(Instant::now())
                     .as_millis()
@@ -790,6 +988,11 @@ impl Host {
             }
             result.outcome = outcome;
             if outcome != Outcome::Success {
+                if phase == "agent" && outcome != Outcome::Unknown {
+                    result.stopped_stage = Some(crate::replacement::StoppedStage::developer(
+                        0, None, None, 0,
+                    ));
+                }
                 return result;
             }
         }
@@ -857,6 +1060,7 @@ impl Host {
             let spec = CommandSpec {
                 workspace_lease: false,
                 git_inventory: false,
+                catalog: false,
                 app_server: None,
                 provider: None,
                 read_only: false,
@@ -1010,10 +1214,23 @@ impl Host {
                     profile,
                     read_only,
                     attempt,
-                    require_resume,
+                    require_resume
+                        || (crate::workspaces::role_epoch(workspace, read_only)?.is_some()
+                            && !crate::workspaces::fresh_role_epoch(workspace, read_only)?),
+                    crate::workspaces::role_epoch(workspace, read_only)?.as_deref(),
                 )
             }) {
-                Ok(session) => Some(session),
+                Ok(session) => {
+                    if let Err(error) =
+                        crate::workspaces::consume_fresh_role_epoch(workspace, read_only)
+                    {
+                        return CommandResult::error(
+                            Outcome::Failure,
+                            format!("cannot checkpoint active role epoch: {error}"),
+                        );
+                    }
+                    Some(session)
+                }
                 Err(error) => {
                     return CommandResult::error(
                         Outcome::Failure,
@@ -1036,12 +1253,14 @@ impl Host {
         let spec = CommandSpec {
             workspace_lease: false,
             git_inventory: false,
+            catalog: false,
             app_server: if profile.provider == ProviderKind::CodexAppServer {
                 Some(crate::app_server::Start {
                     cwd: repository.to_owned(),
                     prompt: input.to_owned(),
                     model: profile.model.clone(),
                     effort: profile.effort.clone(),
+                    native_permission: profile.native_permission,
                     resume: session.as_ref().and_then(|s| s.resume.clone()),
                     checkpoint: session.as_ref().map(|s| s.checkpoint()),
                 })
@@ -1086,6 +1305,29 @@ impl Host {
 
     pub(crate) fn run_supervised(
         &self,
+        spec: CommandSpec,
+        cancellation: &AtomicBool,
+        workspace: &Path,
+        phase: &str,
+    ) -> CommandResult {
+        let mut result = self.run_supervised_inner(spec, cancellation, workspace, phase);
+        if result.outcome != Outcome::Success && result.failure.is_none() {
+            result.failure = Some(failure_for_outcome(
+                result.outcome,
+                phase,
+                result.error.clone().unwrap_or_else(|| {
+                    if result.stderr.is_empty() {
+                        format!("command stopped with exit {:?}", result.exit_code)
+                    } else {
+                        result.stderr.clone()
+                    }
+                }),
+            ));
+        }
+        result
+    }
+    fn run_supervised_inner(
+        &self,
         mut spec: CommandSpec,
         cancellation: &AtomicBool,
         workspace: &Path,
@@ -1093,7 +1335,9 @@ impl Host {
     ) -> CommandResult {
         // Reject an already oversized task before starting any command or model.
         if let Err(error) = check_workspace_budget(workspace, &self.config) {
-            return CommandResult::error(Outcome::Failure, error.to_string());
+            let mut result = CommandResult::error(Outcome::Failure, error.to_string());
+            result.failure = Some(resources::failure_from_io(&error, phase));
+            return result;
         }
         let lease = match self.leases.lock() {
             Ok(leases) => leases.get(workspace).cloned(),
@@ -1176,7 +1420,9 @@ impl Host {
         let mut next_workspace_check = Instant::now();
         // JSON can escape each inventory byte to six bytes. stderr retains its
         // ordinary control-output budget; no task log budget is increased.
-        let mut output = Capture::new(if spec.git_inventory {
+        let mut output = Capture::new(if spec.catalog {
+            2 * crate::capabilities::MAX_CATALOG_RESPONSE_BYTES
+        } else if spec.git_inventory {
             6 * (crate::git_inventory::MAX_BYTES + MAX_PROBE_CAPTURE) + 128 * 1024
         } else if spec.output_limit_bytes > MAX_CAPTURE {
             1024 * 1024
@@ -1202,9 +1448,7 @@ impl Host {
                 }
             }
             if Instant::now() >= next_workspace_check && resource_error.is_none() {
-                resource_error = check_workspace_budget(workspace, &self.config)
-                    .err()
-                    .map(|error| error.to_string());
+                resource_error = check_workspace_budget(workspace, &self.config).err();
                 next_workspace_check = Instant::now() + Duration::from_millis(250);
                 if resource_error.is_some() {
                     input.take();
@@ -1240,14 +1484,12 @@ impl Host {
                     {
                         result.supervisor_pid = Some(pid);
                         if result.outcome != Outcome::Unknown {
-                            let resource_error = resource_error.or_else(|| {
-                                check_workspace_budget(workspace, &self.config)
-                                    .err()
-                                    .map(|error| error.to_string())
-                            });
+                            let resource_error = resource_error
+                                .or_else(|| check_workspace_budget(workspace, &self.config).err());
                             if let Some(error) = resource_error {
                                 result.outcome = Outcome::Failure;
-                                result.error = Some(error);
+                                result.failure = Some(resources::failure_from_io(&error, phase));
+                                result.error = Some(error.to_string());
                             } else if cancellation.load(Ordering::Acquire) {
                                 result.outcome = Outcome::Cancelled;
                             }
@@ -1370,7 +1612,12 @@ fn inspect_snapshot(source: &Path, budget: &mut SnapshotBudget<'_>) -> io::Resul
         }
         budget.entries += 1;
         if budget.entries > budget.config.max_snapshot_entries {
-            return Err(io::Error::other("snapshot entry limit exceeded"));
+            return Err(resources::budget_error(
+                "snapshot_entry_limit_exceeded",
+                resources::Usage::observed(budget.bytes, false),
+                budget.config.max_snapshot_entries as u64,
+                "snapshot entry limit exceeded",
+            ));
         }
         let metadata = fs::symlink_metadata(entry.path())?;
         if metadata.is_dir() {
@@ -1381,10 +1628,15 @@ fn inspect_snapshot(source: &Path, budget: &mut SnapshotBudget<'_>) -> io::Resul
                 .checked_add(metadata.len())
                 .ok_or_else(|| io::Error::other("snapshot admission byte count overflow"))?;
             if budget.bytes > budget.config.max_snapshot_bytes {
-                return Err(io::Error::other(format!(
-                    "snapshot byte limit exceeded: at least {} logical bytes, max_snapshot_bytes={}",
-                    budget.bytes, budget.config.max_snapshot_bytes
-                )));
+                return Err(resources::budget_error(
+                    "snapshot_limit_exceeded",
+                    resources::Usage::observed(budget.bytes, false),
+                    budget.config.max_snapshot_bytes,
+                    format!(
+                        "snapshot byte limit exceeded: at least {} logical bytes, max_snapshot_bytes={}",
+                        budget.bytes, budget.config.max_snapshot_bytes
+                    ),
+                ));
             }
         } else {
             return Err(io::Error::other(
@@ -1414,7 +1666,12 @@ fn copy_snapshot(
         }
         budget.entries += 1;
         if budget.entries > budget.config.max_snapshot_entries {
-            return Err(io::Error::other("snapshot entry limit exceeded"));
+            return Err(resources::budget_error(
+                "snapshot_entry_limit_exceeded",
+                resources::Usage::observed(budget.bytes, false),
+                budget.config.max_snapshot_entries as u64,
+                "snapshot entry limit exceeded",
+            ));
         }
         let metadata = fs::symlink_metadata(entry.path())?;
         let target = destination.join(&name);
@@ -1449,7 +1706,12 @@ fn copy_snapshot(
                 }
                 budget.bytes = budget.bytes.saturating_add(read as u64);
                 if budget.bytes > budget.config.max_snapshot_bytes {
-                    return Err(io::Error::other("snapshot byte limit exceeded"));
+                    return Err(resources::budget_error(
+                        "snapshot_limit_exceeded",
+                        resources::Usage::observed(budget.bytes, false),
+                        budget.config.max_snapshot_bytes,
+                        "snapshot byte limit exceeded",
+                    ));
                 }
                 target.write_all(&buffer[..read])?;
             }
@@ -1481,10 +1743,15 @@ pub(crate) fn check_workspace_admission(
         .checked_add(additional_bytes)
         .ok_or_else(|| io::Error::other("workspace admission byte count overflow"))?;
     if required > config.workspace_byte_limit() {
-        return Err(io::Error::other(format!(
-            "workspace admission estimate is {required} logical bytes ({present} present + {additional_bytes} planned file bytes), exceeding max_workspace_bytes={} (omitted: max_snapshot_bytes); Git objects, checkpoints and build growth may require more",
-            config.workspace_byte_limit()
-        )));
+        return Err(resources::admission_error(
+            present,
+            required,
+            config.workspace_byte_limit(),
+            format!(
+                "workspace admission estimate is {required} logical bytes ({present} present + {additional_bytes} planned file bytes), exceeding max_workspace_bytes={} (omitted: max_snapshot_bytes); Git objects, checkpoints and build growth may require more",
+                config.workspace_byte_limit()
+            ),
+        ));
     }
     Ok(())
 }
@@ -1512,7 +1779,12 @@ fn workspace_bytes(root: &Path, config: &HostConfig) -> io::Result<u64> {
             };
             entries += 1;
             if entries > config.max_snapshot_entries {
-                return Err(io::Error::other("running workspace entry limit exceeded"));
+                return Err(resources::budget_error(
+                    "workspace_entry_limit_exceeded",
+                    resources::Usage::observed(bytes, false),
+                    config.max_snapshot_entries as u64,
+                    "running workspace entry limit exceeded",
+                ));
             }
             if metadata.is_dir() {
                 directories.push(entry.path());
@@ -1521,10 +1793,15 @@ fn workspace_bytes(root: &Path, config: &HostConfig) -> io::Result<u64> {
             }
             // Never follow new symlinks while inspecting a running workspace.
             if bytes > config.workspace_byte_limit() {
-                return Err(io::Error::other(format!(
-                    "running workspace byte limit exceeded: at least {bytes} logical bytes, max_workspace_bytes={} (omitted: max_snapshot_bytes); includes Git metadata, reviewer copies and task control files",
-                    config.workspace_byte_limit()
-                )));
+                return Err(resources::budget_error(
+                    "workspace_quota_exceeded",
+                    resources::Usage::observed(bytes, false),
+                    config.workspace_byte_limit(),
+                    format!(
+                        "running workspace byte limit exceeded: at least {bytes} logical bytes, max_workspace_bytes={} (omitted: max_snapshot_bytes); includes Git metadata, reviewer copies and task control files",
+                        config.workspace_byte_limit()
+                    ),
+                ));
             }
         }
     }
@@ -1542,6 +1819,8 @@ pub(crate) struct CommandSpec {
     pub(crate) provider: Option<ProviderResult>,
     #[serde(default)]
     pub(crate) app_server: Option<crate::app_server::Start>,
+    #[serde(default)]
+    pub(crate) catalog: bool,
     #[serde(default)]
     pub(crate) read_only: bool,
     #[serde(default)]
@@ -1583,6 +1862,11 @@ pub fn supervisor_main() -> i32 {
             || spec.output_limit_bytes == 0
             || spec.output_limit_bytes > MAX_PROBE_CAPTURE
             || spec.input.len() > MAX_PHASE_INPUT
+            || (spec.catalog
+                && (spec.provider.is_none()
+                    || spec.app_server.is_some()
+                    || spec.git_inventory
+                    || !spec.input.is_empty()))
         {
             return Err(io::Error::other("invalid supervisor limits"));
         }
@@ -1691,9 +1975,11 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
     if spec.git_inventory {
         output.inventory = Some(crate::git_inventory::Framing::default());
     }
-    let bidirectional = spec.app_server.is_some();
+    let bidirectional = spec.app_server.is_some() || spec.catalog;
     let mut protocol = spec.provider.map(|result| {
-        if let Some(start) = spec.app_server {
+        if spec.catalog {
+            ProtocolParser::catalog(result)
+        } else if let Some(start) = spec.app_server {
             ProtocolParser::app_server(result, start)
         } else {
             ProtocolParser::new(result).read_only(spec.read_only)
@@ -1749,6 +2035,12 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
             .and_then(|_| errors.drain(&mut stderr))
         {
             error = Some(failure.to_string());
+            break;
+        }
+        if !bidirectional && let Some(failure) = protocol.as_ref().and_then(ProtocolParser::failure)
+        {
+            error = Some(failure.to_owned());
+            outcome = Outcome::Failure;
             break;
         }
         if bidirectional && input_offset == input_bytes.len() {
@@ -1860,6 +2152,7 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
             ));
         }
     }
+    let catalog = protocol.as_ref().and_then(ProtocolParser::catalog_result);
     let provider = protocol.map(|parser| {
         let (result, protocol_error) = parser.finish();
         if let Some(failure) = protocol_error {
@@ -1874,12 +2167,26 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
     });
     let (exit_code, signal) = status.unwrap_or((None, None));
     CommandResult {
-        provider,
+        failure: None,
+        provider: if spec.catalog { None } else { provider },
+        catalog: if outcome == Outcome::Success && error.is_none() {
+            catalog
+        } else {
+            None
+        },
         outcome,
         exit_code,
         signal,
-        stdout: output.text(),
-        stderr: errors.text(),
+        stdout: if spec.catalog {
+            String::new()
+        } else {
+            output.text()
+        },
+        stderr: if spec.catalog {
+            String::new()
+        } else {
+            errors.text()
+        },
         stdout_truncated: output.is_truncated(),
         stderr_truncated: errors.is_truncated(),
         duration_ms: started.elapsed().as_millis() as u64,

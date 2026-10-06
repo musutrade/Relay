@@ -48,6 +48,10 @@ impl Fixture {
     }
     fn job(&self) -> Job {
         Job {
+            role_epochs: None,
+            role_selections: None,
+            role_binding: None,
+            workspace_quota_bytes: None,
             continuation: None,
             workflow: None,
             repository: "fixture".into(),
@@ -630,13 +634,15 @@ fn native_claude_version_gate_never_starts_unsupported_model_run() {
     let f = native_fixture("claude_cli", NATIVE_CLAUDE_SUCCESS, "2.1.259 (Claude Code)");
     let result = f.run(&f.task(1));
     assert_eq!(result.outcome, Outcome::Success, "{result:?}");
+    let provider = result.agent.unwrap().provider.unwrap();
+    assert!(provider.reported_model.is_none());
     assert_eq!(
-        result
-            .agent
+        provider
+            .selection
             .unwrap()
-            .provider
+            .session_settings
             .unwrap()
-            .reported_model
+            .model
             .as_deref(),
         Some("reported-model")
     );

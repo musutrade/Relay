@@ -21,6 +21,15 @@ const filters=['all','queued','claimed','finished'].map(f=>{let e=new Element('b
 const document={getElementById:id=>{assert(nodes.has(id),'missing '+id);return nodes.get(id)},createElement:tag=>new Element(tag),querySelectorAll:()=>filters,documentElement:new Element('html'),get activeElement(){return active}};
 const $=id=>nodes.get(id),tick=()=>new Promise(r=>setTimeout(r,0));
 const task=(id,state='queued',outcome=null)=>({id,key:'key-'+id,payload:JSON.stringify({repository:'repo',agent:'agent',test:null,publish:false,requirements:'需求 '+id}),state,generation:state==='queued'?0:1,owner:state==='queued'?null:'host',result:outcome?JSON.stringify({outcome}):null});
+// Fixtures model the server-owned decision; production UI never infers actions from results.
+function operatorFixture(t){
+ const result=JSON.parse(t.result||'null'),job=JSON.parse(t.payload),w=result?.workflow,last=w?.rounds?.at(-1),sha=w?.candidate_sha;
+ const stopped=t.state==='finished'&&['failure','timed_out','cancelled'].includes(result?.outcome),reserved=Boolean(t.continuation_status),successor=t.continuation_status?.successor_id??null;
+ const retry=stopped&&!successor&&(reserved||(Boolean(result.workspace)&&!result.draft_pr));
+ const review=retry&&!reserved&&typeof job.workflow==='string'&&job.workflow===w?.name&&result.draft_pr===null&&[sha,w?.base_sha].every(v=>typeof v==='string'&&/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(v))&&w.reviewed_sha===null&&w.publication===null&&w.reconciliation_required===false&&last?.candidate_sha===sha&&last.review===null&&last.reviewer&&typeof last.reviewer==='object'&&!Array.isArray(last.reviewer)&&last.tests?.outcome==='success'&&last.tests.exit_code===0&&result.tests?.outcome==='success'&&result.tests.exit_code===0&&result.tests.signal===null&&result.tests.error===null;
+ const action=id=>({id,quota_increase_allowed:false,quota_increase_required:false,min_quota_bytes:null,max_quota_bytes:104857600,requires_test_revalidation:id==='continue_review'});
+ return {task_id:t.id,generation:t.generation,failure:null,resources:{usage:{logical_bytes:100,complete:true,measured_at:1700000000,reason:null},quota_bytes:104857600,host_policy_cap_bytes:104857600,snapshot_cap_bytes:104857600,enforcement:'logical_bytes_best_effort',os_hard_quota:false,disk_reserved:false},retained_result:{available:Boolean(t.result),immutable:true},workspace_retained:Boolean(result?.workspace),recovery:{inherited_quota_bytes:104857600,actions:successor?[]:[...(retry?[action('retry')]:[]),...(review?[action('continue_review')]:[])],blocked_reason:result?.draft_pr?'发布已尝试，需先核对外部结果后本机恢复':null,successor_id:successor,reserved_request:null}};
+}
 let config={repositories:['repo'],agents:['agent'],tests:['test']};
 let db=[task(3),task(2,'claimed'),task(1,'finished','success')],status={active:task(2,'claimed'),recovery_required:false,diagnostic:null},requests=[],submissions=[],retries=[],reviewRetries=[],mode='success',pendingFetch=[],failList=false,delayList=false,delayDetail=false,delayPost=false,delayConfig=false,ignoreAbort=false;
 const authMode=process.argv.includes('--session')?'session':process.argv.includes('--hybrid')?'hybrid':'bearer';
@@ -45,6 +54,7 @@ async function fetch(url,opts){assert.equal(opts.headers.Authorization,authMode=
    db=[data,...db.filter(t=>t.id!==data.id)];
   }
  }
+ else if(url.endsWith('/operator'))data=operatorFixture(db.find(t=>t.id===Number(url.split('/').at(-2))));
  else if(url.endsWith('/cancel'))data={requested:true};
  else data=db.find(t=>t.id===Number(url.split('/').at(-1)));
  const response={ok:code===200,status:code,json:async()=>JSON.parse(JSON.stringify(data))};
@@ -193,5 +203,9 @@ vm.runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1],ctx);
  // Rejection of a formerly configured workflow returns to an editable ordinary form.
  $('token').value='test-token';await $('auth-form').emit('submit');await chooseWorkflow('reviewed');$('requirements').value='被移除的工作流';mode='401';await $('task-form').emit('submit');config={repositories:[],agents:[],tests:[],workflows:[]};mode='422';$('token').value='test-token';await $('auth-form').emit('submit');const rejectedOriginal=submissions.at(-1);assert(!$('submit-task').disabled);await $('task-form').emit('submit');await tick();assert.deepEqual(submissions.at(-1),rejectedOriginal);assert.equal($('workflow').value,'');assert($('workflow-field').hidden);assert(!$('requirements').disabled);assert(!$('repository').disabled);assert.equal($('requirements').value,'被移除的工作流');assert.match($('form-message').textContent,/提交被拒绝/);assert($('submit-task').disabled);
  for(const args of [['--session'],['--session','--restore'],['--hybrid'],['--hybrid','--restore']]){const result=require('node:child_process').spawnSync(process.execPath,[__filename,...args],{stdio:'inherit'});assert.equal(result.status,0,'session UI subprocess failed')}
+ const resourceTests=require('node:child_process').spawnSync(process.execPath,[require('node:path').join(__dirname,'ui_resources_test.cjs')],{stdio:'inherit'});assert.equal(resourceTests.status,0,'resource UI subprocess failed');
+ const capabilityTests=require('node:child_process').spawnSync(process.execPath,[require('node:path').join(__dirname,'ui_capabilities_test.cjs')],{stdio:'inherit'});assert.equal(capabilityTests.status,0,'capability UI subprocess failed');
+ const roleTests=require('node:child_process').spawnSync(process.execPath,[require('node:path').join(__dirname,'ui_roles_test.cjs')],{stdio:'inherit'});assert.equal(roleTests.status,0,'role UI subprocess failed');
+ const replacementTests=require('node:child_process').spawnSync(process.execPath,[require('node:path').join(__dirname,'ui_replacement_test.cjs')],{stdio:'inherit'});assert.equal(replacementTests.status,0,'replacement UI subprocess failed');
  console.log('PASS: UI logic groups: review-only last-candidate eligibility; UTF-8 focus validation; immutable review retry through auth expiry; duplicate review guards; shared successor navigation; per-stage token usage; verified turn totals and separate snapshots; legacy unverified scope; missing/zero/malformed counts; provider cache semantics; optional reported cost; safe usage text; stale config response; rejected workflow reset; optional workflow config; locked metadata and ordinary restoration; invalid selection; safe workflow text; workflow payload; workflow auth retry after config changes; back/forward session reset; no unauthenticated polling; token memory only; double-click submit; exact-key retry; 32-KiB UTF-8 validation; active-task merge; matched unknown diagnostic; selection race; network recovery; auth-expiry retry; logout abort/stale response/poll stop');
 })().catch(e=>{console.error(e);process.exitCode=1}).finally(()=>{windowEvents.get('pagehide')()});

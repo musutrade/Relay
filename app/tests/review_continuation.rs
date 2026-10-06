@@ -44,7 +44,7 @@ import json, os, pathlib, sys
 if '--version' in sys.argv:
     print('2.1.281 (Claude Code)'); sys.exit()
 if '--help' in sys.argv:
-    print('--output-format --verbose --permission-prompts --restricted --tools --allowedTools --disallowedTools --disable-slash-commands --strict-mcp-config --mcp-config --no-session-persistence --session-id --resume --max-turns --max-budget-usd'); sys.exit()
+    print('--model --output-format --verbose --permission-prompts --restricted --tools --allowedTools --disallowedTools --disable-slash-commands --strict-mcp-config --mcp-config --no-session-persistence --session-id --resume --max-turns --max-budget-usd'); sys.exit()
 root = pathlib.Path(os.environ['FIXTURE_AUDIT'])
 log = root / 'reviewer.jsonl'
 count = len(log.read_text().splitlines()) if log.exists() else 0
@@ -138,6 +138,9 @@ fn git(repository: &Path, args: &[&str]) -> String {
 
 fn request(key: &str) -> ReviewContinuationRequest {
     ReviewContinuationRequest {
+        replacement: None,
+        permission_challenge: None,
+        workspace_quota_bytes: None,
         key: key.into(),
         confirm_stopped_and_reconciled: true,
         revalidate_tests: true,
@@ -452,6 +455,9 @@ fn duplicate_requests_reload_and_mixed_retry_share_first_winner() {
         app.retry(
             1,
             RetryRequest {
+                replacement: None,
+                permission_challenge: None,
+                workspace_quota_bytes: None,
                 key: "ordinary-retry".into(),
                 confirm_stopped_and_reconciled: true
             }
@@ -528,6 +534,9 @@ fn ordinary_retry_reservation_also_wins_over_review_continuation() {
         .retry(
             1,
             RetryRequest {
+                replacement: None,
+                permission_challenge: None,
+                workspace_quota_bytes: None,
                 key: "ordinary-first".into(),
                 confirm_stopped_and_reconciled: true,
             },
@@ -1802,6 +1811,9 @@ impl Fixture {
             app.retry(
                 id,
                 RetryRequest {
+                    replacement: None,
+                    permission_challenge: None,
+                    workspace_quota_bytes: None,
                     key: "cannot-retry-unknown".into(),
                     confirm_stopped_and_reconciled: true
                 }
@@ -1872,4 +1884,472 @@ fn unknown_review_only_tests_or_reviewer_never_downgrade_or_release_claim() {
         assert_eq!(app.get(1).unwrap(), original);
         assert_eq!(app.list(None).unwrap().len(), 2);
     }
+}
+
+fn add_replacement_reviewer(fixture: &mut Fixture, isolated: bool) {
+    let audit = fixture.temp.path().join("replacement-audit");
+    fs::create_dir(&audit).unwrap();
+    fs::write(audit.join("review-mode"), "approve").unwrap();
+    let mut profile = fixture.config.native_agents["reviewer"].clone();
+    profile
+        .env
+        .insert("FIXTURE_AUDIT".into(), audit.to_string_lossy().into());
+    profile.session_continuity = isolated;
+    fixture
+        .config
+        .native_agents
+        .insert("replacement".into(), profile);
+    fixture
+        .config
+        .workflows
+        .get_mut("checked")
+        .unwrap()
+        .selectable_reviewers = Some(vec!["replacement".into()]);
+}
+fn replacement_review(key: &str) -> ReviewContinuationRequest {
+    let mut input = request(key);
+    input.replacement = Some(serde_json::from_value(json!({"profile":"replacement"})).unwrap());
+    input
+}
+#[test]
+fn reviewer_replacement_preserves_candidate_old_history_and_runs_one_test_zero_developers() {
+    let mut fixture = Fixture::new();
+    add_replacement_reviewer(&mut fixture, true);
+    let (app, first) = fixture.failed_review();
+    let root = first.workspace.as_ref().unwrap();
+    let old = fs::read(root.join("sessions/reviewer.json")).unwrap();
+    let original = app.get(1).unwrap();
+    let successor = app
+        .continue_review(1, replacement_review("new-reviewer"))
+        .unwrap();
+    let payload: Value = serde_json::from_str(&successor.payload).unwrap();
+    let epoch = payload["role_epochs"]["reviewer"].as_str().unwrap();
+    assert!(app.work_once().unwrap());
+    let next = result(&app, successor.id);
+    assert_eq!(next.outcome, Outcome::Success, "{}", next.to_json());
+    assert!(next.agent.is_none());
+    assert_eq!(
+        next.workflow.as_ref().unwrap().candidate_sha,
+        first.workflow.unwrap().candidate_sha
+    );
+    fixture.assert_calls(1, 2, 1);
+    assert_eq!(fs::read(root.join("sessions/reviewer.json")).unwrap(), old);
+    let new = read_json(root.join(format!("sessions/reviewer-{epoch}.json")));
+    assert_ne!(
+        new["session_id"],
+        serde_json::from_slice::<Value>(&old).unwrap()["session_id"]
+    );
+    assert_eq!(app.get(1).unwrap(), original);
+    let calls =
+        fs::read_to_string(fixture.temp.path().join("replacement-audit/reviewer.jsonl")).unwrap();
+    let call: Value = serde_json::from_str(calls.trim()).unwrap();
+    assert!(
+        call["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == "--session-id")
+    );
+    assert!(
+        !call["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == "--resume")
+    );
+}
+#[test]
+fn reviewer_replacement_can_recover_missing_old_session_but_ordinary_cannot() {
+    let mut fixture = Fixture::new();
+    add_replacement_reviewer(&mut fixture, true);
+    let (app, first) = fixture.failed_review();
+    let root = first.workspace.as_ref().unwrap();
+    fs::remove_file(root.join("sessions/reviewer.json")).unwrap();
+    assert!(app.continue_review(1, request("ordinary")).is_err());
+    let operator = app.operator(1).unwrap();
+    let action = operator["recovery"]["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "continue_review")
+        .unwrap();
+    assert_eq!(action["ordinary_allowed"], false);
+    assert_eq!(action["replacement"]["allowed"], true);
+    app.continue_review(1, replacement_review("replace"))
+        .unwrap();
+    app.work_once().unwrap();
+    assert_eq!(result(&app, 2).outcome, Outcome::Success);
+    fixture.assert_calls(1, 2, 1);
+}
+#[test]
+fn reviewer_replacement_rejects_topology_changes_without_resetting_checkout() {
+    let mut fixture = Fixture::new();
+    add_replacement_reviewer(&mut fixture, false);
+    let (app, first) = fixture.failed_review();
+    let root = first.workspace.as_ref().unwrap();
+    let before = fs::read(root.join("claim.json")).unwrap();
+    let error = app
+        .continue_review(1, replacement_review("different-topology"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("reviewer_topology_change_unsupported"),
+        "{error}"
+    );
+    assert_eq!(fs::read(root.join("claim.json")).unwrap(), before);
+    fixture.assert_calls(1, 1, 1);
+}
+#[test]
+fn reviewer_replacement_rechecks_raw_candidate_index_and_frozen_result_before_execution() {
+    for mutation in ["raw", "index", "result"] {
+        let mut fixture = Fixture::new();
+        add_replacement_reviewer(&mut fixture, true);
+        let (app, first) = fixture.failed_review();
+        let root = first.workspace.as_ref().unwrap();
+        app.continue_review(1, replacement_review("reserved"))
+            .unwrap();
+        match mutation {
+            "raw" => {
+                fs::write(root.join("repository/changed.txt"), "tampered").unwrap();
+            }
+            "index" => {
+                fs::write(root.join("repository/changed.txt"), "tampered").unwrap();
+                git(&root.join("repository"), &["add", "changed.txt"]);
+                fs::write(root.join("repository/changed.txt"), "exact candidate\n").unwrap();
+            }
+            _ => {
+                let mut stopped = read_json(root.join("last-result.json"));
+                stopped["stopped_stage"]["round"] = json!(2);
+                fs::write(root.join("last-result.json"), stopped.to_string()).unwrap();
+            }
+        }
+        app.work_once().unwrap();
+        assert_eq!(result(&app, 2).outcome, Outcome::Failure);
+        fixture.assert_calls(1, 1, 1);
+        assert!(
+            !fixture
+                .temp
+                .path()
+                .join("replacement-audit/reviewer.jsonl")
+                .exists()
+        );
+    }
+}
+#[test]
+fn failed_repair_replacement_keeps_original_round_and_remaining_budget() {
+    let mut fixture = Fixture::new();
+    let developer = fixture.config.agents["developer"].program.clone();
+    executable(&developer,&DEVELOPER.replace("print('implemented fixture')","if os.environ['RELAY_WORKFLOW_ROUND']=='1':\n    pathlib.Path('dirty-repair.txt').write_text('keep repair work'); sys.exit(7)\nprint('implemented fixture')"));
+    let new_developer = fixture.temp.path().join("new-developer");
+    executable(
+        &new_developer,
+        r#"#!/usr/bin/python3
+import os,pathlib,sys
+prompt=sys.stdin.read()
+assert 'A fixture issue remains' in prompt
+assert os.environ['RELAY_WORKFLOW_ROUND']=='1'
+assert pathlib.Path('dirty-repair.txt').read_text()=='keep repair work'
+marker=pathlib.Path('.git/replacement-attempted')
+if not marker.exists(): marker.write_text('stopped once'); sys.exit(7)
+pathlib.Path('changed.txt').write_text('exact candidate\n')
+"#,
+    );
+    let mut profile = fixture.config.agents["developer"].clone();
+    profile.program = new_developer;
+    fixture
+        .config
+        .agents
+        .insert("replacement-dev".into(), profile);
+    let workflow = fixture.config.workflows.get_mut("checked").unwrap();
+    workflow.max_repairs = 1;
+    workflow.selectable_developers = Some(vec!["replacement-dev".into()]);
+    fixture.mode("reject");
+    let app = fixture.open();
+    app.submit(fixture.input()).unwrap();
+    app.work_once().unwrap();
+    let first = result(&app, 1);
+    let proof = first.stopped_stage.as_ref().unwrap();
+    assert_eq!(proof.round, 1);
+    assert_eq!(proof.remaining_repairs, 0);
+    let input=serde_json::from_value(json!({"key":"repair-replacement","confirm_stopped_and_reconciled":true,"replacement":{"profile":"replacement-dev"}})).unwrap();
+    app.retry(1, input).unwrap();
+    app.work_once().unwrap();
+    let interrupted = result(&app, 2);
+    assert_eq!(interrupted.stopped_stage.as_ref().unwrap().round, 1);
+    assert_eq!(
+        interrupted
+            .stopped_stage
+            .as_ref()
+            .unwrap()
+            .remaining_repairs,
+        0
+    );
+    app.retry(
+        2,
+        serde_json::from_value(
+            json!({"key":"ordinary-after-replacement","confirm_stopped_and_reconciled":true}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    app.work_once().unwrap();
+    let next = result(&app, 3);
+    assert_eq!(next.outcome, Outcome::Failure, "{}", next.to_json());
+    assert!(
+        next.error
+            .as_deref()
+            .unwrap()
+            .contains("repair budget exhausted"),
+        "{}",
+        next.to_json()
+    );
+    assert_eq!(
+        next.workflow
+            .unwrap()
+            .rounds
+            .iter()
+            .map(|r| r.round)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    fixture.assert_calls(2, 2, 2);
+}
+
+#[test]
+fn adoption_inherits_initial_reviewer_selection_instead_of_workflow_default() {
+    let mut fixture = Fixture::new();
+    add_replacement_reviewer(&mut fixture, true);
+    let audit = fixture.temp.path().join("replacement-audit");
+    fs::write(audit.join("review-mode"), "prose").unwrap();
+    let app = fixture.open();
+    let mut input = fixture.input();
+    input.job.role_selections = Some(serde_json::from_value(json!({
+        "reviewer": {"profile": "replacement", "model": {"value": "selected-review-model", "source": "manual"}}
+    })).unwrap());
+    app.submit(input).unwrap();
+    app.work_once().unwrap();
+    let failed = result(&app, 1);
+    assert_eq!(
+        failed.error.as_deref(),
+        Some("reviewer did not return the required JSON verdict")
+    );
+    let raw = fs::read_to_string(audit.join("reviewer-response.txt")).unwrap();
+    let candidate = failed
+        .workflow
+        .as_ref()
+        .unwrap()
+        .candidate_sha
+        .as_ref()
+        .unwrap();
+    let root = failed.workspace.as_ref().unwrap();
+    let session = fs::read(root.join("sessions/reviewer.json")).unwrap();
+    let calls = fs::read(audit.join("reviewer.jsonl")).unwrap();
+    let child = app
+        .adopt_review(1, adoption_request("adopt-selected", candidate, &raw))
+        .unwrap();
+    app.work_once().unwrap();
+    let adopted = result(&app, child.id);
+    assert_eq!(adopted.outcome, Outcome::Success, "{}", adopted.to_json());
+    assert_eq!(
+        fs::read(root.join("sessions/reviewer.json")).unwrap(),
+        session
+    );
+    assert_eq!(fs::read(audit.join("reviewer.jsonl")).unwrap(), calls);
+    fixture.assert_calls(1, 1, 0);
+}
+
+#[test]
+fn adoption_inherits_replacement_reviewer_epoch_and_rejects_changed_epoch() {
+    for tamper in [false, true] {
+        let mut fixture = Fixture::new();
+        add_replacement_reviewer(&mut fixture, true);
+        let audit = fixture.temp.path().join("replacement-audit");
+        fs::write(audit.join("review-mode"), "prose").unwrap();
+        let (app, first) = fixture.failed_review();
+        let root = first.workspace.as_ref().unwrap();
+        let original = app.get(1).unwrap();
+        let old_session = fs::read(root.join("sessions/reviewer.json")).unwrap();
+        let replacement = app
+            .continue_review(1, replacement_review("replacement-prose"))
+            .unwrap();
+        app.work_once().unwrap();
+        let failed = result(&app, replacement.id);
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("reviewer did not return the required JSON verdict")
+        );
+        let predecessor = app.get(replacement.id).unwrap();
+        let payload: Value = serde_json::from_str(&predecessor.payload).unwrap();
+        let epoch = payload["role_epochs"]["reviewer"].as_str().unwrap();
+        let path = root.join(format!("sessions/reviewer-{epoch}.json"));
+        let session = fs::read(&path).unwrap();
+        let calls = fs::read(audit.join("reviewer.jsonl")).unwrap();
+        let raw = fs::read_to_string(audit.join("reviewer-response.txt")).unwrap();
+        let candidate = failed
+            .workflow
+            .as_ref()
+            .unwrap()
+            .candidate_sha
+            .as_ref()
+            .unwrap();
+        let child = app
+            .adopt_review(
+                replacement.id,
+                adoption_request("adopt-replacement", candidate, &raw),
+            )
+            .unwrap();
+        let adopted_payload: Value = serde_json::from_str(&child.payload).unwrap();
+        for name in ["role_epochs", "role_selections", "role_binding"] {
+            assert_eq!(adopted_payload[name], payload[name], "preserved {name}");
+        }
+        assert!(adopted_payload["continuation"]["replacement"].is_null());
+        if tamper {
+            let mut record: Value = serde_json::from_slice(&session).unwrap();
+            record["epoch"] = json!("0".repeat(32));
+            fs::write(&path, record.to_string()).unwrap();
+        }
+        app.work_once().unwrap();
+        let adopted = result(&app, child.id);
+        assert_eq!(
+            adopted.outcome,
+            if tamper {
+                Outcome::Failure
+            } else {
+                Outcome::Success
+            },
+            "{}",
+            adopted.to_json()
+        );
+        if !tamper {
+            assert_eq!(fs::read(&path).unwrap(), session);
+        }
+        assert_eq!(
+            fs::read(root.join("sessions/reviewer.json")).unwrap(),
+            old_session
+        );
+        assert_eq!(fs::read(audit.join("reviewer.jsonl")).unwrap(), calls);
+        assert_eq!(app.get(1).unwrap(), original);
+        assert_eq!(app.get(replacement.id).unwrap(), predecessor);
+        fixture.assert_calls(1, 2, 1);
+    }
+}
+
+#[test]
+fn adoption_after_developer_replacement_does_not_resume_development() {
+    let mut fixture = Fixture::new();
+    let developer = fixture.config.agents["developer"].program.clone();
+    executable(
+        &developer,
+        &DEVELOPER.replace("print('implemented fixture')", "sys.exit(7)"),
+    );
+    let new_developer = fixture.temp.path().join("replacement-developer");
+    executable(&new_developer, DEVELOPER);
+    let mut profile = fixture.config.agents["developer"].clone();
+    profile.program = new_developer;
+    fixture
+        .config
+        .agents
+        .insert("replacement-dev".into(), profile);
+    fixture
+        .config
+        .workflows
+        .get_mut("checked")
+        .unwrap()
+        .selectable_developers = Some(vec!["replacement-dev".into()]);
+    fixture.mode("prose");
+    let app = fixture.open();
+    app.submit(fixture.input()).unwrap();
+    app.work_once().unwrap();
+    assert_eq!(result(&app, 1).outcome, Outcome::Failure);
+    let replacement = app.retry(1, serde_json::from_value(json!({
+        "key":"replace-developer", "confirm_stopped_and_reconciled":true, "replacement":{"profile":"replacement-dev"}
+    })).unwrap()).unwrap();
+    app.work_once().unwrap();
+    let failed = result(&app, replacement.id);
+    assert_eq!(
+        failed.error.as_deref(),
+        Some("reviewer did not return the required JSON verdict")
+    );
+    let raw = fs::read_to_string(fixture.temp.path().join("audit/reviewer-response.txt")).unwrap();
+    let candidate = failed
+        .workflow
+        .as_ref()
+        .unwrap()
+        .candidate_sha
+        .as_ref()
+        .unwrap();
+    let child = app
+        .adopt_review(
+            replacement.id,
+            adoption_request("adopt-after-developer", candidate, &raw),
+        )
+        .unwrap();
+    let payload: Value = serde_json::from_str(&child.payload).unwrap();
+    assert!(payload["role_epochs"]["developer"].is_string());
+    assert!(payload["continuation"]["developer_stage"].is_null());
+    app.work_once().unwrap();
+    let adopted = result(&app, child.id);
+    assert_eq!(adopted.outcome, Outcome::Success, "{}", adopted.to_json());
+    fixture.assert_calls(2, 1, 1);
+}
+
+#[test]
+fn adoption_reservation_crash_gap_is_only_resumable_by_matching_local_request() {
+    let fixture = Fixture::new();
+    let (app, first, raw) = fixture.prose_review();
+    let candidate = first
+        .workflow
+        .as_ref()
+        .unwrap()
+        .candidate_sha
+        .as_ref()
+        .unwrap();
+    let child = app
+        .adopt_review(1, adoption_request("reserved-adoption", candidate, &raw))
+        .unwrap();
+    drop(app);
+    // Simulate a crash after the immutable reservation but before core submission.
+    let db = rusqlite::Connection::open(fixture.db()).unwrap();
+    db.execute(
+        "UPDATE app_continuations SET task_id=NULL WHERE predecessor_id=1",
+        [],
+    )
+    .unwrap();
+    db.execute("DELETE FROM tasks WHERE id=?1", [child.id])
+        .unwrap();
+    drop(db);
+    let app = fixture.open();
+    let operator = app.operator(1).unwrap();
+    assert_eq!(operator["recovery"]["actions"], json!([]));
+    assert!(operator["recovery"]["reserved_request"].is_null());
+    assert!(
+        operator["recovery"]["blocked_reason"]
+            .as_str()
+            .unwrap()
+            .contains("local adopt-review")
+    );
+    assert!(
+        app.retry(
+            1,
+            serde_json::from_value(
+                json!({"key":"other-retry","confirm_stopped_and_reconciled":true})
+            )
+            .unwrap()
+        )
+        .is_err()
+    );
+    assert!(app.continue_review(1, request("other-review")).is_err());
+    assert_eq!(app.list(None).unwrap().len(), 1);
+    let restored = app
+        .adopt_review(1, adoption_request("reserved-adoption", candidate, &raw))
+        .unwrap();
+    assert_eq!(restored.payload, child.payload);
+    assert_eq!(
+        app.operator(1).unwrap()["recovery"]["successor_id"],
+        restored.id
+    );
+    app.work_once().unwrap();
+    let adopted = result(&app, restored.id);
+    assert_eq!(adopted.outcome, Outcome::Success, "{}", adopted.to_json());
+    fixture.assert_calls(1, 1, 1);
 }

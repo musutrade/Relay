@@ -30,7 +30,7 @@ fn public_workflow_metadata_contains_selectors_without_execution_configuration()
     assert_eq!(
         public["workflows"],
         json!([{
-            "name":"checked", "repository":"fixture", "developer":"fake", "reviewer":"reviewer", "test":"pass", "max_repairs":1
+            "name":"checked", "repository":"fixture", "developer":"fake", "reviewer":"reviewer", "test":"pass", "max_repairs":1, "selectable_developers":["fake"], "selectable_reviewers":["reviewer"]
         }])
     );
     let serialized = public.to_string();
@@ -539,4 +539,65 @@ async fn browser_session_http_boundary_and_secret_redaction() {
             .status(),
         StatusCode::UNAUTHORIZED
     );
+}
+
+#[tokio::test]
+async fn catalog_reads_are_authenticated_cached_and_do_not_expose_profile_secrets() {
+    let root = TempDir::new().unwrap();
+    let mut config = config(root.path());
+    config.native_agents.insert(
+        "configured-native".into(),
+        serde_json::from_value(json!({
+            "provider":"codex_app_server", "program":"/bin/sh",
+            "model":"operator-model", "env":{"PRIVATE_CREDENTIAL":"never-expose-this-value"}
+        }))
+        .unwrap(),
+    );
+    let app = Application::open(root.path().join("queue.db"), config).unwrap();
+    let router = http::router(app.clone(), TOKEN.into()).unwrap();
+    let (status, _) = request(
+        router.clone(),
+        "GET",
+        "/api/capabilities",
+        Value::Null,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, catalog) = request(
+        router.clone(),
+        "GET",
+        "/api/capabilities",
+        Value::Null,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(catalog["profiles"].as_array().unwrap().len(), 1);
+    assert_eq!(catalog["profiles"][0]["name"], "configured-native");
+    assert_eq!(catalog["profiles"][0]["generation"], 0);
+    assert_eq!(catalog["profiles"][0]["stale"], true);
+    assert!(catalog["profiles"][0]["catalog"].is_null());
+    assert!(!catalog.to_string().contains("never-expose-this-value"));
+    assert!(!catalog.to_string().contains("/bin/sh"));
+    let (status, _) = request(
+        router.clone(),
+        "POST",
+        "/api/capabilities/unconfigured/refresh",
+        Value::Null,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = request(
+        router,
+        "POST",
+        "/api/capabilities/configured-native/refresh",
+        Value::Null,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(app.list(None).unwrap().is_empty());
+    assert_eq!(app.capabilities().unwrap()[0].generation, 0);
 }

@@ -3,7 +3,7 @@ Requires Python Playwright and an installed Chromium (or CHROMIUM_PATH).
 Uses a local fixture, fake token, and no real repository execution.
 The application itself has no JavaScript/build dependencies.
 """
-import json, threading, tempfile, os
+import json, threading, tempfile, os, re, time
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from playwright.sync_api import sync_playwright, expect
@@ -32,11 +32,60 @@ def review_task(i, outcome='failure'):
         'developer':passed,'tests':passed,'review':None,
         'reviewer':{'outcome':'failure','exit_code':1,'summary':'审查连接中断'}}]}},ensure_ascii=False)
     return value
+def resource_fixture():
+    return {'host_policy_cap_bytes':104857600,'default_quota_bytes':104857600,'snapshot_cap_bytes':52428800,
+        'initial_estimate':{'source':'host_inventory','snapshot_bytes':1000,'git_metadata_reference_bytes':500,
+            'reviewer_copy_bytes':1000,'estimated_initial_bytes':2500,'complete':True,'notes':['初始清单估算，不保证后续构建完成']},
+        'build_growth':'unknown','enforcement':'logical_bytes_best_effort','os_hard_quota':False,'disk_reserved':False}
+def operator_fixture(value, reservation=None, saved=None):
+    result=json.loads(value['result']) if value['result'] else {};job=json.loads(value['payload'])
+    workflow=result.get('workflow') or {};rounds=workflow.get('rounds') or [];last=rounds[-1] if rounds else {}
+    sha=workflow.get('candidate_sha');tests=result.get('tests') or {};last_tests=last.get('tests') or {}
+    successor=(reservation or {}).get('successor_id')
+    retry=value['state']=='finished' and result.get('outcome') in ['failure','timed_out','cancelled'] and successor is None and (reservation is not None or (result.get('workspace') and result.get('draft_pr') is None))
+    review=retry and reservation is None and job.get('workflow') and job['workflow']==workflow.get('name') and all(isinstance(v,str) and re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})',v) for v in [sha,workflow.get('base_sha')]) and workflow.get('reviewed_sha') is None and workflow.get('publication') is None and workflow.get('reconciliation_required') is False and last.get('candidate_sha')==sha and last.get('review') is None and isinstance(last.get('reviewer'),dict) and last_tests.get('outcome')=='success' and last_tests.get('exit_code')==0 and tests.get('outcome')=='success' and tests.get('exit_code')==0 and tests.get('signal') is None and tests.get('error') is None
+    cap=104857600;quota=job.get('workspace_quota_bytes',cap)
+    def action(name):
+        return {'id':name,'quota_increase_allowed':quota<cap,'quota_increase_required':False,'min_quota_bytes':quota+1 if quota<cap else None,'max_quota_bytes':cap,'requires_test_revalidation':name=='continue_review'}
+    frozen=None
+    if saved:
+        body=saved['body'];frozen={'action_id':'continue_review' if saved['path'].endswith('/continue-review') else 'retry','key':body['key'],'workspace_quota_bytes':body.get('workspace_quota_bytes'),'revalidate_tests':body.get('revalidate_tests',False),'review_focus':body.get('review_focus'),'replacement':body.get('replacement')}
+    actions=[action('retry')] if retry else []
+    if review: actions.append(action('continue_review'))
+    if frozen and successor is None: actions=[action(frozen['action_id'])]
+    return {'task_id':value['id'],'generation':value['generation'],'failure':result.get('failure'),
+        'resources':{'usage':{'logical_bytes':4096,'complete':True,'measured_at':1700000000,'reason':None},'quota_bytes':quota,'host_policy_cap_bytes':cap,'snapshot_cap_bytes':52428800,'enforcement':'logical_bytes_best_effort','os_hard_quota':False,'disk_reserved':False},
+        'retained_result':{'available':value['result'] is not None,'immutable':True},'workspace_retained':bool(result.get('workspace')),
+        'recovery':{'inherited_quota_bytes':quota,'actions':actions,'blocked_reason':'发布已尝试，需先核对外部结果后本机恢复' if result.get('draft_pr') else None,'successor_id':successor,'reserved_request':frozen}}
+def catalog_fixture():
+    def evidence(state, reason, source='fixture:read-only-discovery'):
+        return {'state':state,'reason':reason,'source':source}
+    attack='<img src=x onerror=alert(1)>'
+    return {'provider':'codex_app_server','checked_at_unix_ms':1700000000000,'cli_version':'fixture-cli 1.0',
+        'executable':evidence('supported','Configured executable is runnable'),
+        'compatibility':evidence('supported','Protocol verified'),
+        'authentication':evidence('unknown','Account authentication is not checked'),
+        'reviewer_isolation':evidence('unsupported','Read-only reviewer isolation is unavailable'),
+        'permission_control':evidence('supported','Approval requests are rejected'),
+        'session_continuity':evidence('supported','Explicit sessions are supported'),
+        'startup_context':evidence('unknown','Discovery context differs from execution'),
+        'process_cleanup':evidence('supported','Discovery process has stopped'),
+        'model_catalog':evidence('supported','All catalog pages returned'),
+        'models':[{'id':'fixture-model','model':'fixture-model','display_name':attack,
+            'description':'Model metadata is plain text '+attack,'default_effort':'high',
+            'supported_efforts':[{'effort':'low','description':'Fast'},{'effort':'high','description':attack}],
+            'is_default':True,'hidden':False,'source':'fixture:model/list'}],
+        'selection':{'requested_model':'manual-model','requested_effort':'high',
+            'effective_model':None,'effective_effort':None,
+            'status':evidence('unknown','Execution has not verified the requested configuration')}}
 with sync_playwright() as p:
     browser=p.chromium.launch(executable_path=os.environ.get('CHROMIUM_PATH'),headless=True,args=['--no-sandbox'])
     context=browser.new_context(viewport={'width':1440,'height':1150},locale='zh-CN')
     page=context.new_page(); errors=[]; requests=[]; submissions=[]
     data={'tasks':[task(3,'queued'),task(2,'claimed'),task(1,'finished',outcome='success')], 'status':{'active':task(2,'claimed'),'recovery_required':False,'diagnostic':None},'post':'success','list_error':False,'continuations':{},'continuation_payloads':{},'continuation_post':'success','hidden_task_ids':set(),'frozen_lists':{},'retry_requests':[],'review_requests':[],'config':{'repositories':['relay-demo','api-service'],'agents':['codex','reviewer'],'tests':['unit','full']}}
+    data['catalog']={'name':'codex','cache_epoch':'browser-fixture-process','generation':0,'stale':True,'refreshing':False,'catalog':None}
+    data['catalog_refreshes']=0
+    data['resources']=resource_fixture();data['operator_overrides']={}
     # Model persisted reservations separately from visible task payloads. A child
     # outside the recent page must not make its predecessor appear retryable.
     def task_response(value):
@@ -48,6 +97,46 @@ with sync_playwright() as p:
         assert req.headers.get('authorization')=='Bearer test-token',req.headers
         if path=='/api/config': result=data['config']
         elif path=='/api/status': result=data['status']
+        elif path.startswith('/api/resources?'): result=data['resources']
+        elif path.endswith('/replacement-challenge'):
+            assert req.method=='POST'
+            body=req.post_data_json;old_id=int(path.split('/')[-2]);choice=body['replacement']
+            assert 'confirm_permission_expansion' not in choice
+            data.setdefault('replacement_challenges',[]).append((old_id,body))
+            role='reviewer' if body['action']=='continue_review' else 'developer'
+            profile=next(p for p in data['config']['native_agents'] if p['name']==choice['profile'])
+            result={'challenge':f"{len(data['replacement_challenges'])+100:064x}",'expires_at_unix_ms':int(time.time()*1000)+data.get('replacement_expiry_ms',300000),
+                'confirmation_text':'Confirm this stopped-stage replacement <img src=x>',
+                'scope':{'predecessor_task_id':old_id,'action':body['action'],'role':role,'repository':'relay-demo','workflow':'reviewed',
+                    role:{'profile':choice['profile'],'provider':profile['provider'],'model':choice.get('model',{}).get('value',profile['model']),
+                        'effort':choice.get('effort',profile['effort']),'native_permission':choice.get('native_permission',profile['native_permission'])}}}
+        elif path=='/api/permission-challenge':
+            assert req.method=='POST'
+            job=req.post_data_json['job'];data.setdefault('permission_challenges',[]).append(job)
+            assert 'role_binding' not in job
+            for choice in job.get('role_selections',{}).values(): assert 'confirm_permission_expansion' not in choice
+            workflow=next((w for w in data['config'].get('workflows',[]) if w['name']==job.get('workflow')),None)
+            def resolve_role(role):
+                choice=job.get('role_selections',{}).get(role,{})
+                name=choice.get('profile') or (job['agent'] if role=='developer' else workflow['reviewer'] if workflow else None)
+                if name is None: return None
+                profile=next(p for p in data['config']['native_agents'] if p['name']==name)
+                return {'profile':name,'provider':profile['provider'],'model':choice.get('model',{}).get('value',profile['model']),
+                    'effort':choice.get('effort',profile['effort']),'native_permission':choice.get('native_permission',profile['native_permission'])}
+            result={'challenge':f"{len(data['permission_challenges']):064x}",'expires_at_unix_ms':int(time.time()*1000)+300000,
+                'confirmation_text':'Confirm this exact host-resolved developer scope <img src=x>',
+                'scope':{'repository':job['repository'],'workflow':job.get('workflow'),'developer':resolve_role('developer'),'reviewer':resolve_role('reviewer')}}
+        elif path.endswith('/operator'):
+            task_id=int(path.split('/')[-2]);value=next(t for t in data['tasks'] if t['id']==task_id)
+            result=data['operator_overrides'].get(task_id) or operator_fixture(value,data['continuations'].get(task_id),data['continuation_payloads'].get(task_id))
+        elif path=='/api/capabilities':
+            assert req.method=='GET'
+            result={'profiles':data.get('catalogs', [data['catalog']]) if data['config'].get('native_agents') else []}
+        elif path=='/api/capabilities/codex/refresh':
+            assert req.method=='POST' and not req.post_data
+            data['catalog_refreshes']+=1
+            data['catalog'].update(generation=data['catalog']['generation']+1,stale=False,catalog=catalog_fixture())
+            result=data['catalog']
         elif path=='/api/tasks' and req.method=='GET':
             if data['list_error']: r.abort();return
             result=data['frozen_lists'].get(req.frame.page,visible_tasks())
@@ -64,13 +153,14 @@ with sync_playwright() as p:
             assert req.method=='POST'
             review=path.endswith('/continue-review')
             if review:
-                assert set(body)=={'key','confirm_stopped_and_reconciled','revalidate_tests','review_focus'}
+                assert set(body)-{'workspace_quota_bytes','replacement','permission_challenge'}=={'key','confirm_stopped_and_reconciled','revalidate_tests','review_focus'}
                 assert body['revalidate_tests'] is True
                 assert body['review_focus'] is None or 0<len(body['review_focus'].encode('utf-8'))<=8192
             else:
-                assert set(body)=={'key','confirm_stopped_and_reconciled'}
+                assert set(body)-{'workspace_quota_bytes','replacement','permission_challenge'}=={'key','confirm_stopped_and_reconciled'}
             data['review_requests' if review else 'retry_requests'].append((old_id,body))
             if data['continuation_post']=='abort': r.abort();return
+            if data['continuation_post']=='401': r.fulfill(status=401,content_type='application/json',body=json.dumps({'error':'Unauthorized'}));return
             old=next(t for t in data['tasks'] if t['id']==old_id)
             reservation=data['continuations'].setdefault(old_id,{'successor_id':None})
             # One persisted intent per predecessor, shared by both endpoints.
@@ -81,11 +171,17 @@ with sync_playwright() as p:
                 workspace_id=job.get('continuation',{}).get('workspace_task_id',old_id)
                 job['continuation']={'workspace_task_id':workspace_id,'predecessor_task_id':old_id,'predecessor_generation':old['generation']}
                 original=data['continuation_payloads'][old_id]
+                if 'workspace_quota_bytes' in original['body']: job['workspace_quota_bytes']=original['body']['workspace_quota_bytes']
                 if original['path'].endswith('/continue-review'):
                     workflow=json.loads(old['result'])['workflow']
                     job['continuation']['review_only']={'base_sha':workflow['base_sha'],'candidate_sha':workflow['candidate_sha'],'round':workflow['rounds'][-1]['round']}
                     if original['body']['review_focus'] is not None:
                         job['continuation']['review_only']['review_focus']=original['body']['review_focus']
+                if original['body'].get('replacement'):
+                    role='reviewer' if original['path'].endswith('/continue-review') else 'developer'
+                    choice=original['body']['replacement'];job.setdefault('role_selections',{})[role]=choice
+                    if role=='developer': job['agent']=choice['profile']
+                    job['continuation']['replacement']={'role':role,'session_epoch':1}
                 result=task(max(t['id'] for t in data['tasks'])+1);result['key']=original['body']['key'];result['payload']=json.dumps(job)
                 data['tasks'].append(result)
                 reservation['successor_id']=result['id']
@@ -131,6 +227,27 @@ with sync_playwright() as p:
     assert page.locator('.task-button').count()==3
     assert not page.locator('#workflow-field').is_visible(), 'Legacy configuration keeps the ordinary form'
     page.screenshot(path=str(SCREENSHOTS / 'relay-connected-desktop.png'),full_page=True)
+    # Estimates are bounded, explicit, selected-repository reads; task polling does not scan resources.
+    expect(page.locator('#workspace-quota')).to_be_disabled()
+    with page.expect_response(lambda response: '/api/resources?repository=relay-demo' in response.url):
+        page.locator('#resource-read').click()
+    expect(page.locator('#workspace-quota')).to_be_enabled()
+    expect(page.locator('#resource-estimate')).to_contain_text('初始总量估算')
+    expect(page.locator('#submission-resources')).to_contain_text('构建增长未知')
+    expect(page.locator('#submission-resources')).to_contain_text('不预留主机磁盘')
+    reads_before=len([path for method,path,_ in requests if path.startswith('/api/resources') or path.endswith('/operator')])
+    page.wait_for_timeout(2200)
+    assert len([path for method,path,_ in requests if path.startswith('/api/resources') or path.endswith('/operator')])==reads_before
+    data['resources']['initial_estimate'].update(complete=False,estimated_initial_bytes=None,git_metadata_reference_bytes=None,notes=['<img src=x onerror=alert(1)>'])
+    page.locator('#resource-read').click()
+    expect(page.locator('#resource-estimate-status')).to_contain_text('估算不完整')
+    expect(page.locator('#resource-estimate')).to_contain_text('初始总量估算：未知')
+    assert page.locator('#resource-estimate img').count()==0
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':900})
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'resource composer overflow at {width}'
+        page.screenshot(path=str(SCREENSHOTS / f'relay-resource-estimate-{width}.png'),full_page=True)
+    page.set_viewport_size({'width':1440,'height':1150})
     # Token details distinguish current-turn totals from the final snapshot.
     data['tasks'][2]['result']=json.dumps({'outcome':'success','agent':{'provider':{
         'provider':'codex_app_server','usage':{'usage_scope':'last_snapshot',
@@ -148,8 +265,53 @@ with sync_playwright() as p:
     page.set_viewport_size({'width':1440,'height':1150})
     page.locator('[data-task-id="3"]').click()
     assert not page.locator('#detail-usage').is_visible()
-    # Optional named workflows lock configured fields, then restore ordinary choices.
+    # The catalog reads cached evidence on login/open, without automatic discovery.
     page.locator('#logout').click()
+    data['config']['native_agents']=[{'name':'codex','provider':'codex_app_server','model':'manual-model','effort':'high','authentication':'unknown'}]
+    with page.expect_response(lambda response: response.url==base+'/api/capabilities' and response.request.method=='GET'):
+        connect(page)
+    expect(page.locator('#capability-panel')).to_be_visible()
+    expect(page.locator('#capability-body')).to_be_hidden()
+    assert data['catalog_refreshes']==0
+    with page.expect_response(lambda response: response.url==base+'/api/capabilities' and response.request.method=='GET'):
+        page.locator('#capability-toggle').click()
+    expect(page.locator('#capability-toggle')).to_have_attribute('aria-expanded','true')
+    expect(page.locator('#capability-profiles')).to_contain_text('尚无缓存')
+    expect(page.locator('#capability-disclaimer')).to_contain_text('不代表账户已登录、可调用模型或获得调用授权')
+    page.wait_for_timeout(2200)
+    assert data['catalog_refreshes']==0, 'Task polling must never trigger discovery'
+    with page.expect_response(lambda response: response.url==base+'/api/capabilities/codex/refresh' and response.request.method=='POST'):
+        page.locator('[data-catalog-refresh="codex"]').click()
+    card=page.locator('[data-profile="codex"]')
+    expect(card).to_contain_text('fixture-cli 1.0')
+    expect(card).to_contain_text('上次读取时缓存有效')
+    expect(card).to_contain_text('manual-model')
+    expect(card).to_contain_text('未知（尚无执行证据）')
+    expect(card).to_contain_text('Account authentication is not checked')
+    expect(card).to_contain_text('Discovery context differs from execution')
+    expect(card).to_contain_text('Read-only reviewer isolation is unavailable')
+    card.locator('.catalog-models summary').click()
+    expect(card.locator('.catalog-model-list')).to_be_visible()
+    expect(card.locator('.catalog-model-list')).to_contain_text('<img src=x onerror=alert(1)>')
+    expect(card.locator('.catalog-model-list')).to_contain_text('支持的 effort：low（Fast）、high')
+    expect(card.locator('.catalog-model-list')).to_contain_text('来源：fixture:model/list')
+    assert page.locator('img').count()==0, 'Catalog metadata must remain inert text'
+    assert card.locator('select,input').count()==0, 'Phase-one catalog is read-only'
+    assert data['catalog_refreshes']==1 and not submissions
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':900})
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'catalog overflow at {width}'
+        page.screenshot(path=str(SCREENSHOTS / f'relay-catalog-{width}.png'),full_page=True)
+    page.wait_for_timeout(2200)
+    assert data['catalog_refreshes']==1, 'Open catalog must not repeat discovery'
+    page.locator('#logout').click()
+    expect(page.locator('#capability-panel')).to_be_hidden()
+    expect(page.locator('#capability-body')).to_be_hidden()
+    expect(page.locator('#capability-profiles')).to_be_empty()
+    expect(page.locator('#capability-toggle')).to_have_attribute('aria-expanded','false')
+    data['config'].pop('native_agents')
+    page.set_viewport_size({'width':1440,'height':1150})
+    # Optional named workflows lock configured fields, then restore ordinary choices.
     reviewed={'name':'reviewed','repository':'api-service','developer':'native-codex','reviewer':'reviewer <img src=x onerror=alert(1)>','test':'full','max_repairs':2}
     data['config']['agents'] += [reviewed['developer'],reviewed['reviewer']]
     data['config']['workflows']=[reviewed,dict(reviewed,name='review-only',max_repairs=0)]
@@ -213,23 +375,27 @@ with sync_playwright() as p:
     page.locator('#requirements').fill('')
     # Recovery disables further submission and exposes diagnostic as inert text.
     data['status']['recovery_required']=True;data['status']['diagnostic']=json.dumps({'outcome':'unknown','reason':'进程组状态待人工核对 <b>safe</b>'})
-    page.locator('#refresh').click();page.wait_for_timeout(150)
-    assert page.locator('#recovery-banner').is_visible()
-    assert page.locator('#submit-task').is_disabled()
-    page.locator('.task-button[data-task-id="2"]').click()
-    assert page.locator('#detail-warning').is_visible()
-    assert '<b>safe</b>' in page.locator('#detail-diagnostic-text').inner_text()
-    page.locator('.task-button[data-task-id="4"]').click()
-    assert not page.locator('#detail-diagnostic').is_visible()
+    page.locator('#refresh').click()
+    # Refresh waits for both reads and may discard an overlapping stale revision.
+    # Assert the rendered state, rather than assuming a 150 ms completion window.
+    expect(page.locator('#recovery-banner')).to_be_visible()
+    expect(page.locator('#submit-task')).to_be_disabled()
+    select_task(page,2)
+    expect(page.locator('#detail-warning')).to_be_visible()
+    expect(page.locator('#detail-diagnostic-text')).to_contain_text('<b>safe</b>')
+    select_task(page,4)
+    expect(page.locator('#detail-diagnostic')).to_be_hidden()
     page.screenshot(path=str(SCREENSHOTS / 'relay-recovery-desktop.png'),full_page=True)
     # Network banner with last-known data.
-    data['list_error']=True;page.locator('#refresh').click();page.wait_for_timeout(150)
-    assert page.locator('#network-banner').is_visible()
-    assert page.locator('.task-button').count()==4
-    data['list_error']=False;page.locator('#refresh-error').click();page.wait_for_timeout(150)
-    assert not page.locator('#network-banner').is_visible()
+    data['list_error']=True;page.locator('#refresh').click()
+    expect(page.locator('#network-banner')).to_be_visible()
+    expect(page.locator('.task-button')).to_have_count(4)
+    data['list_error']=False;page.locator('#refresh-error').click()
+    expect(page.locator('#network-banner')).to_be_hidden()
     # Mobile / dark / zoom-like narrow viewport: no horizontal scrolling.
-    data['status']['recovery_required']=False;data['status']['diagnostic']=None;page.locator('#refresh').click();page.wait_for_timeout(150)
+    data['status']['recovery_required']=False;data['status']['diagnostic']=None;page.locator('#refresh').click()
+    expect(page.locator('#recovery-banner')).to_be_hidden()
+    expect(page.locator('#submit-task')).to_be_enabled()
     for width in [390,320,768,1024,1440]:
         page.set_viewport_size({'width':width,'height':900})
         assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'overflow at {width}'
@@ -339,6 +505,7 @@ with sync_playwright() as p:
     with fresh_page.expect_response(lambda response: response.url==base+'/api/tasks/121'):
         fresh_page.locator('#refresh').click()
     expect(fresh_page.locator('#retry-task')).to_be_visible()
+    fresh_page.locator('#operator-read').click()
     expect(fresh_page.locator('#retry-task')).to_be_enabled()
     expect(fresh_page.locator('#continuation-next')).to_be_hidden()
     fresh_page.locator('#retry-task').click();fresh_page.locator('#retry-confirm').click()
@@ -506,6 +673,229 @@ with sync_playwright() as p:
     select_task(stale_page,150);assert_successor(stale_page,150,151);stale_page.close()
     select_task(page,150);assert_successor(page,150,151)
     # Logout clears sensitive task content and stops polling.
+    # Resource recovery uses exact server eligibility, never failure-message heuristics.
+    resource_task=task(180,'finished',outcome='failure')
+    resource_job=json.loads(resource_task['payload']);resource_job['workspace_quota_bytes']=10485760;resource_task['payload']=json.dumps(resource_job)
+    resource_task['result']=json.dumps({'outcome':'failure','workspace':'/fixture/task-180','draft_pr':None,'failure':{'code':'workspace_quota_exceeded','stage':'test','cause':'<img src=x onerror=alert(1)> logical capacity exceeded','required_bytes':20971520,'limit_bytes':10485760}})
+    data['tasks'].append(resource_task)
+    planned_operator=operator_fixture(resource_task)
+    assert planned_operator['resources']['quota_bytes']==resource_job['workspace_quota_bytes']
+    assert planned_operator['recovery']['inherited_quota_bytes']==resource_job['workspace_quota_bytes']
+    planned_operator['recovery']['actions'][0].update(quota_increase_required=True,min_quota_bytes=20971520)
+    data['operator_overrides'][180]=planned_operator
+    with page.expect_response(lambda response: response.url==base+'/api/tasks'):
+        page.locator('#refresh').click()
+    select_task(page,180)
+    expect(page.locator('#operator-failure')).to_contain_text('workspace_quota_exceeded')
+    expect(page.locator('#operator-failure')).to_contain_text('<img src=x onerror=alert(1)>')
+    assert page.locator('#operator-failure img').count()==0
+    expect(page.locator('#operator-retained')).to_contain_text('已保留且不可改写')
+    for label in ['已记录任务容量','无覆盖续接容量']:
+        expect(page.locator('#operator-resources > div').filter(has_text=label)).to_contain_text('10.00 MiB（10485760 字节）')
+    page.locator('#retry-task').click();page.locator('#retry-confirm').click()
+    expect(page.locator('#retry-dialog')).to_be_visible()
+    expect(page.locator('#retry-dialog-error')).to_contain_text('宿主要求显式提高容量')
+    page.locator('#retry-quota').fill('20971520')
+    expect(page.locator('#retry-dialog-error')).to_be_hidden()
+    expect(page.locator('#retry-quota-summary')).to_contain_text('10485760 字节） → 20.00 MiB（20971520 字节）')
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':900})
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'resource recovery overflow at {width}'
+        page.screenshot(path=str(SCREENSHOTS / f'relay-resource-recovery-{width}.png'),full_page=True)
+    page.locator('#retry-dismiss').click()
+    blocked=operator_fixture(resource_task);blocked['resources']['usage'].update(logical_bytes=None,complete=False,reason='Inventory incomplete');blocked['recovery'].update(actions=[],blocked_reason='Unknown process or publication requires host reconciliation')
+    data['operator_overrides'][180]=blocked;page.locator('#operator-read').click()
+    expect(page.locator('#retry-task')).to_be_disabled()
+    expect(page.locator('#operator-resources')).to_contain_text('观测不完整')
+    expect(page.locator('#operator-recovery')).to_contain_text('requires host reconciliation')
+    blocked['resources']['quota_bytes']=blocked['resources']['host_policy_cap_bytes'];blocked['failure']['code']='source_snapshot_limit';page.locator('#operator-read').click()
+    expect(page.locator('#operator-failure')).to_contain_text('source_snapshot_limit')
+    expect(page.locator('#operator-recovery')).to_contain_text('经过授权的宿主配置变更')
+    # Phase 3: independent roles, fresh catalog provenance and exact pending replay.
+    data['frozen_lists'].pop(page,None)
+    page.locator('#logout').click()
+    def permission_mode(name, allowed=True):
+        return {'id':name,'label':name,'host_allowed':allowed,'availability':'unknown' if allowed else 'unsupported',
+            'reason':'Native availability is unknown <img src=x onerror=alert(1)>','reviewer_only':name=='claude_restricted',
+            'requires_confirmation':name not in ['codex_workspace_write','claude_restricted'],'confirmation_text':None}
+    def native_profile(name, provider='claude_cli'):
+        return {'name':name,'provider':provider,'model':None,'effort':None,'native_permission':None,
+            'reviewer_supported':provider=='claude_cli','permission_modes':
+                [permission_mode('codex_workspace_write'),permission_mode('codex_full_access')] if provider=='codex_app_server'
+                else [permission_mode('claude_dont_ask'),permission_mode('claude_auto'),permission_mode('claude_bypass_permissions',False),permission_mode('claude_restricted')]}
+    data['config']={'repositories':['relay-demo'],'agents':['codex','claude','other-review'],'tests':['unit'],
+        'native_agents':[native_profile('codex','codex_app_server'),native_profile('claude'),native_profile('other-review')],
+        'workflows':[{'name':'role-flow','repository':'relay-demo','developer':'codex','reviewer':'claude','test':'unit','max_repairs':1,
+            'selectable_developers':['codex','claude'],'selectable_reviewers':['claude','other-review','codex']}]}
+    role_catalog=catalog_fixture()
+    role_catalog['models'].append(dict(role_catalog['models'][0],id='review-model',model='review-model',display_name='Independent reviewer model'))
+    data['catalogs']=[{'name':name,'cache_epoch':'a'*32,'generation':1,'stale':False,'refreshing':False,'catalog':role_catalog} for name in ['codex','claude','other-review']]
+    data['post']='success';page.locator('#token').fill('test-token');page.locator('#connect').click()
+    expect(page.locator('#auth-panel')).to_be_hidden()
+    page.locator('#workflow').select_option('role-flow');page.locator('#agent').select_option('claude')
+    expect(page.locator('#reviewer option[value="codex"]')).to_be_disabled()
+    for role, model, effort in [('developer','fixture-model','high'),('reviewer','review-model','low')]:
+        page.locator(f'#{role}-model-source').select_option('catalog')
+        page.locator(f'#{role}-model').select_option(model);page.locator(f'#{role}-effort').select_option(effort)
+    page.locator('#resource-read').click();expect(page.locator('#workspace-quota')).to_be_enabled()
+    assert any('reviewer_profile=claude' in path for _,path,_ in requests)
+    page.locator('#reviewer').select_option('other-review');expect(page.locator('#workspace-quota')).to_be_disabled()
+    page.locator('#reviewer').select_option('claude')
+    page.locator('#reviewer-model-source').select_option('catalog');page.locator('#reviewer-model').select_option('review-model');page.locator('#reviewer-effort').select_option('low')
+    expect(page.locator('#developer-model')).to_have_value('fixture-model')
+    expect(page.locator('#reviewer-support')).to_contain_text('不是原生 --permission-mode')
+    assert page.locator('#developer-mode-reasons img').count()==0
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':1000})
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'role controls overflow at {width}'
+        page.screenshot(path=str(SCREENSHOTS / f'relay-native-roles-{width}.png'),full_page=True)
+    page.locator('#requirements').fill('Independent native role choices')
+    page.locator('#submit-task').click();expect(page.locator('#form-message')).to_contain_text('已确认')
+    role_job=submissions[-1]['job'];assert role_job['agent']=='claude'
+    assert role_job['role_selections']['developer']['model']['value']=='fixture-model'
+    assert role_job['role_selections']['reviewer']['model']['value']=='review-model'
+    assert role_job['role_selections']['developer']['profile']==role_job['role_selections']['reviewer']['profile']=='claude'
+    def confirm_permission():
+        page.locator('#developer-challenge').click();expect(page.locator('#developer-confirm')).to_be_enabled()
+        expect(page.locator('#developer-challenge-scope')).to_contain_text('profile=')
+        expect(page.locator('#developer-confirm-text')).to_contain_text('Confirm this exact host-resolved')
+        assert page.locator('#developer-confirm-text img').count()==0
+        page.locator('#developer-confirm').check()
+    # Default workflow returns to pinned profiles. Full access requires all three consequences.
+    page.locator('#developer-permission').select_option('codex_full_access')
+    expect(page.locator('#developer-confirm-text')).to_contain_text('expanded filesystem AND network access')
+    expect(page.locator('#developer-confirm-text')).to_contain_text('no native approval prompts')
+    page.locator('#requirements').fill('Risk confirmation fixture');count=len(submissions)
+    page.locator('#submit-task').click();expect(page.locator('#form-message')).to_contain_text('风险确认');assert len(submissions)==count
+    confirm_permission()
+    # A profile change drops confirmation, mode and model. Auto is a classifier, not bypass.
+    page.locator('#agent').select_option('claude');expect(page.locator('#developer-confirm')).not_to_be_checked()
+    expect(page.locator('#developer-permission')).to_have_value('')
+    page.locator('#developer-permission').select_option('claude_auto');expect(page.locator('#developer-permission-note')).to_contain_text('不是 bypass')
+    expect(page.locator('#developer-permission-note')).to_contain_text('拒绝或回退')
+    confirm_permission()
+    for role, model, effort in [('developer','fixture-model','high'),('reviewer','review-model','low')]:
+        page.locator(f'#{role}-model-source').select_option('catalog');page.locator(f'#{role}-model').select_option(model);page.locator(f'#{role}-effort').select_option(effort)
+    confirm_permission()
+    # Stale catalog explicitly invalidates both roles, no silently retained effort.
+    for item in data['catalogs']: item['stale']=True
+    page.locator('#capability-toggle').click();expect(page.locator('#developer-model')).to_have_value('')
+    expect(page.locator('#developer-effort')).to_be_disabled()
+    expect(page.locator('#developer-confirm')).not_to_be_checked();expect(page.locator('#developer-confirm')).to_be_disabled()
+    page.locator('#developer-model-source').select_option('manual');page.locator('#developer-manual-model').fill('old-manual')
+    expect(page.locator('#developer-model-note')).to_contain_text('未验证');expect(page.locator('#developer-effort')).to_be_disabled()
+    for item in data['catalogs']: item.update(stale=False,generation=2)
+    page.locator('#capability-read').click()
+    page.locator('#reviewer-model').select_option('review-model');page.locator('#reviewer-effort').select_option('low')
+    confirm_permission();page.locator('#developer-manual-model').fill('manual-unverified')
+    expect(page.locator('#developer-confirm')).not_to_be_checked();expect(page.locator('#developer-confirm')).to_be_disabled()
+    confirm_permission()
+    data['post']='401';page.locator('#submit-task').click();expect(page.locator('#auth-panel')).to_be_visible()
+    original=json.loads(json.dumps(submissions[-1]));assert len(original['permission_challenge'])==64;assert original['job']['role_selections']['developer']['model']=={'value':'manual-unverified','source':'manual'}
+    assert 'effort' not in original['job']['role_selections']['developer']
+    data['config']={'repositories':[],'agents':[],'tests':[]};data['catalogs']=[]
+    data['post']='success';page.locator('#token').fill('test-token');page.locator('#connect').click();expect(page.locator('#auth-panel')).to_be_hidden()
+    for control in ['agent','reviewer','developer-manual-model','reviewer-model','developer-permission','developer-confirm']:
+        expect(page.locator('#'+control)).to_be_disabled()
+    expect(page.locator('#reviewer-model-note')).to_contain_text('原提交已冻结')
+    page.locator('#submit-task').click();expect(page.locator('#form-message')).to_contain_text('已确认');assert submissions[-1]==original
+    # Missing observed evidence stays unknown even with server-resolved session values.
+    evidence={'requested':{'profile':'<img src=x>','provider':'claude_cli','model':'requested-model'},
+        'session_settings':{'model':'session-only','source':'native session'},'observed':{'model':None,'reroutes':[{'from_model':'requested-model','to_model':'rerouted-model','reason':'<script>not HTML</script>','thread_id':'thread','turn_id':'turn'}]},
+        'verification':{'model':'unknown','effort':'unknown','permission':'unknown'},'truncated':True}
+    role_task=data['tasks'][-1];role_task['state']='finished';role_task['result']=json.dumps({'agent':{'provider':{'selection':evidence}},'workflow':{'rounds':[{'round':0,'reviewer':{'outcome':'failure','exit_code':1,'summary':'Serialized StageSummary','selection':{'requested':{'model':'review-request'}}}}]}},ensure_ascii=False)
+    page.locator('#refresh').click();expect(page.locator('#selection-stages')).to_contain_text('实际消息 / reroute 观测：模型 未知')
+    expect(page.locator('#selection-stages')).to_contain_text('不是每回合证明')
+    expect(page.locator('#selection-stages')).to_contain_text('review-request')
+    expect(page.locator('#selection-stages')).to_contain_text('证据已截断')
+    assert page.locator('#selection-stages img, #selection-stages script').count()==0
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':1000})
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'role evidence overflow at {width}'
+        page.screenshot(path=str(SCREENSHOTS / f'relay-native-role-evidence-{width}.png'),full_page=True)
+    # Phase 4: optional same-stage replacement, exact consent and frozen first-winner replay.
+    replacement_request_start=len(requests)
+    page.locator('#logout').click()
+    data['config']={'repositories':['relay-demo'],'agents':['codex','claude','other-review'],'tests':['unit'],
+        'native_agents':[native_profile('codex','codex_app_server'),native_profile('claude'),native_profile('other-review')],
+        'workflows':[{'name':'reviewed','repository':'relay-demo','developer':'codex','reviewer':'claude','test':'unit','max_repairs':2,
+            'selectable_developers':['codex','claude'],'selectable_reviewers':['claude','other-review','codex']}]}
+    data['catalogs']=[{'name':name,'cache_epoch':'d'*32,'generation':1,'stale':False,'refreshing':False,'catalog':role_catalog} for name in ['codex','claude','other-review']]
+    def replacement_operator(value,role):
+        result=operator_fixture(value)
+        action=next(a for a in result['recovery']['actions'] if a['id']==('continue_review' if role=='reviewer' else 'retry'))
+        action.update(ordinary_allowed=True,replacement={'allowed':True,'role':role,'reason':None,
+            'profiles':['claude','other-review','codex'] if role=='reviewer' else ['codex','claude'],
+            'stopped_stage':{'role':role,'round':1,'base_sha':'b'*40,'candidate_sha':'a'*40,'max_repairs':2,'remaining_repairs':1}})
+        result['recovery']['actions']=[action]
+        return result
+    for task_id,role in [(220,'developer'),(221,'reviewer'),(222,'developer'),(223,'developer')]:
+        value=review_task(task_id);data['tasks'].append(value);data['operator_overrides'][task_id]=replacement_operator(value,role)
+    connect(page);select_task(page,220)
+    page.locator('#retry-task').click();expect(page.locator('#retry-replace')).not_to_be_checked()
+    page.locator('#retry-replace').check();page.locator('#replacement-profile').select_option('codex')
+    page.locator('#replacement-model-source').select_option('catalog');page.locator('#replacement-model').select_option('fixture-model');page.locator('#replacement-effort').select_option('high')
+    expect(page.locator('#replacement-stage')).to_contain_text('保留原轮次 1 与剩余修复预算 1')
+    expect(page.locator('#retry-dialog-description')).to_contain_text('在已停止的开发阶段继续，保留原轮次和剩余修复预算')
+    expect(page.locator('#replacement-session')).to_contain_text('旧原生历史不能跨供应商兼容恢复')
+    page.locator('#replacement-permission').select_option('codex_full_access')
+    expect(page.locator('#replacement-confirm-text')).to_contain_text('expanded filesystem AND network access')
+    expect(page.locator('#replacement-confirm-text')).to_contain_text('no native approval prompts')
+    count=len(data['retry_requests']);page.locator('#retry-confirm').click();expect(page.locator('#retry-dialog-error')).to_contain_text('精确权限范围');assert len(data['retry_requests'])==count
+    def confirm_replacement():
+        page.locator('#replacement-challenge').click();expect(page.locator('#replacement-confirm')).to_be_enabled()
+        expect(page.locator('#replacement-challenge-scope')).to_contain_text('前置任务 #220')
+        expect(page.locator('#replacement-confirm-text')).to_contain_text('<img src=x>')
+        assert page.locator('#replacement-confirm-text img, #replacement-mode-reasons img').count()==0
+        page.locator('#replacement-confirm').check()
+        expect(page.locator('#retry-dialog-error')).to_be_hidden()
+    data['replacement_expiry_ms']=-1;page.locator('#replacement-challenge').click()
+    expect(page.locator('#replacement-challenge-status')).to_contain_text('读取失败');expect(page.locator('#replacement-confirm')).to_be_disabled()
+    data['replacement_expiry_ms']=300000;confirm_replacement()
+    page.locator('#replacement-model-source').select_option('manual');expect(page.locator('#replacement-confirm')).not_to_be_checked();expect(page.locator('#replacement-confirm')).to_be_disabled()
+    page.locator('#replacement-manual-model').fill('replacement-unverified');expect(page.locator('#replacement-effort')).to_be_disabled();expect(page.locator('#replacement-model-note')).to_contain_text('未验证')
+    confirm_replacement()
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':1000})
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'replacement dialog overflow at {width}'
+        assert page.locator('#retry-dialog').evaluate('(node) => node.scrollWidth <= node.clientWidth'),f'replacement content overflow at {width}'
+        page.locator('#retry-dialog').evaluate('(node) => { node.scrollTop = 0; }')
+        page.screenshot(path=str(SCREENSHOTS / f'relay-stage-replacement-{width}.png'),full_page=True)
+        page.locator('#replacement-confirm').scroll_into_view_if_needed()
+        page.screenshot(path=str(SCREENSHOTS / f'relay-stage-replacement-consent-{width}.png'),full_page=True)
+    data['continuation_post']='abort';page.locator('#retry-confirm').click();expect(page.locator('#detail-error')).to_contain_text('续接未确认')
+    frozen=json.loads(json.dumps(data['retry_requests'][-1]));assert frozen[1]['replacement']['confirm_permission_expansion'] is True
+    page.locator('#retry-task').click();expect(page.locator('#replacement-profile')).to_be_disabled();expect(page.locator('#replacement-manual-model')).to_have_value('replacement-unverified')
+    data['continuation_post']='401';page.locator('#retry-confirm').click();expect(page.locator('#auth-panel')).to_be_visible();assert json.loads(json.dumps(data['retry_requests'][-1]))==frozen
+    for item in data['catalogs']: item.update(cache_epoch='e'*32,generation=1,stale=True)
+    connect(page);select_task(page,220);page.locator('#retry-task').click();expect(page.locator('#replacement-confirm')).to_be_disabled()
+    data['continuation_post']='success';page.locator('#retry-confirm').click();expect(page.locator('#continuation-choice')).to_contain_text('replacement-unverified');assert json.loads(json.dumps(data['retry_requests'][-1]))==frozen
+    # Reviewer replacement never asks for developer expansion consent and retains the exact candidate.
+    select_task(page,221);page.locator('#review-task').click();page.locator('#retry-replace').check();page.locator('#replacement-profile').select_option('other-review')
+    expect(page.locator('#replacement-profile option[value="codex"]')).to_be_disabled()
+    expect(page.locator('#replacement-stage')).to_contain_text('a'*40)
+    expect(page.locator('#replacement-stage')).to_contain_text('原配置测试只运行一次，通过后仅审查，不开发、不修复')
+    page.locator('#replacement-permission').select_option('claude_restricted');expect(page.locator('#replacement-confirm-field')).to_be_hidden()
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':1000});assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        page.screenshot(path=str(SCREENSHOTS / f'relay-reviewer-replacement-{width}.png'),full_page=True)
+    before_challenges=len(data['replacement_challenges']);page.locator('#retry-confirm').click();expect(page.locator('#continuation-choice')).to_contain_text('配置 other-review')
+    assert len(data['replacement_challenges'])==before_challenges;assert data['review_requests'][-1][1]['revalidate_tests'] is True
+    # A second tab may win with a different replacement; the frozen server choice is visible.
+    select_task(page,222);page.locator('#retry-task').click();page.locator('#retry-replace').check();page.locator('#replacement-profile').select_option('codex')
+    stale_page=context.new_page();instrument(stale_page);stale_page.goto(base);connect(stale_page);select_task(stale_page,222)
+    data['frozen_lists'][page]=json.loads(json.dumps(visible_tasks()))
+    stale_page.locator('#retry-task').click();stale_page.locator('#retry-replace').check();stale_page.locator('#replacement-profile').select_option('claude')
+    stale_page.locator('#replacement-model-source').select_option('manual');stale_page.locator('#replacement-manual-model').fill('other-tab-winner');stale_page.locator('#retry-confirm').click()
+    expect(stale_page.locator('#continuation-choice')).to_contain_text('other-tab-winner')
+    page.locator('#retry-confirm').click();expect(page.locator('#continuation-choice')).to_contain_text('other-tab-winner');expect(page.locator('#continuation-choice')).to_contain_text('其他页面的预留已获确认')
+    assert data['continuation_payloads'][222]['body']['replacement']['profile']=='claude';stale_page.close()
+    # Missing legacy stage proof and explicit publication ambiguity remain unavailable.
+    select_task(page,223)
+    unavailable=data['operator_overrides'][223]['recovery']['actions'][0]['replacement'];unavailable.update(allowed=False,reason='Missing stopped-stage proof; publication or unknown execution requires reconciliation',stopped_stage=None)
+    page.locator('#operator-read').click();expect(page.locator('#operator-replacement')).to_contain_text('Missing stopped-stage proof')
+    page.locator('#retry-task').click();expect(page.locator('#retry-replace')).to_be_disabled();expect(page.locator('#retry-replacement-status')).to_contain_text('requires reconciliation');page.locator('#retry-dismiss').click()
+    assert not any(path.endswith('/refresh') for _,path,_ in requests[replacement_request_start:]), 'Replacement must not start catalog discovery'
     page.locator('#logout').click();after_logout=len(requests);page.wait_for_timeout(2400)
     assert len(requests)==after_logout
     assert page.locator('#auth-panel').is_visible()
@@ -518,6 +908,6 @@ with sync_playwright() as p:
     assert not page.locator('#workflow-field').is_visible()
     assert page.locator('#workflow-hint').inner_text()==''
     assert not errors, errors
-    print('PASS: optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, persisted continuation status, repeated successor navigation, stale two-tab confirmation, reload/new-context recovery, off-page successor detail/refresh, continuation chains, reserved-submit recovery, review-only eligibility and dismissal, review focus UTF-8 boundary, immutable unknown-request retry, duplicate review confirmation, bidirectional cross-mode stale confirmations, review successor reload, logout; no browser errors')
+    print('PASS: cached-only catalog login/open, explicit profile discovery, unknown auth/effective selection, startup context, safe model/effort metadata, catalog screenshots at 320/390/1440, no automatic discovery, catalog logout reset; optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, persisted continuation status, repeated successor navigation, stale two-tab confirmation, reload/new-context recovery, off-page successor detail/refresh, continuation chains, reserved-submit recovery, review-only eligibility and dismissal, review focus UTF-8 boundary, immutable unknown-request retry, duplicate review confirmation, bidirectional cross-mode stale confirmations, review successor reload, logout; no browser errors')
     browser.close()
 server.shutdown()

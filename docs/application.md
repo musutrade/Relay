@@ -20,9 +20,9 @@
 - `timeout_seconds`：整个快照、Agent、测试和 PR 流程的共同期限，1–3600 秒，默认 300
 - `output_limit_bytes`：每阶段 stdout/stderr 分别捕获 1–8192 字节，默认 2048；多余内容继续排空并标注截断，不无限累积
 - `max_snapshot_bytes` / `max_snapshot_entries`：复制输入快照时的字节数和条目限制，默认 50 MiB / 20,000；字节上限允许 1–1099511627776（1 TiB），条目允许 1–100000；复制排除 `.git`、`target` 和 `node_modules`，拒绝符号链接和特殊文件
-- `max_workspace_bytes`：可选的整项任务逻辑字节预算，允许 1–1099511627776（1 TiB）；省略或 null 时沿用 `max_snapshot_bytes`，保持旧配置行为。显式设置可独立允许 Git、审查与构建开销，不放宽输入快照预算
+- `max_workspace_bytes`：可信宿主允许的单次工作区逻辑字节上限，允许 1–1099511627776（1 TiB）；省略或 null 时沿用 `max_snapshot_bytes`。请求可在此上限内选择更小的 `workspace_quota_bytes`，不能修改宿主策略或放宽输入快照预算
 - `successful_workspace_retention_seconds`：可选成功工作区保留期（60–31536000 秒）；省略不自动清理。失败/未知现场保留，详见 [固定工作区与继续](workspace-continuation.md)
-- `max_retained_workspaces`：默认最多保留 100 个工作区；达到上限后拒绝新执行，需可信操作员先检查和清理。每个命令启动前、结束后及运行期每 250ms 尽力检查整项任务的 `max_workspace_bytes` / `max_snapshot_entries` 预算，超限会停止当前命令；快写入可能暂时超过限制，这不是内核文件系统配额
+- `max_retained_workspaces`：默认最多保留 100 个工作区；达到上限后拒绝新执行，需可信操作员先检查和清理。每个命令启动前、结束后及运行期每 250ms 尽力检查整项任务的本次字节配额 / `max_snapshot_entries` 预算，超限会停止当前命令；快写入可能暂时超过限制，这不是内核文件系统配额
 
 ### 工作区容量选择
 
@@ -32,7 +32,15 @@
 
 复制普通快照前只扫描元数据做准入检查，复制中仍检查变化。工作流在 fetch 前估算已固定基线的物化工作树大小（若需要独立 reviewer，预留两份工作树），fetch 后、checkout 前再计入已存在的实际 Git/控制字节；创建 reviewer 时再次检查，复用 reviewer 仅估算增长差额。该估算不重复完整内容哈希，也不复制对象；源 Git filters 可能影响实际 checkout 大小，Git 压缩/临时 pack、后续模型和构建增长均不能提前精确预测。通过准入检查不保证后续所有阶段都能容纳；运行期检查仍是同一整项预算，错误报告有效上限和观测/估算字节。
 
-这些是尽力而为的逻辑字节限制，不是 OS 硬配额、已分配磁盘空间或整机可用空间保证。命令检查间隔与最终结果落盘可短暂超限；Relay 不为整个主机、其他任务或 CLI 外部缓存预留磁盘。保留上限只限制工作区数量，不是全局字节配额；例如 20 个各 4 GiB 的现场可能需要约 80 GiB，另需系统、源仓库和临时空间余量。提升预算前请核对真实磁盘容量；不自动删除失败现场、不共享 Git 对象来绕过预算。资源预算不进入工作区身份绑定，停止且已核对的失败任务可在提高容量后通过原有显式继续入口复用现场，无需重建或清空。
+这些是尽力而为的逻辑字节限制，不是 OS 硬配额、已分配磁盘空间或整机可用空间保证。命令检查间隔与最终结果落盘可短暂超限；Relay 不为整个主机、其他任务或 CLI 外部缓存预留磁盘。保留上限只限制工作区数量，不是全局字节配额；例如 20 个各 4 GiB 的现场可能需要约 80 GiB，另需系统、源仓库和临时空间余量。提升预算前请核对真实磁盘容量；不自动删除失败现场、不共享 Git 对象来绕过预算。失败现场保留，普通恢复不要求手工编辑主机配置。新任务可选 `workspace_quota_bytes`（正整数字节，不超过宿主上限）；省略或 null 使用整个宿主上限，因此默认没有可上调余量。已停止任务通过显式继续入口选择更大的单次配额，服务端验证前置结果、现场和当前用量后复用原目录；不会自动提额或清理文件。
+
+#### 只读估算与任务操作状态
+
+`GET /api/resources?repository=<允许的名字>&workflow=<可选名字>&reviewer_profile=<可选审查profile>`（MCP：`relay_resources`）只读扫描宿主文件元数据，不复制、不运行 Git、Agent 或测试，也不预留磁盘。返回宿主上限 `host_policy_cap_bytes`、默认值 `default_quota_bytes`、输入快照上限 `snapshot_cap_bytes`，以及 `initial_estimate`：来源固定为 `host_inventory`，分别列出快照、源 Git 元数据参考值、独立 reviewer 副本和初始总量。普通快照不复制源 `.git`；其新 Git/控制文件开销无法精确预测，总量可为 null。工作流估算包含物化工作树、必要的 reviewer 副本、各 checkout 的源 Git 参考值和控制文件余量；源对象大小不等于实际 fetch/checkout 大小。`complete` 只表示估算所需数据齐全，不是容量保证；未知量不按零处理，后续构建增长始终为 `unknown`。
+
+`GET /api/tasks/<id>/operator`（MCP：`relay_operator`）返回结构化 `failure {code,stage,cause}`、当前 `resources`、旧结果是否保留、工作区是否仍在，以及服务端允许的 `recovery.actions`。`workspace_quota_exceeded` 表示整项目录的本次配额不足；`snapshot_limit_exceeded` 表示源快照准入失败，增加工作区配额不能解决。旧结果缺少结构化字段时明确标记 legacy；不根据日志措辞猜测原因。面板的配额优先显示该次结果实际记录的值；历史未记录且未显式选择时为未知，不按新宿主上限回填。`recovery.inherited_quota_bytes` 另示后继不覆盖时的额度，旧省略字段仍随当前宿主上限，详见[继续说明](workspace-continuation.md#单次容量不足时显式上调)。
+
+用量包含 `logical_bytes`、`complete`、Unix 秒 `measured_at` 和不完整原因；扫描受条目数、深度与 100ms 协作期限约束，不遍历符号链接，读操作短暂缓存 5 秒。操作提交时重新验证；无法确认的用量不允许提额。非资源失败只有已知部分用量不超原额度时，才可按原额度继续并由执行前检查把关；已知资源超限或用量未知时须先得到完整测量。所有资源响应都明确 `enforcement=logical_bytes_best_effort`、`os_hard_quota=false`、`disk_reserved=false`。不支持的恢复请求以 HTTP 409 和结构化 request-stage 失败说明拒绝，不能绕过 unknown owner、缺失现场、候选改变或发布核对门禁。
 
 开发 job 示例：
 
@@ -80,7 +88,7 @@
 {"repository":"project","requirements":"实现需求并补测试","agent":"codex","workflow":"reviewed","publish":false}
 ```
 
-工作流固定 repository、developer、reviewer 和 test；job 的 `agent` 必须等于该 developer，若给出 `test` 则必须匹配配置。网页可选工作流并自动锁定这些字段；网页仍不请求 GitHub 发布。HTTP/MCP 可显式选择 `publish=true` 和匹配的 `draft_pr_adapter`，不能用 job 改模型、命令、修复次数或目标仓库。
+工作流固定 repository、test、修复次数和发布目标；默认固定 developer/reviewer。可信宿主可一次配置角色 allowlist，首次提交通过可选 `role_selections` 分别选择 profile、model、effort 与允许的原生权限，详见[角色选择](native-role-selection.md)。job 的 `agent` 必须等于所选 developer，若给出 `test` 则必须匹配配置。网页仍不请求 GitHub 发布；HTTP/MCP 的发布必须显式选择 `publish=true` 和匹配的 `draft_pr_adapter`。
 
 执行顺序：
 
@@ -106,7 +114,7 @@
 
 HTTP 所有 `/api` 路由校验 bearer token（32–256 非空白 ASCII 字节）。HTML 入口无需 token，但无 token 不能读取任务或配置。页面内存保存 token，没有 URL/token 持久化；响应 `no-store`，无第三方脚本和 CORS 开放。用户可查看任务、提交、请求取消及显式继续已停止的失败任务；接口没有运行任意命令、自动恢复或删除工作区入口。
 
-MCP 采用 stdio newline JSON-RPC，支持 `initialize`（协议 2024-11-05）、`ping`、`tools/list`、`tools/call`。工具为 `relay_submit`、`relay_get`、`relay_list`、`relay_config`，只作需求入口和读取结果。每条消息上限 128 KiB；没有 ID 的通知不返回响应，也不会提交任务。MCP 是可信 OS 本机进程接口，不使用 HTTP token。MCP 本身不启动 worker，因此需要同时运行 `serve`。
+MCP 采用 stdio newline JSON-RPC，支持 `initialize`（协议 2024-11-05）、`ping`、`tools/list`、`tools/call`。工具包括 `relay_submit`、`relay_get`、`relay_list`、`relay_config`、`relay_resources`、`relay_operator`、`relay_permission_challenge`，以及显式确认的 `relay_retry` / `relay_continue_review`。资源读取不启动执行，继续操作仍由同一队列 worker 执行。每条消息上限 128 KiB；没有 ID 的通知不返回响应，也不会提交任务。MCP 是可信 OS 本机进程接口，不使用 HTTP token。MCP 本身不启动 worker，因此需要同时运行 `serve`。
 
 MCP 配置示例（把路径替换成实际绝对路径）：
 
@@ -156,7 +164,7 @@ UI 的依赖免费 Node 状态测试覆盖重复提交、保留幂等 key 重试
 
 ## 原生 Codex / Claude CLI profile
 
-旧 `agents` 命令 profile 保持兼容。`native_agents` 提供封闭的 `codex_cli` / `codex_app_server` / `claude_cli` 协议适配；两类 profile 名称不能重复。job 的 `agent` 仍只引用可信配置中的名字，不接受用户指定程序、参数、环境变量或模型 ID。
+旧 `agents` 命令 profile 保持兼容。`native_agents` 提供封闭的 `codex_cli` / `codex_app_server` / `claude_cli` 协议适配；两类 profile 名称不能重复。job 的 `agent` 仍只引用可信配置中的名字，不接受用户指定程序、参数或环境变量；模型 ID 仅通过有界、标明目录来源或未验证手工来源的角色选择。
 
 ```json
 {
@@ -167,7 +175,7 @@ UI 的依赖免费 Node 状态测试覆盖重复提交、保留幂等 key 重试
 }
 ```
 
-这是需要加入完整 host 配置的片段。程序必须已安装；可选 `model` 来自部署者自己的账户配置，省略时由 CLI 选择。`effort`、Claude `max_turns` / `max_budget_usd` 也只由可信配置指定。不要把展示名猜成供应商模型 ID。`env` 仅供可信部署者配置已有 CLI 所需环境；Relay 不保存或代办登录、密钥与付款。
+这是需要加入完整 host 配置的片段。程序必须已安装；可选 `model` 来自部署者自己的账户配置，省略时由 CLI 选择。可信配置可提供 `effort` 默认值；首次提交可按该模型的新鲜目录元数据覆盖。Claude `max_turns` / `max_budget_usd` 仍只由可信配置指定。不要把展示名猜成供应商模型 ID。`env` 仅供可信部署者配置已有 CLI 所需环境；Relay 不保存或代办登录、密钥与付款。
 
 ```sh
 cargo run -p relay-app -- doctor /absolute/path/config.json
@@ -175,7 +183,7 @@ cargo run -p relay-app -- doctor /absolute/path/config.json
 
 `doctor` 只调用已配置 CLI 的版本与帮助入口，输出 JSON 能力诊断；不发出模型请求。退出码 0 表示诊断完成，不代表所有 profile 兼容；自动化须检查 JSON 中所需 profile 的 `compatible`，审查能力另看 `probe.read_only_supported`。Claude 的[官方 CLI 文档](https://code.claude.com/docs/en/cli-reference)说明帮助输出不包含所有参数：若配置了但帮助中隐藏 `--max-turns`，Relay 先验证版本和其他必要参数，再用带 `--help` 的缺参/有效值探测确认解析器确实支持该选项；单独 `--help` 成功或普通非零退出均不足以通过。额外探测共享原有 10 秒期限和输出上限；格式不明仍拒绝，不删除 turn/budget 限制。`compatible` 仅表示本地接口满足调用要求，认证与模型访问始终标记 `unknown`。Claude 无人值守运行要求 v2.1.259+ 及相应参数。任务执行前再次进行受 supervisor 管理的检查，所有检查共享任务期限。缺少功能或检查失败时停止，不退回不安全的权限模式。
 
-只读能力单独探测：当前 Claude 需要 restricted 模式、仅 Read/Glob/Grep 工具、禁用 MCP/自定义命令的完整能力。Codex 开发调用可用，但只读审查返回 `review_profile_unsupported`，因为其 read-only sandbox 不等于禁用项目 MCP/hooks。机器上的托管设置仍属于可信部署边界，不承诺对恶意 CLI 或托管 hooks 隔离。
+只读能力单独探测：当前 Claude 需要 restricted 模式、仅 Read/Glob/Grep 工具、禁用 MCP/自定义命令的完整能力。Codex 开发调用可用，但只读审查返回 `review_profile_unsupported`，因为完整版本验证的无执行、hooks/MCP、配置加载与恢复隔离契约尚未证明；已有单项控制不能替代完整证明。机器上的托管设置仍属于可信部署边界，不承诺对恶意 CLI 或托管 hooks 隔离。
 
 原生调用使用 stdin 传需求、JSONL 输出以及显式权限参数。供应商事件在排空 stdout 时增量解析，独立于用户可见的截断日志；限制单事件、摘要、标识符与 usage 的保留大小。成功需要进程正常退出以及有效成功终态。Codex 的非致命 error item 和失败的工具 item 可由 Agent 后续恢复，不单独视为协议损坏；以最后一条已完成 agent_message 为摘要，仍须有成功 turn.completed 终态。缺失或非法终态、turn.failed、顶层供应商 error、权限拒绝、预算耗尽、非零退出都不能成为成功。格式错误保持失败，但继续有界解析后续行以保留摘要和 usage；超过 64 KiB 的行丢弃至下一换行后恢复解析，后续成功事件不会消除之前的致命错误。结果的 provider 信息保留实际报告的模型与会话标识；未报告的字段不猜测，旧无会话 profile 不会仅凭此字段恢复会话。显式续接配置与 app-server 生命周期见 [原生会话续接](session-continuity.md)。
 

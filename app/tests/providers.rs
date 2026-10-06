@@ -1,5 +1,6 @@
 use relay_app::providers::{
-    MAX_PROTOCOL_LINE, NativeProfile, ProtocolParser, ProviderKind, ProviderResult,
+    MAX_PROTOCOL_LINE, NativePermission, NativeProfile, ProtocolParser, ProviderKind,
+    ProviderResult, validate_selection_value,
 };
 use serde_json::json;
 
@@ -154,8 +155,261 @@ fn normalizes_codex_and_claude_without_trusting_requested_model_as_reported() {
     assert_eq!(result.usage.cached_input_tokens, Some(3));
     let (result, error) = parse(ProviderKind::ClaudeCli, CLAUDE_OK);
     assert!(error.is_none(), "{error:?}");
-    assert_eq!(result.reported_model.as_deref(), Some("reported"));
+    assert_eq!(result.reported_model, None);
+    let selection = result.selection.unwrap();
+    assert_eq!(
+        selection.session_settings.unwrap().model.as_deref(),
+        Some("reported")
+    );
+    assert_eq!(selection.verification.model, "session_reported");
+    assert!(selection.observed.model.is_none());
     assert_eq!(result.usage.total_cost_usd, Some(0.25));
+}
+
+#[test]
+fn absent_native_fields_preserve_legacy_profile_bytes_and_result_records() {
+    let p = profile(ProviderKind::CodexCli);
+    assert_eq!(
+        serde_json::to_string(&p).unwrap(),
+        r#"{"provider":"codex_cli","program":"/bin/true","env":{},"model":null,"effort":null,"max_turns":null,"max_budget_usd":null,"session_continuity":false}"#
+    );
+    assert!(p.native_permission.is_none());
+    assert!(p.allowed_permission_modes.is_empty());
+    let mut legacy = serde_json::to_value(ProviderResult::new(&p, None)).unwrap();
+    legacy.as_object_mut().unwrap().remove("selection");
+    let result: ProviderResult = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(result.selection.is_none());
+    assert_eq!(serde_json::to_value(result).unwrap(), legacy);
+}
+
+#[test]
+fn arbitrary_bounded_selection_values_are_safe_literals() {
+    for value in [
+        "future-ultra",
+        "custom/provider-model",
+        "\"literal\\value\"",
+        "界",
+    ] {
+        assert!(validate_selection_value(value));
+        for kind in [ProviderKind::CodexCli, ProviderKind::ClaudeCli] {
+            let mut p = profile(kind);
+            p.effort = Some(value.into());
+            p.validate().unwrap();
+            let args = p.compile(false).unwrap().args;
+            if kind == ProviderKind::CodexCli {
+                let compiled = args
+                    .iter()
+                    .find(|arg| arg.starts_with("model_reasoning_effort="))
+                    .unwrap();
+                let literal = compiled.strip_prefix("model_reasoning_effort=").unwrap();
+                assert_eq!(serde_json::from_str::<String>(literal).unwrap(), value);
+            } else {
+                assert!(args.windows(2).any(|pair| pair == ["--effort", value]));
+            }
+        }
+    }
+    assert!(validate_selection_value(&"a".repeat(256)));
+    assert!(!validate_selection_value(&"界".repeat(86)));
+    for value in ["", "-flag", "x\ny", "x\0y", "x\u{7f}y"] {
+        assert!(!validate_selection_value(value));
+    }
+}
+
+#[test]
+fn native_modes_compile_exact_flags_and_keep_reviewer_contract_fixed() {
+    for (mode, sandbox, confirmation) in [
+        (
+            NativePermission::CodexWorkspaceWrite,
+            "workspace-write",
+            false,
+        ),
+        (
+            NativePermission::CodexFullAccess,
+            "danger-full-access",
+            true,
+        ),
+    ] {
+        assert_eq!(mode.requires_confirmation(), confirmation);
+        for kind in [ProviderKind::CodexCli, ProviderKind::CodexAppServer] {
+            assert!(mode.compatible(kind, false));
+            assert!(!mode.compatible(kind, true));
+        }
+        let mut p = profile(ProviderKind::CodexCli);
+        p.native_permission = Some(mode);
+        let args = p.compile(false).unwrap().args;
+        assert!(args.windows(2).any(|pair| pair == ["--sandbox", sandbox]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-c", "approval_policy=\"never\""])
+        );
+        assert!(
+            p.compile(true)
+                .unwrap_err()
+                .contains("isolation contract is unproven")
+        );
+    }
+    for (mode, native) in [
+        (NativePermission::ClaudeDontAsk, "dontAsk"),
+        (NativePermission::ClaudeAuto, "auto"),
+        (
+            NativePermission::ClaudeBypassPermissions,
+            "bypassPermissions",
+        ),
+    ] {
+        assert!(mode.requires_confirmation());
+        assert!(mode.compatible(ProviderKind::ClaudeCli, false));
+        assert!(!mode.compatible(ProviderKind::CodexCli, false));
+        let mut p = profile(ProviderKind::ClaudeCli);
+        p.native_permission = Some(mode);
+        let args = p.compile(false).unwrap().args;
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--permission-mode", native])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--permission-prompts", "none"])
+        );
+        assert!(!args.contains(&"--restricted".into()));
+        assert!(p.compile(true).is_err());
+    }
+    let mut p = profile(ProviderKind::ClaudeCli);
+    p.native_permission = Some(NativePermission::ClaudeRestricted);
+    assert!(!NativePermission::ClaudeRestricted.requires_confirmation());
+    assert!(p.compile(false).is_err());
+    let args = p.compile(true).unwrap().args;
+    assert!(args.contains(&"--restricted".into()));
+    assert!(args.contains(&"--strict-mcp-config".into()));
+    assert!(args.contains(&"Bash,Edit,Write,NotebookEdit,Agent,Task,mcp__*".into()));
+    assert!(!args.contains(&"--permission-mode".into()));
+    p.native_permission = Some(NativePermission::CodexFullAccess);
+    assert!(p.validate().is_err());
+    p.native_permission = None;
+    p.allowed_permission_modes = vec![NativePermission::CodexWorkspaceWrite];
+    assert!(p.validate().is_err());
+}
+
+#[test]
+fn explicit_mode_probes_require_compiled_flags_without_auto_fallback() {
+    let mut p = profile(ProviderKind::CodexCli);
+    p.native_permission = Some(NativePermission::CodexWorkspaceWrite);
+    let help = "--json --sandbox --skip-git-repo-check --ephemeral";
+    assert!(
+        p.validate_probe("0.160.0", help, false)
+            .unwrap_err()
+            .contains("--config")
+    );
+    assert!(
+        p.validate_probe("0.160.0", &format!("{help} --config"), false)
+            .is_ok()
+    );
+    let mut p = profile(ProviderKind::ClaudeCli);
+    p.native_permission = Some(NativePermission::ClaudeAuto);
+    let help = "--output-format --verbose --permission-prompts --no-session-persistence";
+    assert!(
+        p.validate_probe("2.1.259", help, false)
+            .unwrap_err()
+            .contains("--permission-mode")
+    );
+    assert!(
+        p.validate_probe("2.1.259", &format!("{help} --permission-mode"), false)
+            .is_ok()
+    );
+    let args = p.compile(false).unwrap().args;
+    assert!(!args.iter().any(|arg| arg.contains("bypass")));
+}
+
+fn parse_with_profile(
+    p: NativeProfile,
+    events: &[serde_json::Value],
+) -> (ProviderResult, Option<String>) {
+    let mut parser = ProtocolParser::new(ProviderResult::new(&p, None));
+    for event in events {
+        parser.feed(format!("{event}\n").as_bytes());
+    }
+    parser.feed(
+        b"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}\n",
+    );
+    parser.finish()
+}
+
+#[test]
+fn claude_session_and_main_message_evidence_have_distinct_scope() {
+    let mut p = profile(ProviderKind::ClaudeCli);
+    p.model = Some("requested-alias".into());
+    p.effort = Some("high".into());
+    p.native_permission = Some(NativePermission::ClaudeAuto);
+    let (result, error) = parse_with_profile(
+        p,
+        &[
+            json!({"type":"system","subtype":"init","session_id":"session","model":"resolved-session-model","effort":"high","permissionMode":"auto"}),
+            json!({"type":"assistant","parent_tool_use_id":null,"message":{"model":"main-model"}}),
+            json!({"type":"assistant","parent_tool_use_id":"nested-tool","message":{"model":"subagent-model"}}),
+        ],
+    );
+    assert!(error.is_none());
+    assert_eq!(result.reported_model.as_deref(), Some("main-model"));
+    let evidence = result.selection.unwrap();
+    assert_eq!(evidence.requested.model.as_deref(), Some("requested-alias"));
+    assert_eq!(evidence.observed.model.as_deref(), Some("main-model"));
+    assert_eq!(evidence.verification.model, "message_reported");
+    assert_eq!(evidence.verification.effort, "session_reported");
+    assert_eq!(evidence.verification.permission, "session_reported");
+    let settings = evidence.session_settings.unwrap();
+    assert_eq!(settings.model.as_deref(), Some("resolved-session-model"));
+    assert_eq!(settings.permission_mode.as_deref(), Some("auto"));
+    assert_eq!(settings.source, "claude.system/init");
+}
+
+#[test]
+fn claude_permission_mismatch_fails_and_missing_or_restricted_evidence_stays_unknown() {
+    let init = json!({"type":"system","subtype":"init","session_id":"session","permissionMode":"bypassPermissions"});
+    let mut p = profile(ProviderKind::ClaudeCli);
+    p.native_permission = Some(NativePermission::ClaudeAuto);
+    let (result, error) = parse_with_profile(p.clone(), std::slice::from_ref(&init));
+    assert!(error.unwrap().contains("native permission mismatch"));
+    assert_eq!(
+        result.selection.unwrap().verification.permission,
+        "mismatch"
+    );
+    let (result, error) = parse_with_profile(
+        p,
+        &[json!({"type":"system","subtype":"init","session_id":"session"})],
+    );
+    assert!(error.is_none());
+    assert_eq!(result.selection.unwrap().verification.permission, "unknown");
+    for permission in [None, Some(NativePermission::ClaudeRestricted)] {
+        let mut p = profile(ProviderKind::ClaudeCli);
+        p.native_permission = permission;
+        let (result, error) = parse_with_profile(p, std::slice::from_ref(&init));
+        assert!(error.is_none());
+        assert_eq!(result.selection.unwrap().verification.permission, "unknown");
+    }
+}
+
+#[test]
+fn fabricated_exec_start_settings_and_subagent_models_do_not_become_observed() {
+    let stream = CODEX_OK.replace(
+        "\"thread_id\":\"session-1\"",
+        "\"thread_id\":\"session-1\",\"model\":\"fabricated\",\"effort\":\"fabricated\"",
+    );
+    let (result, error) = parse(ProviderKind::CodexCli, &stream);
+    assert!(error.is_none());
+    assert!(result.reported_model.is_none());
+    let selection = result.selection.unwrap();
+    assert!(selection.session_settings.is_none());
+    assert!(selection.observed.model.is_none());
+    assert_eq!(selection.verification.model, "unknown");
+    assert_eq!(selection.verification.effort, "unknown");
+    let (result, error) = parse_with_profile(
+        profile(ProviderKind::ClaudeCli),
+        &[
+            json!({"type":"assistant","parent_tool_use_id":"nested","message":{"model":"subagent-model"}}),
+        ],
+    );
+    assert!(error.is_none());
+    assert!(result.reported_model.is_none());
+    assert_eq!(result.selection.unwrap().verification.model, "unknown");
 }
 
 #[test]

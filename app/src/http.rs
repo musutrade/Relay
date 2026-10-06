@@ -30,11 +30,20 @@ pub fn router_with_auth(app: Arc<Application>, auth: Auth) -> Router {
     };
     let api = Router::new()
         .route("/config", get(config))
+        .route("/resources", get(resources))
+        .route("/permission-challenge", post(permission_challenge))
+        .route("/capabilities", get(capabilities))
+        .route("/capabilities/{name}/refresh", post(refresh_capabilities))
         .route("/status", get(status))
         .route("/tasks", get(list).post(submit))
         .route("/tasks/{id}", get(detail))
+        .route("/tasks/{id}/operator", get(operator))
         .route("/tasks/{id}/cancel", post(cancel))
         .route("/tasks/{id}/retry", post(retry))
+        .route(
+            "/tasks/{id}/replacement-challenge",
+            post(replacement_challenge),
+        )
         .route("/tasks/{id}/continue-review", post(continue_review))
         .layer(DefaultBodyLimit::max(96 * 1024))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
@@ -136,6 +145,47 @@ async fn index() -> Response {
 async fn config(State(state): State<Web>) -> Json<Value> {
     Json(state.app.public_config())
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourceQuery {
+    repository: String,
+    workflow: Option<String>,
+    reviewer_profile: Option<String>,
+}
+async fn resources(
+    State(state): State<Web>,
+    Query(query): Query<ResourceQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || {
+        state.app.resource_estimate_with_reviewer(
+            &query.repository,
+            query.workflow.as_deref(),
+            query.reviewer_profile.as_deref(),
+        )
+    })
+    .await
+    .map_err(|_| Error::Poisoned)??;
+    Ok(Json(json!(result)))
+}
+async fn operator(State(state): State<Web>, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        tokio::task::spawn_blocking(move || state.app.operator(id))
+            .await
+            .map_err(|_| Error::Poisoned)??,
+    ))
+}
+async fn capabilities(State(state): State<Web>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({"profiles": state.app.capabilities()?})))
+}
+async fn refresh_capabilities(
+    State(state): State<Web>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let result = tokio::task::spawn_blocking(move || state.app.refresh_capabilities(&name))
+        .await
+        .map_err(|_| Error::Poisoned)??;
+    Ok(Json(json!(result)))
+}
 async fn status(State(state): State<Web>) -> Result<Json<Value>, ApiError> {
     Ok(Json(state.app.status()?))
 }
@@ -155,11 +205,29 @@ async fn detail(
 ) -> Result<Json<crate::TaskView>, ApiError> {
     Ok(Json(state.app.get_view(id)?))
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PermissionChallengeInput {
+    job: crate::host::Job,
+}
+async fn permission_challenge(
+    State(state): State<Web>,
+    Json(input): Json<PermissionChallengeInput>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(state.app.permission_challenge(input.job)?))
+}
 async fn submit(
     State(state): State<Web>,
     Json(input): Json<Submission>,
 ) -> Result<(StatusCode, Json<relay::Task>), ApiError> {
     Ok((StatusCode::CREATED, Json(state.app.submit(input)?)))
+}
+async fn replacement_challenge(
+    State(state): State<Web>,
+    Path(id): Path<i64>,
+    Json(input): Json<crate::ReplacementChallengeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(state.app.replacement_challenge(id, input)?))
 }
 async fn retry(
     State(state): State<Web>,
@@ -192,7 +260,9 @@ impl IntoResponse for ApiError {
         let status = match &self.0 {
             Error::Core(relay::Error::NotFound) => StatusCode::NOT_FOUND,
             Error::Core(relay::Error::IdempotencyConflict | relay::Error::StaleClaim)
-            | Error::RecoveryRequired => StatusCode::CONFLICT,
+            | Error::RecoveryRequired
+            | Error::DiscoveryUnavailable(_)
+            | Error::ActionUnavailable { .. } => StatusCode::CONFLICT,
             Error::Core(relay::Error::Invalid(_)) | Error::Invalid(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -202,6 +272,17 @@ impl IntoResponse for ApiError {
         } else {
             self.0.to_string()
         };
-        (status, Json(json!({"error":message}))).into_response()
+        let failure = match &self.0 {
+            Error::ActionUnavailable { code, cause } => {
+                Some(crate::resources::Failure::new(code, "request", cause))
+            }
+            Error::Invalid(cause) => Some(crate::resources::Failure::new(
+                "invalid_request",
+                "request",
+                cause,
+            )),
+            _ => None,
+        };
+        (status, Json(json!({"error":message,"failure":failure}))).into_response()
     }
 }

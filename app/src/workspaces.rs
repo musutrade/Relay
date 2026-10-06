@@ -13,6 +13,12 @@ use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Continuation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer_stage: Option<crate::replacement::StoppedStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<crate::replacement::Replacement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_increase: Option<QuotaIncrease>,
     pub workspace_task_id: i64,
     pub predecessor_task_id: i64,
     pub predecessor_generation: i64,
@@ -21,10 +27,20 @@ pub struct Continuation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_adoption: Option<crate::workflow::PinnedReviewAdoption>,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaIncrease {
+    pub previous_bytes: u64,
+    pub new_bytes: u64,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
     version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fresh_session_role: Option<crate::replacement::Role>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_bytes: Option<u64>,
     workspace_task_id: i64,
     task_id: i64,
     generation: i64,
@@ -43,7 +59,7 @@ fn failure(path: &Path, outcome: Outcome, error: impl ToString) -> Box<RunResult
     result.workspace = Some(path.to_owned());
     Box::new(result)
 }
-fn root(config: &HostConfig, task: &Task, job: &Job) -> PathBuf {
+pub(crate) fn root(config: &HostConfig, task: &Task, job: &Job) -> PathBuf {
     config.workspace_root.join(format!(
         "task-{}",
         job.continuation
@@ -57,6 +73,24 @@ fn normalized(job: &Job) -> Job {
     job
 }
 fn config_binding(config: &HostConfig, job: &Job) -> io::Result<String> {
+    if job.role_selections.is_some() {
+        let workflow = job
+            .workflow
+            .as_ref()
+            .and_then(|name| config.workflows.get(name))
+            .map(|workflow| crate::selection::effective_workflow(job, config, workflow));
+        let developer =
+            crate::selection::native_profile(job, config, false).map_err(io::Error::other)?;
+        let reviewer =
+            crate::selection::native_profile(job, config, true).map_err(io::Error::other)?;
+        return crate::sessions::fingerprint(&json!({
+            "source":config.repositories.get(&job.repository),
+            "agent":config.agents.get(&job.agent),"native":developer,"workflow":workflow,"reviewer":reviewer,
+            "test":job.test.as_ref().or(workflow.as_ref().map(|w|&w.test)).and_then(|name|config.tests.get(name)),
+            "publisher":job.draft_pr_adapter.as_ref().and_then(|name|config.draft_pr_adapters.get(name)),
+            "role_selections":job.role_selections,
+        }));
+    }
     let workflow = job
         .workflow
         .as_ref()
@@ -71,8 +105,11 @@ fn config_binding(config: &HostConfig, job: &Job) -> io::Result<String> {
 fn read_record(path: &Path) -> io::Result<Record> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path.join("claim.json"))?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("workspace claim must be a regular file"));
+    }
     let mut bytes = Vec::new();
     file.take(128 * 1024 + 1).read_to_end(&mut bytes)?;
     if bytes.len() > 128 * 1024 {
@@ -80,18 +117,24 @@ fn read_record(path: &Path) -> io::Result<Record> {
     }
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
-fn lock(path: &Path) -> io::Result<Arc<File>> {
+pub(crate) fn lock(path: &Path) -> io::Result<Arc<File>> {
+    lock_with_create(path, false)
+}
+fn lock_with_create(path: &Path, create: bool) -> io::Result<Arc<File>> {
     if !fs::symlink_metadata(path)?.is_dir() || path.canonicalize()? != path {
         return Err(io::Error::other("workspace root was redirected"));
     }
     let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
+        .create(create)
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path.join("owner.lock"))?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("workspace lock must be a regular file"));
+    }
     // SAFETY: flock operates on our live private descriptor; ownership is inherited
     // by each supervisor, but never by the configured command.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -108,11 +151,76 @@ fn inspect(config: &HostConfig, task: &Task, job: &Job, path: &Path) -> io::Resu
         .continuation
         .as_ref()
         .map_or(task.id, |c| c.workspace_task_id);
+    let replacement_transition =
+        record.task_id != task.id && crate::replacement::current(job).is_some();
+    if replacement_transition {
+        let proof = crate::replacement::current(job).expect("replacement");
+        let continuation = job.continuation.as_ref().expect("continuation");
+        if record.task_id != continuation.predecessor_task_id
+            || record.generation != continuation.predecessor_generation
+        {
+            return Err(io::Error::other(
+                "replacement predecessor ownership changed",
+            ));
+        }
+        crate::replacement::verify_transition(
+            &record.job,
+            job,
+            &read_stopped_result(path)?,
+            &record.owner,
+            config,
+        )?;
+        crate::replacement::verify_stage_checkpoint(&proof.stopped_stage, path)?;
+        verify_candidate_checkpoint(config, &record.job, path)?;
+    }
+    let mut expected = if replacement_transition {
+        record.job.clone()
+    } else {
+        normalized(job)
+    };
+    // Quota is an independent approved delta, even when the role also changes.
+    expected.workspace_quota_bytes = job.workspace_quota_bytes;
+    if expected.workspace_quota_bytes != record.job.workspace_quota_bytes {
+        let proof = job
+            .continuation
+            .as_ref()
+            .and_then(|continuation| continuation.quota_increase.as_ref())
+            .ok_or_else(|| {
+                io::Error::other(
+                    "workspace quota changed without a validated continuation increase",
+                )
+            })?;
+        let previous_result = read_stopped_result(path)?;
+        if proof.previous_bytes == 0
+            || proof.new_bytes <= proof.previous_bytes
+            || Some(proof.previous_bytes) != record.quota_bytes
+            || previous_result
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.quota_bytes)
+                != Some(proof.previous_bytes)
+            || expected.workspace_quota_bytes != Some(proof.new_bytes)
+            || proof.new_bytes > config.workspace_byte_limit()
+        {
+            return Err(io::Error::other(
+                "workspace quota increase proof does not match the stopped predecessor",
+            ));
+        }
+        expected.workspace_quota_bytes = record.job.workspace_quota_bytes;
+    }
     if record.version != 1
         || record.workspace_task_id != expected_root
-        || record.config_binding != config_binding(config, job)?
+        || record.config_binding
+            != config_binding(
+                config,
+                if replacement_transition {
+                    &record.job
+                } else {
+                    job
+                },
+            )?
         || serde_json::to_value(&record.job).map_err(io::Error::other)?
-            != serde_json::to_value(normalized(job)).map_err(io::Error::other)?
+            != serde_json::to_value(expected).map_err(io::Error::other)?
     {
         return Err(io::Error::other(
             "workspace task, job, or selected profile binding changed",
@@ -184,7 +292,7 @@ pub(crate) fn prepare(
             "workspace path was redirected",
         ));
     }
-    let file = lock(&path).map_err(|e| {
+    let file = lock_with_create(&path, !reused).map_err(|e| {
         failure(
             &path,
             Outcome::Unknown,
@@ -236,8 +344,13 @@ pub(crate) fn prepare(
     } else {
         1
     };
+    let fresh_session_role = crate::replacement::current(job)
+        .filter(|_| read_record(&path).is_ok_and(|record| record.task_id != task.id))
+        .map(|proof| proof.role);
     let record = Record {
         version: 1,
+        fresh_session_role,
+        quota_bytes: Some(config.workspace_byte_limit()),
         workspace_task_id: job
             .continuation
             .as_ref()
@@ -261,6 +374,14 @@ pub(crate) fn continuation(
 ) -> io::Result<Continuation> {
     let path = root(config, task, job);
     let _lock = lock(&path)?;
+    continuation_under_lease(config, task, job)
+}
+pub(crate) fn continuation_under_lease(
+    config: &HostConfig,
+    task: &Task,
+    job: &Job,
+) -> io::Result<Continuation> {
+    let path = root(config, task, job);
     let record = inspect(config, task, job, &path)?;
     if record.task_id != task.id
         || record.generation != task.generation
@@ -274,12 +395,37 @@ pub(crate) fn continuation(
         return Err(io::Error::other("workspace was not completely initialized"));
     }
     Ok(Continuation {
+        developer_stage: None,
+        replacement: None,
+        quota_increase: None,
         workspace_task_id: record.workspace_task_id,
         predecessor_task_id: task.id,
         predecessor_generation: task.generation,
         review_only: None,
         operator_adoption: None,
     })
+}
+pub(crate) fn consume_fresh_role_epoch(path: &Path, reviewer: bool) -> io::Result<()> {
+    let mut record = read_record(path)?;
+    if record
+        .fresh_session_role
+        .is_some_and(|role| role.reviewer() == reviewer)
+    {
+        record.fresh_session_role = None;
+        crate::sessions::atomic_write(&path.join("claim.json"), &record)?;
+    }
+    Ok(())
+}
+pub(crate) fn fresh_role_epoch(path: &Path, reviewer: bool) -> io::Result<bool> {
+    Ok(read_record(path)?
+        .fresh_session_role
+        .is_some_and(|role| role.reviewer() == reviewer))
+}
+pub(crate) fn role_epoch(path: &Path, reviewer: bool) -> io::Result<Option<String>> {
+    Ok(read_record(path)?
+        .job
+        .role_epochs
+        .and_then(|epochs| epochs.role(reviewer).map(str::to_owned)))
 }
 pub(crate) fn attempt(path: &Path) -> io::Result<u64> {
     Ok(read_record(path)?.attempt)
@@ -439,4 +585,190 @@ fn read_bounded_record(path: &Path, limit: u64) -> io::Result<String> {
         return Err(io::Error::other("checkpoint exceeds its bound"));
     }
     Ok(text)
+}
+
+/// Metadata-only preflight. The execution path still verifies raw candidate bytes,
+/// index, source cleanliness and compatible sessions before running any agent.
+pub(crate) fn verify_candidate_checkpoint(
+    config: &HostConfig,
+    job: &Job,
+    path: &Path,
+) -> io::Result<()> {
+    if job.workflow.is_none() {
+        return Ok(());
+    }
+    let base: String = serde_json::from_str(&read_marker(&path.join("workflow-base.txt"))?)
+        .map_err(io::Error::other)?;
+    let candidate: String = serde_json::from_str(&read_marker(&path.join("candidate-head.json"))?)
+        .map_err(io::Error::other)?;
+    if !valid_sha(&base)
+        || !valid_sha(&candidate)
+        || git_head(&path.join("repository"))? != candidate
+        || git_head(&config.repositories[&job.repository])? != base
+    {
+        return Err(io::Error::other(
+            "preserved candidate or source HEAD differs from the host checkpoint",
+        ));
+    }
+    Ok(())
+}
+fn valid_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+fn git_head(repository: &Path) -> io::Result<String> {
+    if repository.canonicalize()? != repository || !fs::symlink_metadata(repository)?.is_dir() {
+        return Err(io::Error::other("repository path was redirected"));
+    }
+    let mut git = repository.join(".git");
+    if fs::symlink_metadata(&git)?.is_file() {
+        let pointer = read_bounded_record(&git, 4096)?;
+        let destination = pointer
+            .trim()
+            .strip_prefix("gitdir: ")
+            .ok_or_else(|| io::Error::other("invalid Git directory pointer"))?;
+        git = repository.join(destination).canonicalize()?;
+    }
+    if !fs::symlink_metadata(&git)?.is_dir() || git.canonicalize()? != git {
+        return Err(io::Error::other("Git metadata path was redirected"));
+    }
+    let head = read_bounded_record(&git.join("HEAD"), 1024)?;
+    let head = head.trim();
+    if valid_sha(head) {
+        return Ok(head.into());
+    }
+    let reference = head
+        .strip_prefix("ref: ")
+        .filter(|value| {
+            value.starts_with("refs/")
+                && !value
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+        })
+        .ok_or_else(|| io::Error::other("unsupported Git HEAD"))?;
+    let common = match read_bounded_record(&git.join("commondir"), 4096) {
+        Ok(pointer) => git.join(pointer.trim()).canonicalize()?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => git.clone(),
+        Err(error) => return Err(error),
+    };
+    match read_bounded_record(&common.join(reference), 1024) {
+        Ok(value) if valid_sha(value.trim()) => return Ok(value.trim().into()),
+        Ok(_) => return Err(io::Error::other("invalid Git reference")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error),
+    }
+    for line in read_bounded_record(&common.join("packed-refs"), 1024 * 1024)?.lines() {
+        if let Some((sha, name)) = line.split_once(' ')
+            && name == reference
+            && valid_sha(sha)
+        {
+            return Ok(sha.into());
+        }
+    }
+    Err(io::Error::other(
+        "Git HEAD could not be verified from bounded metadata",
+    ))
+}
+
+pub(crate) fn verify_review_checkpoint(
+    config: &HostConfig,
+    job: &Job,
+    result: &RunResult,
+    path: &Path,
+) -> io::Result<()> {
+    verify_review_candidate_checkpoint(config, job, result, path)?;
+    verify_review_session(config, job, path)
+}
+pub(crate) fn verify_review_candidate_checkpoint(
+    config: &HostConfig,
+    job: &Job,
+    result: &RunResult,
+    path: &Path,
+) -> io::Result<()> {
+    let review = crate::workflow::review_continuation(result, None).map_err(io::Error::other)?;
+    let profile = crate::selection::native_profile(job, config, true)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("review continuation has no configured reviewer"))?;
+    let profile = &profile;
+    if crate::sessions::enabled(profile) {
+        let repository = path.join("reviewer-repository");
+        if read_marker(&path.join("reviewer-candidate.txt"))? != review.candidate_sha
+            || git_head(&repository)? != review.candidate_sha
+        {
+            return Err(io::Error::other(
+                "reviewer candidate checkpoint does not match the stopped candidate",
+            ));
+        }
+    }
+    Ok(())
+}
+fn verify_review_session(config: &HostConfig, job: &Job, path: &Path) -> io::Result<()> {
+    let profile = crate::selection::native_profile(job, config, true)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("reviewer missing"))?;
+    if crate::sessions::enabled(&profile) {
+        let next_attempt = attempt(path)?
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("workspace attempt limit reached"))?;
+        crate::sessions::Session::verify_reviewer_resume(
+            path,
+            &path.join("reviewer-repository"),
+            &profile,
+            next_attempt,
+            job.role_epochs
+                .as_ref()
+                .and_then(|epochs| epochs.role(true)),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod selection_binding_tests {
+    use super::*;
+    #[test]
+    fn legacy_workspace_fingerprint_is_stable_and_selected_settings_are_bound() {
+        let config: HostConfig = serde_json::from_value(json!({
+            "workspace_root":"/fixture/runs","repositories":{"repo":"/fixture/source"},
+            "native_agents":{"dev":{"provider":"codex_cli","program":"/bin/true"}}
+        }))
+        .unwrap();
+        let mut job: Job = serde_json::from_value(
+            json!({"repository":"repo","requirements":"Do work","agent":"dev"}),
+        )
+        .unwrap();
+        assert_eq!(
+            config_binding(&config, &job).unwrap(),
+            "fnv1a-v1-6de094035fdf55a3"
+        );
+        job.role_selections = Some(
+            serde_json::from_value(
+                json!({"developer":{"profile":"dev","model":{"value":"first","source":"manual"}}}),
+            )
+            .unwrap(),
+        );
+        let selected = config_binding(&config, &job).unwrap();
+        job.role_selections
+            .as_mut()
+            .unwrap()
+            .developer
+            .as_mut()
+            .unwrap()
+            .model
+            .as_mut()
+            .unwrap()
+            .value = "second".into();
+        assert_ne!(config_binding(&config, &job).unwrap(), selected);
+        let selected = config_binding(&config, &job).unwrap();
+        let mut changed = config.clone();
+        changed
+            .native_agents
+            .get_mut("dev")
+            .unwrap()
+            .env
+            .insert("POLICY".into(), "different".into());
+        assert_ne!(config_binding(&changed, &job).unwrap(), selected);
+    }
 }
