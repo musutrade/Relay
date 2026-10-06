@@ -1166,3 +1166,161 @@ async fn planned_copy_admission_declares_required_increase_despite_low_current_u
         required
     );
 }
+
+// Allocation inventory is metadata-only: these fixtures never open an
+// Application, execute a host command, or make a provider call.
+fn allocation_config(root: &Path) -> HostConfig {
+    serde_json::from_value(json!({
+        "workspace_root": root.join("unused"),
+        "repositories": {},
+        "max_snapshot_entries": 1000
+    }))
+    .unwrap()
+}
+fn blocks(path: impl AsRef<Path>) -> u64 {
+    fs::symlink_metadata(path).unwrap().blocks() * 512
+}
+
+#[test]
+fn allocated_sparse_blocks_are_distinct_from_unchanged_logical_usage() {
+    use relay_app::resources::{measure_allocated_workspace, measure_workspace};
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("sparse");
+    sparse(&path, 8 * 1024 * KIB);
+    let config = allocation_config(temp.path());
+    let usage = measure_allocated_workspace(temp.path(), &config);
+    assert!(usage.complete);
+    assert!(usage.reason.is_none());
+    assert!(usage.measured_at > 0);
+    assert_eq!(
+        usage.allocated_bytes,
+        Some(blocks(temp.path()) + blocks(&path))
+    );
+    assert!(usage.allocated_bytes.unwrap() < 8 * 1024 * KIB);
+    assert_eq!(
+        measure_workspace(temp.path(), &config).logical_bytes,
+        Some(8 * 1024 * KIB)
+    );
+    let json = serde_json::to_value(&usage).unwrap();
+    assert!(json.get("logical_bytes").is_none());
+    assert_eq!(json["allocated_bytes"], usage.allocated_bytes.unwrap());
+}
+
+#[test]
+fn allocated_hardlinks_are_counted_once_within_workspace() {
+    use relay_app::resources::{measure_allocated_workspace, measure_workspace};
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    let external = temp.path().join("also-linked-outside");
+    fs::write(&external, vec![42u8; 16 * KIB as usize]).unwrap();
+    fs::hard_link(&external, root.join("first")).unwrap();
+    fs::hard_link(&external, root.join("second")).unwrap();
+    let config = allocation_config(&root);
+    let usage = measure_allocated_workspace(&root, &config);
+    assert!(usage.complete);
+    assert_eq!(
+        usage.allocated_bytes,
+        Some(blocks(&root) + blocks(&external))
+    );
+    // Logical quotas intentionally continue charging each regular-file path.
+    assert_eq!(
+        measure_workspace(&root, &config).logical_bytes,
+        Some(32 * KIB)
+    );
+    assert_eq!(fs::metadata(&external).unwrap().nlink(), 3);
+}
+
+#[test]
+fn allocated_observation_includes_git_reviewer_controls_and_directory_blocks() {
+    use relay_app::resources::measure_allocated_workspace;
+    let temp = TempDir::new().unwrap();
+    let directories = [
+        "repository",
+        "repository/.git",
+        "repository/.git/objects",
+        "reviewer-repository",
+        "target",
+    ];
+    for name in directories {
+        fs::create_dir(temp.path().join(name)).unwrap();
+    }
+    let files = [
+        "repository/source",
+        "repository/.git/objects/object",
+        "reviewer-repository/source",
+        "target/output",
+        "claim.json",
+        "owner.lock",
+    ];
+    for name in files {
+        fs::write(temp.path().join(name), vec![1u8; 8192]).unwrap();
+    }
+    let expected = blocks(temp.path())
+        + directories
+            .into_iter()
+            .chain(files)
+            .map(|name| blocks(temp.path().join(name)))
+            .sum::<u64>();
+    let usage = measure_allocated_workspace(temp.path(), &allocation_config(temp.path()));
+    assert!(usage.complete);
+    assert_eq!(usage.allocated_bytes, Some(expected));
+}
+
+#[test]
+fn allocated_symlinks_count_own_blocks_without_following_targets_or_cycles() {
+    use relay_app::resources::measure_allocated_workspace;
+    use std::os::unix::fs::symlink;
+    let temp = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("large"), vec![1u8; 256 * KIB as usize]).unwrap();
+    symlink(outside.path(), temp.path().join("directory-link")).unwrap();
+    symlink(outside.path().join("large"), temp.path().join("file-link")).unwrap();
+    symlink(temp.path(), temp.path().join("loop")).unwrap();
+    let long_target = format!("{}/{}", outside.path().display(), "segment/".repeat(100));
+    symlink(long_target, temp.path().join("long-dangling-link")).unwrap();
+    let expected = blocks(temp.path())
+        + ["directory-link", "file-link", "loop", "long-dangling-link"]
+            .into_iter()
+            .map(|name| blocks(temp.path().join(name)))
+            .sum::<u64>();
+    let usage = measure_allocated_workspace(temp.path(), &allocation_config(temp.path()));
+    assert!(usage.complete);
+    assert_eq!(usage.allocated_bytes, Some(expected));
+    assert!(usage.allocated_bytes.unwrap() < blocks(outside.path().join("large")));
+    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 4);
+}
+
+#[test]
+fn allocated_entry_limit_is_partial_and_unknown_roots_are_not_zero() {
+    use relay_app::resources::measure_allocated_workspace;
+    let temp = TempDir::new().unwrap();
+    let mut config = allocation_config(temp.path());
+    config.max_snapshot_entries = 1;
+    fs::write(temp.path().join("a"), vec![1u8; 8192]).unwrap();
+    let usage = measure_allocated_workspace(temp.path(), &config);
+    assert!(usage.complete);
+    let expected = blocks(temp.path()) + blocks(temp.path().join("a"));
+    assert_eq!(usage.allocated_bytes, Some(expected));
+    fs::write(temp.path().join("b"), vec![1u8; 8192]).unwrap();
+    let usage = measure_allocated_workspace(temp.path(), &config);
+    assert!(!usage.complete);
+    assert_eq!(
+        usage.allocated_bytes,
+        Some(blocks(temp.path()) + blocks(temp.path().join("a")))
+    );
+    assert!(usage.reason.unwrap().contains("entry limit"));
+    std::os::unix::fs::symlink(temp.path(), temp.path().join("link")).unwrap();
+    for root in [
+        temp.path().join("missing"),
+        temp.path().join("a"),
+        temp.path().join("link"),
+        temp.path().join(".."),
+    ] {
+        let usage = measure_allocated_workspace(&root, &config);
+        assert_eq!(usage.allocated_bytes, None, "{}", root.display());
+        assert!(!usage.complete);
+        assert!(usage.reason.is_some());
+    }
+    assert!(!temp.path().join("missing").exists());
+}

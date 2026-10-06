@@ -57,6 +57,26 @@ def operator_fixture(value, reservation=None, saved=None):
         'resources':{'usage':{'logical_bytes':4096,'complete':True,'measured_at':1700000000,'reason':None},'quota_bytes':quota,'host_policy_cap_bytes':cap,'snapshot_cap_bytes':52428800,'enforcement':'logical_bytes_best_effort','os_hard_quota':False,'disk_reserved':False},
         'retained_result':{'available':value['result'] is not None,'immutable':True},'workspace_retained':bool(result.get('workspace')),
         'recovery':{'inherited_quota_bytes':quota,'actions':actions,'blocked_reason':'发布已尝试，需先核对外部结果后本机恢复' if result.get('draft_pr') else None,'successor_id':successor,'reserved_request':frozen}}
+def workspace_fixture(older=False):
+    attack='<img src=x onerror=window.__inventoryXss=1>'
+    def entry(i, status):
+        return {'workspace_task_id':i,'path':'/fixture/task-'+str(i),
+            'current_owner':{'task_id':i+100,'generation':2,'owner':'host-fixture','state':'finished'},
+            'references':[{'task_id':i,'generation':1,'state':'finished','outcome':'failure'},
+                {'task_id':i+100,'generation':2,'state':'finished','outcome':'success'}],
+            'references_complete':True,'successor_reserved':False,
+            'allocated_usage':{'allocated_bytes':4096,'complete':True,'measured_at':1700000000,'reason':None},
+            'retention':{'status':status,'reason':'Host retention snapshot','eligible_at':1700003600}}
+    entries=[entry(45,'protected')] if older else [entry(50-i,status) for i,status in enumerate(['eligible','waiting','disabled','protected','unknown'])]
+    if not older:
+        entries[0]['allocated_usage']['allocated_bytes']=0
+        entries[1]['allocated_usage'].update(complete=False,reason='Bounded scan ended')
+        entries[-1].update(path='/fixture/'+attack+'long-path-segment-'*18,current_owner=None,references_complete=False,successor_reserved=True)
+        entries[-1]['allocated_usage'].update(allocated_bytes=None,complete=False,reason=attack)
+        entries[-1]['references']=[{'task_id':1000,'generation':3,'state':attack,'outcome':None}]
+        entries[-1]['retention'].update(reason=attack,eligible_at=None)
+    return {'observed_at':1700000001,'policy':{'successful_retention_seconds':3600,'automatic_cleanup_enabled':True},
+        'workspaces':entries,'next_before':None if older else 46,'complete':older,'reason':None if older else 'Some observations incomplete'}
 def catalog_fixture():
     def evidence(state, reason, source='fixture:read-only-discovery'):
         return {'state':state,'reason':reason,'source':source}
@@ -93,6 +113,7 @@ with sync_playwright() as p:
     page=context.new_page(); errors=[]; requests=[]; submissions=[]
     data={'tasks':[task(3,'queued'),task(2,'claimed'),task(1,'finished',outcome='success')], 'status':{'active':task(2,'claimed'),'recovery_required':False,'diagnostic':None},'post':'success','list_error':False,'continuations':{},'continuation_payloads':{},'continuation_post':'success','hidden_task_ids':set(),'frozen_lists':{},'retry_requests':[],'review_requests':[],'config':{'repositories':['relay-demo','api-service'],'agents':['codex','reviewer'],'tests':['unit','full']}}
     data['catalog']={'name':'codex','cache_epoch':'browser-fixture-process','generation':0,'stale':True,'refreshing':False,'catalog':None}
+    data['workspaces']=workspace_fixture();data['workspace_error']=False
     data['catalog_refreshes']=0
     data['resources']=resource_fixture();data['operator_overrides']={}
     # Model persisted reservations separately from visible task payloads. A child
@@ -106,6 +127,11 @@ with sync_playwright() as p:
         assert req.headers.get('authorization')=='Bearer test-token',req.headers
         if path=='/api/config': result=data['config']
         elif path=='/api/status': result=data['status']
+        elif path.startswith('/api/workspaces'):
+            assert req.method=='GET' and not req.post_data
+            if data['workspace_error']: r.fulfill(status=503,content_type='application/json',body=json.dumps({'error':'Workspace read unavailable'}));return
+            assert path in ['/api/workspaces','/api/workspaces?before=46']
+            result=workspace_fixture(True) if path.endswith('before=46') else data['workspaces']
         elif path.startswith('/api/resources?'): result=data['resources']
         elif path.endswith('/replacement-challenge'):
             assert req.method=='POST'
@@ -236,6 +262,66 @@ with sync_playwright() as p:
     assert page.locator('.task-button').count()==3
     assert not page.locator('#workflow-field').is_visible(), 'Legacy configuration keeps the ordinary form'
     page.screenshot(path=str(SCREENSHOTS / 'relay-connected-desktop.png'),full_page=True)
+    # Workspace inventory is explicit GET-only, separate from task polling and resource quotas.
+    workspace_reads=lambda: [path for method,path,_ in requests if path.startswith('/api/workspaces')]
+    assert not workspace_reads()
+    expect(page.locator('#inventory-panel')).to_be_visible()
+    expect(page.locator('#inventory-body')).to_be_hidden()
+    page.locator('#inventory-toggle').focus();page.keyboard.press('Enter')
+    expect(page.locator('#inventory-toggle')).to_have_attribute('aria-expanded','true')
+    assert not workspace_reads(), 'Opening a panel must not scan the host'
+    page.locator('#inventory-read').focus()
+    with page.expect_response(lambda response: response.url==base+'/api/workspaces'):
+        page.keyboard.press('Space')
+    expect(page.locator('#inventory-policy')).to_contain_text('3600 秒；自动清理已开启')
+    expect(page.locator('#inventory-status')).to_contain_text('不完整')
+    expect(page.locator('#inventory-disclaimer')).to_contain_text('不是可安全删除的结论或删除授权')
+    expect(page.locator('#inventory-body')).to_contain_text('不是逻辑容量、独占占用或可回收空间')
+    expect(page.locator('#inventory-body')).to_contain_text('旧配置根或其他路径未扫描')
+    expect(page.locator('[data-workspace-task-id="50"]')).to_contain_text('0 B')
+    expect(page.locator('[data-workspace-task-id="49"]')).to_contain_text('已观测 4.00 KiB')
+    unknown=page.locator('[data-workspace-task-id="46"]')
+    expect(unknown).to_contain_text('未知 / 未确认绑定')
+    expect(unknown).to_contain_text('不完整，仍有未知引用')
+    expect(unknown).to_contain_text('存在预留')
+    expect(unknown).to_contain_text('<img src=x onerror=window.__inventoryXss=1>')
+    assert page.locator('#inventory-entries img, #inventory-entries button, #inventory-entries a').count()==0
+    assert page.evaluate('window.__inventoryXss') is None
+    unknown.locator('summary').focus();page.keyboard.press('Enter')
+    expect(unknown.locator('li')).to_contain_text('结果 未知')
+    for width in [1440,390,320]:
+        page.set_viewport_size({'width':width,'height':1000})
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'),f'workspace inventory overflow at {width}'
+        assert page.locator('#inventory-panel').evaluate('(node) => node.scrollWidth <= node.clientWidth'),f'workspace panel overflow at {width}'
+        page.locator('#inventory-panel').screenshot(path=str(SCREENSHOTS / f'relay-workspace-inventory-{width}.png'))
+    page.set_viewport_size({'width':1440,'height':1150})
+    inventory_count=len(workspace_reads());page.wait_for_timeout(2200);page.locator('#refresh').click()
+    assert len(workspace_reads())==inventory_count, 'Task polling/refresh must not read workspaces'
+    page.locator('#inventory-next').focus();page.keyboard.press('Enter')
+    expect(page.locator('#inventory-page-status')).to_contain_text('第 2 页')
+    expect(page.locator('[data-workspace-task-id="45"]')).to_be_visible()
+    expect(page.locator('#inventory-next')).to_be_disabled()
+    assert page.locator('[data-workspace-task-id="50"]').count()==0
+    page.locator('#inventory-prev').focus();page.keyboard.press('Space')
+    expect(page.locator('#inventory-page-status')).to_contain_text('第 1 页')
+    expect(page.locator('#inventory-prev')).to_be_disabled()
+    data['workspace_error']=True;page.locator('#inventory-read').click()
+    expect(page.locator('#inventory-error')).to_contain_text('Workspace read unavailable')
+    expect(page.locator('#inventory-status')).to_contain_text('保留资格未知')
+    expect(page.locator('#inventory-next')).to_be_disabled()
+    assert page.locator('.inventory-card').count()==0
+    expect(page.locator('#inventory-policy')).to_be_empty()
+    data['workspace_error']=False
+    data['workspaces']['workspaces']=[];data['workspaces']['next_before']=None
+    page.locator('#inventory-read').click();expect(page.locator('#inventory-entries')).to_contain_text('清单不完整')
+    data['workspaces']['complete']=True
+    data['workspaces']['policy']={'successful_retention_seconds':None,'automatic_cleanup_enabled':False}
+    page.locator('#inventory-read').click();expect(page.locator('#inventory-entries')).to_contain_text('本页未发现工作区')
+    expect(page.locator('#inventory-policy')).to_contain_text('未配置；自动清理已关闭')
+    page.locator('#inventory-toggle').focus();page.keyboard.press('Space')
+    expect(page.locator('#inventory-body')).to_be_hidden()
+    expect(page.locator('#inventory-entries')).to_be_empty()
+    data['workspaces']=workspace_fixture()
     # Estimates are bounded, explicit, selected-repository reads; task polling does not scan resources.
     expect(page.locator('#workspace-quota')).to_be_disabled()
     with page.expect_response(lambda response: '/api/resources?repository=relay-demo' in response.url):
@@ -953,10 +1039,13 @@ with sync_playwright() as p:
     assert page.locator('#detail-requirements').inner_text()==''
     assert page.locator('#detail-result').inner_text()==''
     assert page.locator('#token').input_value()==''
+    expect(page.locator('#inventory-panel')).to_be_hidden()
+    expect(page.locator('#inventory-entries')).to_be_empty()
+    expect(page.locator('#inventory-policy')).to_be_empty()
     assert page.locator('#workflow').input_value()==''
     assert not page.locator('#workflow-field').is_visible()
     assert page.locator('#workflow-hint').inner_text()==''
     assert not errors, errors
-    print('PASS: cached-only catalog login/open, explicit profile discovery, unknown auth/effective selection, startup context, safe model/effort metadata, task-only observations with scoped context/resolved alias/false-vs-unknown/staleness/inert XSS and no selector promotion, catalog screenshots at 320/390/1440, no automatic discovery, catalog logout reset; optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, persisted continuation status, repeated successor navigation, stale two-tab confirmation, reload/new-context recovery, off-page successor detail/refresh, continuation chains, reserved-submit recovery, review-only eligibility and dismissal, review focus UTF-8 boundary, immutable unknown-request retry, duplicate review confirmation, bidirectional cross-mode stale confirmations, review successor reload, logout; no browser errors')
+    print('PASS: explicit workspace inventory reads/pagination/keyboard controls, allocated-vs-logical/reclaimable semantics, unknown/incomplete/error/empty states, inert XSS, no polling, responsive 320/390/1440; cached-only catalog login/open, explicit profile discovery, unknown auth/effective selection, startup context, safe model/effort metadata, task-only observations with scoped context/resolved alias/false-vs-unknown/staleness/inert XSS and no selector promotion, catalog screenshots at 320/390/1440, no automatic discovery, catalog logout reset; optional workflows, configured-field locking/restoration, explicit workflow payload, workflow auth retry across config removal, browser-history and cached-page reset, auth, memory-only token, polling, secure rendering, filters, details, cancel modal, exact-key retry, recovery diagnostic, network recovery, widths 320/390/768/1024/1440, dark mode, persisted continuation status, repeated successor navigation, stale two-tab confirmation, reload/new-context recovery, off-page successor detail/refresh, continuation chains, reserved-submit recovery, review-only eligibility and dismissal, review focus UTF-8 boundary, immutable unknown-request retry, duplicate review confirmation, bidirectional cross-mode stale confirmations, review successor reload, logout; no browser errors')
     browser.close()
 server.shutdown()

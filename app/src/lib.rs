@@ -857,6 +857,21 @@ impl Application {
         )
         .map_err(Error::Invalid)
     }
+    /// Explicit bounded read of configured workspace ownership and retention.
+    pub fn workspace_inventory(&self, before: Option<i64>) -> Result<Value> {
+        if before.is_some_and(|id| id <= 0) {
+            return Err(Error::Invalid(
+                "workspace cursor must be a positive task ID".into(),
+            ));
+        }
+        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        Ok(workspaces::inventory(
+            self.host.config(),
+            &state.store,
+            &state.control,
+            before,
+        ))
+    }
     /// Read a single attempt's operator controls. Filesystem measurements have a
     /// short cache; eligibility and every action are checked independently.
     pub fn operator(&self, id: i64) -> Result<Value> {

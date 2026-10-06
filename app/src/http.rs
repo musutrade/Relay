@@ -31,6 +31,7 @@ pub fn router_with_auth(app: Arc<Application>, auth: Auth) -> Router {
     let api = Router::new()
         .route("/config", get(config))
         .route("/resources", get(resources))
+        .route("/workspaces", get(workspaces))
         .route("/permission-challenge", post(permission_challenge))
         .route("/capabilities", get(capabilities))
         .route("/capabilities/{name}/refresh", post(refresh_capabilities))
@@ -166,6 +167,21 @@ async fn resources(
     .await
     .map_err(|_| Error::Poisoned)??;
     Ok(Json(json!(result)))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspacePage {
+    before: Option<i64>,
+}
+async fn workspaces(
+    State(state): State<Web>,
+    Query(page): Query<WorkspacePage>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        tokio::task::spawn_blocking(move || state.app.workspace_inventory(page.before))
+            .await
+            .map_err(|_| Error::Poisoned)??,
+    ))
 }
 async fn operator(State(state): State<Web>, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
     Ok(Json(

@@ -1,6 +1,7 @@
 //! Trusted-host fixed task workspace ownership. No queue state lives here.
 use crate::host::{HostConfig, Job, Outcome, RunResult};
 use relay::Task;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs::{self, File, OpenOptions};
@@ -9,6 +10,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -514,42 +516,10 @@ pub(crate) fn cleanup(config: &HostConfig, store: &relay::Store) -> io::Result<u
         if record.workspace_task_id != root_id {
             continue;
         }
-        let Ok(file) = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path.join("finished.json"))
-        else {
+        let Ok(finished_at) = successful_completion(&path, &path, &record, store) else {
             continue;
         };
-        let mut bytes = Vec::new();
-        file.take(4097).read_to_end(&mut bytes)?;
-        if bytes.len() > 4096 {
-            continue;
-        }
-        let Ok(finished) = serde_json::from_slice::<Finished>(&bytes) else {
-            continue;
-        };
-        if finished.task_id != record.task_id
-            || finished.generation != record.generation
-            || finished.owner != record.owner
-            || now.saturating_sub(finished.finished_at) < retention
-        {
-            continue;
-        }
-        let Ok(task) = store.get(record.task_id) else {
-            continue;
-        };
-        if task.state != relay::State::Finished
-            || task.generation != record.generation
-            || task.owner.as_deref() != Some(&record.owner)
-        {
-            continue;
-        }
-        let Ok(result) = serde_json::from_str::<RunResult>(task.result.as_deref().unwrap_or(""))
-        else {
-            continue;
-        };
-        if result.outcome != Outcome::Success || result.workspace.as_deref() != Some(&path) {
+        if now.saturating_sub(finished_at) < retention {
             continue;
         }
         fs::remove_dir_all(&path)?;
@@ -559,6 +529,284 @@ pub(crate) fn cleanup(config: &HostConfig, store: &relay::Store) -> io::Result<u
         }
     }
     Ok(removed)
+}
+
+/// Shared with the host cleanup path: only matching durable success and the
+/// matching host completion marker establish the start of the existing TTL.
+fn successful_completion(
+    records: &Path,
+    workspace: &Path,
+    record: &Record,
+    store: &relay::Store,
+) -> io::Result<u64> {
+    let finished: Finished =
+        serde_json::from_str(&read_bounded_record(&records.join("finished.json"), 4096)?)
+            .map_err(io::Error::other)?;
+    if finished.task_id != record.task_id
+        || finished.generation != record.generation
+        || finished.owner != record.owner
+    {
+        return Err(io::Error::other(
+            "completion marker ownership does not match the current workspace claim",
+        ));
+    }
+    let task = store.get(record.task_id).map_err(io::Error::other)?;
+    if task.state != relay::State::Finished
+        || task.generation != record.generation
+        || task.owner.as_deref() != Some(&record.owner)
+    {
+        return Err(io::Error::other(
+            "durable task ownership or completion does not match the workspace claim",
+        ));
+    }
+    let result: RunResult =
+        serde_json::from_str(task.result.as_deref().unwrap_or("")).map_err(io::Error::other)?;
+    if result.outcome != Outcome::Success || result.workspace.as_deref() != Some(workspace) {
+        return Err(io::Error::other(
+            "current durable result is not a successful result for this workspace",
+        ));
+    }
+    Ok(finished.finished_at)
+}
+
+/// Bounded, read-only policy observations. This is deliberately not an action
+/// plan: no snapshot can authorize deletion or establish external PR status.
+pub(crate) fn inventory(
+    config: &HostConfig,
+    store: &relay::Store,
+    control: &Connection,
+    before: Option<i64>,
+) -> serde_json::Value {
+    let started = Instant::now();
+    let observed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut response = json!({
+        "observed_at":observed_at,
+        "policy":{"successful_retention_seconds":config.successful_workspace_retention_seconds,
+            "automatic_cleanup_enabled":config.successful_workspace_retention_seconds.is_some()},
+        "workspaces":[],"next_before":null,"complete":false,"reason":null
+    });
+    let listing = (|| -> io::Result<Vec<i64>> {
+        let directory = crate::resources::open_inventory_root(&config.workspace_root)?;
+        let mut ids = Vec::new();
+        for (count, entry) in fs::read_dir(crate::resources::fd_path(&directory))?.enumerate() {
+            if count >= 10_000 || started.elapsed() >= Duration::from_millis(100) {
+                return Err(io::Error::other(
+                    "configured root inventory exceeds its entry or time bound; no complete page is available",
+                ));
+            }
+            let name = entry?.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(id) = name
+                .strip_prefix("task-")
+                .and_then(|id| id.parse::<i64>().ok())
+                .filter(|id| *id > 0 && name == format!("task-{id}"))
+            else {
+                continue;
+            };
+            if before.is_none_or(|before| id < before) {
+                ids.push(id);
+            }
+        }
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        Ok(ids)
+    })();
+    let ids = match listing {
+        Ok(ids) => ids,
+        Err(error) => {
+            response["reason"] = json!(error.to_string());
+            return response;
+        }
+    };
+    response["complete"] = json!(true);
+    if ids.len() > 16 {
+        response["next_before"] = json!(ids[15]);
+    }
+    response["workspaces"] = json!(
+        ids.into_iter()
+            .take(16)
+            .map(|id| { inventory_entry(config, store, control, id, started, observed_at) })
+            .collect::<Vec<_>>()
+    );
+    response
+}
+
+fn inventory_entry(
+    config: &HostConfig,
+    store: &relay::Store,
+    control: &Connection,
+    root_id: i64,
+    started: Instant,
+    observed_at: u64,
+) -> serde_json::Value {
+    let path = config.workspace_root.join(format!("task-{root_id}"));
+    let mut entry = json!({"workspace_task_id":root_id,"path":path,
+        "current_owner":null,"references":[],"references_complete":false,"successor_reserved":false,
+        "allocated_usage":{"allocated_bytes":null,"complete":false,"measured_at":observed_at,"reason":"workspace ownership has not been verified"},
+        "retention":{"status":"unknown","reason":"workspace identity could not be verified","eligible_at":null}});
+    let inspect = (|| -> io::Result<()> {
+        if started.elapsed() >= Duration::from_millis(250) {
+            return Err(io::Error::other(
+                "inventory request time bound reached; refresh for a new observation",
+            ));
+        }
+        // Anchor the directory once, and read only through this descriptor.
+        // A renamed/symlink-replaced path cannot redirect control-file reads.
+        let directory = crate::resources::open_inventory_root(&path)?;
+        let records = crate::resources::fd_path(&directory);
+        let record = read_record(&records)?;
+        if record.version != 1 || record.workspace_task_id != root_id {
+            return Err(io::Error::other(
+                "workspace claim does not match its canonical task root",
+            ));
+        }
+        let current = store.get(record.task_id).map_err(io::Error::other)?;
+        if current.generation != record.generation
+            || current.owner.as_deref() != Some(&record.owner)
+            || task_root(&current) != Some(root_id)
+        {
+            return Err(io::Error::other(
+                "current durable task identity does not match the workspace claim",
+            ));
+        }
+        entry["current_owner"] = json!({"task_id":record.task_id,"generation":record.generation,
+            "owner":record.owner,"state":current.state});
+        let (references, complete, reserved, active) =
+            shared_references(store, control, root_id, started)?;
+        let current_is_latest = references
+            .last()
+            .is_some_and(|reference| reference["task_id"] == current.id);
+        entry["references"] = json!(references);
+        entry["references_complete"] = json!(complete);
+        entry["successor_reserved"] = json!(reserved);
+        if started.elapsed() < Duration::from_millis(250) {
+            entry["allocated_usage"] = json!(crate::resources::measure_allocated_directory(
+                &directory, config
+            ));
+        } else {
+            entry["allocated_usage"]["reason"] =
+                json!("inventory request time bound reached before allocation observation");
+        }
+        if active || current.state != relay::State::Finished || reserved {
+            entry["retention"] = json!({"status":"protected","reason":"an active/queued owner or reserved successor still references this workspace","eligible_at":null});
+        } else if !complete || !current_is_latest {
+            return Err(io::Error::other(
+                "shared task history is incomplete or does not end at the current owner",
+            ));
+        } else if current
+            .result
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<RunResult>(text).ok())
+            .is_some_and(|result| result.outcome != Outcome::Success)
+        {
+            entry["retention"] = json!({"status":"protected","reason":"the current owner has no successful outcome; failure, cancellation, timeout and unknown evidence are retained by the existing success-only policy","eligible_at":null});
+        } else {
+            // Never contend with prepare or mark_finished: active/reserved and
+            // non-success tasks above need no probe, and the matching completion
+            // marker must already exist before attempting any lock. Successful
+            // finished tasks cannot create an ordinary continuation.
+            successful_completion(&records, &path, &record, store)?;
+            // A read descriptor and nonblocking flock neither create nor rewrite a
+            // lock file. Failure is a protection fact, never proof of stopped work.
+            let lease = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(records.join("owner.lock"));
+            let lease = lease
+                .ok()
+                .filter(|file| file.metadata().is_ok_and(|metadata| metadata.is_file()))
+                .filter(|file| {
+                    // SAFETY: live private descriptor, nonblocking advisory lock.
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+                });
+            if lease.is_none() {
+                entry["retention"] = json!({"status":"protected","reason":"host ownership lock is held or unavailable; stopped execution is not established","eligible_at":null});
+                return Ok(());
+            }
+            let current_record = read_record(&records)?;
+            if current_record.task_id != record.task_id
+                || current_record.generation != record.generation
+                || current_record.owner != record.owner
+                || current_record.workspace_task_id != root_id
+            {
+                return Err(io::Error::other(
+                    "workspace ownership changed during the observation",
+                ));
+            }
+            let finished_at = successful_completion(&records, &path, &current_record, store)?;
+            if let Some(ttl) = config.successful_workspace_retention_seconds {
+                let eligible_at = finished_at.checked_add(ttl).ok_or_else(|| {
+                    io::Error::other("retention timestamp exceeds its supported range")
+                })?;
+                entry["retention"] = json!({"status":if observed_at >= eligible_at {"eligible"} else {"waiting"},
+                    "reason":"current durable success and matching host completion satisfy the existing success-only TTL evidence; this snapshot is not deletion authorization or a reclaimable-space guarantee",
+                    "eligible_at":eligible_at});
+            } else {
+                entry["retention"] = json!({"status":"disabled","reason":"automatic successful-workspace retention is not configured; no cleanup is enabled by this preview","eligible_at":null});
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = inspect {
+        entry["retention"] =
+            json!({"status":"unknown","reason":error.to_string(),"eligible_at":null});
+    }
+    entry
+}
+
+fn task_root(task: &Task) -> Option<i64> {
+    let job: Job = serde_json::from_str(&task.payload).ok()?;
+    Some(
+        job.continuation
+            .as_ref()
+            .map_or(task.id, |continuation| continuation.workspace_task_id),
+    )
+}
+
+fn shared_references(
+    store: &relay::Store,
+    control: &Connection,
+    root_id: i64,
+    started: Instant,
+) -> io::Result<(Vec<serde_json::Value>, bool, bool, bool)> {
+    let mut references = Vec::new();
+    let mut task_id = root_id;
+    let mut active = false;
+    let mut reserved = false;
+    for _ in 0..100 {
+        if started.elapsed() >= Duration::from_millis(250) {
+            return Ok((references, false, reserved, active));
+        }
+        let task = store.get(task_id).map_err(io::Error::other)?;
+        if task_root(&task) != Some(root_id)
+            || references
+                .iter()
+                .any(|reference: &serde_json::Value| reference["task_id"] == task_id)
+        {
+            return Ok((references, false, reserved, active));
+        }
+        active |= task.state != relay::State::Finished;
+        reserved |= task.id != root_id && task.state != relay::State::Finished;
+        let outcome = task
+            .result
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<RunResult>(text).ok())
+            .map(|result| result.outcome);
+        references.push(json!({"task_id":task.id,"generation":task.generation,"state":task.state,"outcome":outcome}));
+        // The unique predecessor index and task key index bound each lookup;
+        // no full task-table or host-filesystem scan is required.
+        let successor: Option<Option<i64>> = control.query_row(
+            "SELECT COALESCE(c.task_id,t.id) FROM app_continuations c LEFT JOIN tasks t ON t.key=c.key AND t.payload=c.payload WHERE c.predecessor_id=?1",
+            [task_id], |row| row.get(0)).optional().map_err(io::Error::other)?;
+        match successor {
+            None => return Ok((references, true, reserved, active)),
+            Some(None) => return Ok((references, true, true, active)),
+            Some(Some(id)) => task_id = id,
+        }
+    }
+    Ok((references, false, reserved, active))
 }
 
 pub(crate) fn read_marker(path: &Path) -> io::Result<String> {
