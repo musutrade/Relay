@@ -37,7 +37,7 @@ Relay 的 `kiro_cli` 使用官方 **ACP V3**，首版面向开发者角色。原
 
 - 一个进程、一个全新 session、一个 prompt，不自动重发提示或读取旧会话
 - 握手固定 ACP protocolVersion 1；请求完全写出后才接受对应响应
-- 仅接纳同一 session 的回答；终态必须是对应 prompt 的 `end_turn` 成功响应
+- 仅接纳同一 session 的回答；终态必须是对应 prompt 的 `end_turn` 成功响应。session 的元数据通知不要求与回合同步结束：同会话、格式完整的后续元数据（包括未知扩展）可被有界排空，但不重写已完成回答、模型证据或 token/费用；新的内容/工具活动、权限请求、错配身份、重复响应和已知失败信号仍拒绝
 - JSON-RPC error、权限请求、取消/拒绝/预算终止、非法 JSON/UTF-8、过长帧、残缺输出、错配/重复响应和缺失终态均不会成功
 - 常驻进程收到关联终态后，由原有 supervisor 停止并回收进程树；确认停止前不进入测试或释放任务槽位。超时不能证明未知外部操作未发生
 - 保存有界摘要与必要的会话/选择信息，不保存原始 ACP 信封或 `whoami` 身份输出。token、费用、实际执行模型缺失时保持未知
@@ -57,3 +57,7 @@ Relay 的 `kiro_cli` 使用官方 **ACP V3**，首版面向开发者角色。原
 - [ACP 握手](https://agentclientprotocol.com/protocol/v1/initialization)、[session](https://agentclientprotocol.com/protocol/v1/session-setup)、[prompt](https://agentclientprotocol.com/protocol/v1/prompt-turn)、[权限请求](https://agentclientprotocol.com/protocol/v1/tool-calls)：标准协议
 - [官方 KiroCrew 就绪实现](https://github.com/kirodotdev/KiroCrew/blob/main/src/kiro_crew/kiro_prerequisite.py)：只读探测与未登录门禁的实现依据
 - [Kiro 下载和使用条款](https://kiro.dev/downloads/)：官方发行物的许可/协议说明
+
+## 终态后的元数据回归
+
+一次真实验收已经得到 `end_turn` 与最终回答，但旧适配器把其后的 session 通知一律判为失败，导致宿主测试未执行。提交的诊断没有原始 ACP 尾流，因此不能断言具体通知类型。修复依据是 [ACP 会话更新生命周期](https://agentclientprotocol.com/protocol/v1/prompt-turn) 和 [Kiro V3 更新语义](https://kiro.dev/docs/cli/v3/acp-migration/)；新增离线 fixture 是协议重建，覆盖同批与跨读取边界的元数据尾流，不冒称真实抓包。不会为诊断自动重跑模型或修改旧任务结果。

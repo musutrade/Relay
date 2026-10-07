@@ -304,19 +304,43 @@ impl Driver {
     }
     fn notification(&mut self, method: &str, params: Option<&Value>) -> Result<(), String> {
         if method == "session/update" {
-            if self.terminal {
-                return Err("Kiro ACP session changed after prompt completion".into());
-            }
             let params = params
                 .filter(|params| params.is_object())
                 .ok_or("Kiro ACP session/update requires object params")?;
             self.check_session(&params["sessionId"])?;
+            check_kiro_meta(params)?;
             let update = params
                 .get("update")
                 .filter(|update| update.is_object())
                 .ok_or("Kiro ACP session/update requires an object update")?;
             check_kiro_meta(update)?;
             let kind = identifier(&update["sessionUpdate"])?;
+            if self.terminal {
+                // The correlated prompt response settles the turn, not the
+                // session notification stream. Metadata may arrive while idle
+                // or during the host's final drain. It cannot rewrite this
+                // completed turn's answer, selection, or accounting evidence.
+                if matches!(
+                    kind,
+                    "agent_message_chunk"
+                        | "agent_thought_chunk"
+                        | "user_message_chunk"
+                        | "tool_call"
+                        | "tool_call_update"
+                        | "plan"
+                ) {
+                    return Err("Kiro ACP turn activity after prompt completion".into());
+                }
+                if kind == "config_option_update" {
+                    self.config_options(
+                        &update["configOptions"],
+                        "kiro.session/update.configOptions",
+                    )?;
+                }
+                // Unknown update discriminators are extensible metadata under
+                // ACP V3. Bound them; do not guess meaning from names or fields.
+                return self.ignore_notification();
+            }
             match kind {
                 "agent_message_chunk" => {
                     self.require_active_prompt()?;
@@ -386,11 +410,14 @@ impl Driver {
         {
             return Err("Kiro ACP reported an error or malformed permission request".into());
         }
-        if let Some(session) = params.and_then(|params| params.get("sessionId")) {
-            if self.terminal {
-                return Err("Kiro ACP session changed after prompt completion".into());
+        if let Some(params) = params.filter(|params| !params.is_null()) {
+            if !params.is_object() && !params.is_array() {
+                return Err("Kiro ACP notification params must be an object or array".into());
             }
-            self.check_session(session)?;
+            check_kiro_meta(params)?;
+            if let Some(session) = params.get("sessionId") {
+                self.check_session(session)?;
+            }
         }
         self.ignore_notification()
     }
@@ -449,6 +476,11 @@ impl Driver {
                 );
             }
             *target = Some(identifier(&option["currentValue"])?.to_owned());
+        }
+        if self.terminal {
+            // Validate a late snapshot without attributing idle configuration
+            // changes to the already-completed prompt.
+            return Ok(());
         }
         if let Some(selection) = &mut self.result.selection {
             selection.verification.model = if model.is_some() {
@@ -1054,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_notifications_are_bounded_and_late_updates_fail() {
+    fn unknown_notifications_are_bounded_and_late_turn_activity_fails() {
         let mut d = driver(None);
         active(&mut d);
         for _ in 0..MAX_IGNORED_NOTIFICATIONS {
@@ -1083,7 +1115,196 @@ mod tests {
             &mut d,
             json!({"jsonrpc":"2.0","method":"_kiro/future","params":{"sessionId":"session-1"}}),
         );
-        assert_failed(d, "after prompt completion");
+        assert!(d.finish().1.is_none());
+    }
+
+    // Protocol-derived fixtures, not a captured trace from the reported run.
+    // ACP permits idle session updates; Kiro documents these metadata snapshots.
+    #[test]
+    fn completed_turn_accepts_metadata_without_rewriting_evidence() {
+        let mut d = driver(None);
+        active(&mut d);
+        update(
+            &mut d,
+            "session-1",
+            json!({"sessionUpdate":"config_option_update","configOptions":[
+                {"id":"model","type":"select","currentValue":"turn-model"}
+            ]}),
+        );
+        answer(&mut d, "finished answer ✓");
+        completed(&mut d);
+        let before = serde_json::to_value(&d.result).unwrap();
+        for metadata in [
+            json!({"sessionUpdate":"session_info_update"}),
+            json!({"sessionUpdate":"session_info_update","title":null,"updatedAt":null,
+                "_meta":{"kiro":{"kind":"context_usage","usagePercentage":7}}}),
+            json!({"sessionUpdate":"session_info_update","_meta":{"kiro":{
+                "kind":"turn_completion","promptTurnSummaries":[{"usage":12,"unit":"credit"}]
+            }}}),
+            // Repeated metering is a snapshot, not another billable turn. Relay
+            // has no qualified accounting mapping and leaves the counters unknown.
+            json!({"sessionUpdate":"session_info_update","_meta":{"kiro":{
+                "kind":"turn_completion","promptTurnSummaries":[{"usage":12,"unit":"credit"}]
+            }}}),
+            json!({"sessionUpdate":"usage_update","used":23,"size":1000,"cost":{"amount":1.25,"currency":"USD"}}),
+            json!({"sessionUpdate":"config_option_update","configOptions":[
+                {"id":"model","type":"select","currentValue":"idle-model"}
+            ]}),
+            json!({"sessionUpdate":"current_mode_update","currentModeId":"idle-mode"}),
+            json!({"sessionUpdate":"available_commands_update","availableCommands":[]}),
+            json!({"sessionUpdate":"future_metadata","future":{"account":"PRIVATE_UNUSED_METADATA"}}),
+        ] {
+            update(&mut d, "session-1", metadata);
+            assert!(d.failure().is_none(), "{:?}", d.failure());
+            assert_eq!(serde_json::to_value(&d.result).unwrap(), before);
+            assert!(d.stopped());
+            assert!(d.take_pending().is_empty());
+        }
+        feed(
+            &mut d,
+            json!({"jsonrpc":"2.0","method":"_kiro/future_metadata",
+            "params":{"sessionId":"session-1","_meta":{"future":true}}}),
+        );
+        let (result, error) = d.finish();
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(serde_json::to_value(result).unwrap(), before);
+    }
+
+    #[test]
+    fn post_completion_metadata_still_validates_identity_structure_and_failure() {
+        for params in [
+            json!({"sessionId":"foreign","update":{"sessionUpdate":"session_info_update"}}),
+            json!({"sessionId":null,"update":{"sessionUpdate":"session_info_update"}}),
+            json!({"update":{"sessionUpdate":"session_info_update"}}),
+            json!({"sessionId":"session-1","update":null}),
+            json!({"sessionId":"session-1","update":[]}),
+            json!({"sessionId":"session-1","update":{}}),
+            json!({"sessionId":"session-1","update":{"sessionUpdate":false}}),
+            json!({"sessionId":"session-1","update":{"sessionUpdate":"session_info_update","_meta":false}}),
+            json!({"sessionId":"session-1","update":{"sessionUpdate":"session_info_update","_meta":{"kiro":[]}}}),
+            json!({"sessionId":"session-1","update":{"sessionUpdate":"future_metadata","_meta":{"kiro":{"failureReason":"error"}}}}),
+            json!({"sessionId":"session-1","update":{"sessionUpdate":"session_info_update","_meta":{"kiro":{"replay":true}}}}),
+            json!({"sessionId":"session-1","_meta":{"kiro":{"failureReason":"denied"}},"update":{"sessionUpdate":"session_info_update"}}),
+            json!({"sessionId":"session-1","update":{"sessionUpdate":"config_option_update","configOptions":{}}}),
+        ] {
+            let mut d = driver(None);
+            active(&mut d);
+            answer(&mut d, "done");
+            completed(&mut d);
+            feed(
+                &mut d,
+                json!({"jsonrpc":"2.0","method":"session/update","params":params}),
+            );
+            assert!(d.failure().is_some());
+            assert!(d.finish().1.is_some());
+        }
+        for params in [
+            json!({"sessionId":"foreign"}),
+            json!({"sessionId":false}),
+            json!(false),
+            json!({"sessionId":"session-1","_meta":{"kiro":{"failureReason":"error"}}}),
+        ] {
+            let mut d = driver(None);
+            active(&mut d);
+            answer(&mut d, "done");
+            completed(&mut d);
+            feed(
+                &mut d,
+                json!({"jsonrpc":"2.0","method":"_kiro/future_metadata","params":params}),
+            );
+            assert!(d.finish().1.is_some());
+        }
+    }
+
+    #[test]
+    fn post_completion_turn_activity_requests_and_duplicate_responses_fail() {
+        for kind in [
+            "agent_message_chunk",
+            "agent_thought_chunk",
+            "user_message_chunk",
+            "tool_call",
+            "tool_call_update",
+            "plan",
+        ] {
+            let mut d = driver(None);
+            active(&mut d);
+            answer(&mut d, "done");
+            completed(&mut d);
+            update(
+                &mut d,
+                "session-1",
+                json!({"sessionUpdate":kind,"content":{"type":"text","text":"late"},"toolCallId":"late-tool"}),
+            );
+            assert_failed(d, "after prompt completion");
+        }
+        for event in [
+            json!({"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}),
+            json!({"jsonrpc":"2.0","id":"late-permission","method":"session/request_permission","params":{"sessionId":"session-1"}}),
+            json!({"jsonrpc":"2.0","id":"late-file","method":"fs/read_text_file","params":{"sessionId":"session-1"}}),
+            json!({"jsonrpc":"2.0","method":"_kiro/error/rate_limit","params":{"sessionId":"session-1"}}),
+        ] {
+            let mut d = driver(None);
+            active(&mut d);
+            answer(&mut d, "done");
+            completed(&mut d);
+            feed(&mut d, event);
+            assert!(d.finish().1.is_some());
+        }
+    }
+
+    #[test]
+    fn completed_metadata_tail_is_parsed_across_fixed_read_boundaries() {
+        for late_activity in [false, true] {
+            let mut d = driver(None);
+            active(&mut d);
+            answer(&mut d, "done");
+            completed(&mut d);
+            let before = serde_json::to_value(&d.result).unwrap();
+            let mut wire = serde_json::to_vec(&json!({"jsonrpc":"2.0","method":"session/update",
+                "params":{"sessionId":"session-1","update":{"sessionUpdate":"future_metadata","padding":"x".repeat(12288)}}})).unwrap();
+            wire.push(b'\n');
+            for chunk in wire.chunks(8192) {
+                d.feed(chunk);
+            }
+            assert!(d.failure().is_none());
+            assert_eq!(serde_json::to_value(&d.result).unwrap(), before);
+            if late_activity {
+                answer(&mut d, "late activity beyond first read");
+                assert_failed(d, "after prompt completion");
+            } else {
+                assert!(d.finish().1.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_tail_budget_and_incomplete_framing_remain_fatal() {
+        let mut d = driver(None);
+        active(&mut d);
+        answer(&mut d, "done");
+        completed(&mut d);
+        for _ in 0..MAX_IGNORED_NOTIFICATIONS {
+            update(
+                &mut d,
+                "session-1",
+                json!({"sessionUpdate":"session_info_update"}),
+            );
+        }
+        assert!(d.failure().is_none());
+        update(
+            &mut d,
+            "session-1",
+            json!({"sessionUpdate":"session_info_update"}),
+        );
+        assert_failed(d, "notification budget");
+        for tail in [b"{\"jsonrpc\":\"2.0\"".as_slice(), b"not json\n", b"\xff\n"] {
+            let mut d = driver(None);
+            active(&mut d);
+            answer(&mut d, "done");
+            completed(&mut d);
+            d.feed(tail);
+            assert!(d.finish().1.is_some());
+        }
     }
 
     #[test]
