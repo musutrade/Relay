@@ -162,9 +162,9 @@ node app/tests/ui_logic_test.cjs
 
 UI 的依赖免费 Node 状态测试覆盖重复提交、保留幂等 key 重试、认证过期、退出取消请求、旧响应/新选择竞争、网络恢复、活跃任务补入列表和未知诊断。可选真实浏览器脚本为 `python3 app/tests/ui_smoke.py`，使用 `app/tests/browser-requirements.txt` 固定依赖和官方 Playwright Chromium。当前 dot cloud 环境阻止浏览器启动/访问 localhost；GitHub CI 提供独立 browser job 执行桌面/手机 viewport 与交互断言并保存仅含假数据的截图。是否通过请以该提交的 CI 结果为准，不能将状态测试替代真实浏览器验收。
 
-## 原生 Codex / Claude CLI profile
+## 原生 Codex / Claude / Kiro CLI profile
 
-旧 `agents` 命令 profile 保持兼容。`native_agents` 提供封闭的 `codex_cli` / `codex_app_server` / `claude_cli` 协议适配；两类 profile 名称不能重复。job 的 `agent` 仍只引用可信配置中的名字，不接受用户指定程序、参数或环境变量；模型 ID 仅通过有界、标明目录来源或未验证手工来源的角色选择。
+旧 `agents` 命令 profile 保持兼容。`native_agents` 提供封闭的 `codex_cli` / `codex_app_server` / `claude_cli` / `kiro_cli` 协议适配；两类 profile 名称不能重复。job 的 `agent` 仍只引用可信配置中的名字，不接受用户指定程序、参数或环境变量；模型 ID 仅通过有界、标明目录来源或未验证手工来源的角色选择。
 
 ```json
 {
@@ -174,6 +174,8 @@ UI 的依赖免费 Node 状态测试覆盖重复提交、保留幂等 key 重试
   }
 }
 ```
+
+Kiro 是独立可选的 ACP V3 开发适配器，使用现有 CLI 登录、全新会话及有界请求关联；不支持审查者、Relay 会话续接、effort 或 turn/budget 覆盖。配置、权限和验证边界见 [Kiro 接入](kiro-adapter.md)。现有 Codex / Claude 配置不需要更改。
 
 这是需要加入完整 host 配置的片段。程序必须已安装；可选 `model` 来自部署者自己的账户配置，省略时由 CLI 选择。可信配置可提供 `effort` 默认值；首次提交可按该模型的新鲜目录元数据覆盖。Claude `max_turns` / `max_budget_usd` 仍只由可信配置指定。不要把展示名猜成供应商模型 ID。`env` 仅供可信部署者配置已有 CLI 所需环境；Relay 不保存或代办登录、密钥与付款。
 
@@ -187,7 +189,7 @@ cargo run -p relay-app -- doctor /absolute/path/config.json
 
 新 [`codex_native_sandboxed_review`](native-sandboxed-review.md) 是独立的默认关闭能力档；`probe.read_only_supported` 不用于报告它。首版 app-server 0.160.1、新 ephemeral 会话、本地 read-only / never、原生启动集成风险和逐次确认均有独立规则。
 
-原生调用使用 stdin 传需求、JSONL 输出以及显式权限参数。供应商事件在排空 stdout 时增量解析，独立于用户可见的截断日志；限制单事件、摘要、标识符与 usage 的保留大小。成功需要进程正常退出以及有效成功终态。Codex 的非致命 error item 和失败的工具 item 可由 Agent 后续恢复，不单独视为协议损坏；以最后一条已完成 agent_message 为摘要，仍须有成功 turn.completed 终态。缺失或非法终态、turn.failed、顶层供应商 error、权限拒绝、预算耗尽、非零退出都不能成为成功。格式错误保持失败，但继续有界解析后续行以保留摘要和 usage；超过 64 KiB 的行丢弃至下一换行后恢复解析，后续成功事件不会消除之前的致命错误。结果的 provider 信息保留实际报告的模型与会话标识；未报告的字段不猜测，旧无会话 profile 不会仅凭此字段恢复会话。显式续接配置与 app-server 生命周期见 [原生会话续接](session-continuity.md)。
+原生调用使用 stdin 传需求、JSONL 输出以及显式权限参数。供应商事件在排空 stdout 时增量解析，独立于用户可见的截断日志；限制单事件、摘要、标识符与 usage 的保留大小。单向 CLI 成功需要进程正常退出以及有效成功终态；常驻 ACP / app-server 以关联成功响应为终态，再由宿主停止并回收进程树。Codex 的非致命 error item 和失败的工具 item 可由 Agent 后续恢复，不单独视为协议损坏；以最后一条已完成 agent_message 为摘要，仍须有成功 turn.completed 终态。缺失或非法终态、turn.failed、顶层供应商 error、权限拒绝、预算耗尽、非零退出都不能成为成功。格式错误保持失败，但继续有界解析后续行以保留摘要和 usage；超过 64 KiB 的行丢弃至下一换行后恢复解析，后续成功事件不会消除之前的致命错误。结果的 provider 信息保留实际报告的模型与会话标识；未报告的字段不猜测，旧无会话 profile 不会仅凭此字段恢复会话。显式续接配置与 app-server 生命周期见 [原生会话续接](session-continuity.md)。
 
 `GET /api/config` 与 MCP 配置结果仅公开 profile 名称、供应商、配置模型/effort 和未知认证状态，不公开程序路径、完整命令或环境。原生适配是 CLI 子进程集成，不是 SDK 或托管模型服务；现阶段离线验收使用假 CLI，真实账户、模型费用与供应商端行为仍需在明确授权的环境单独验收。
 

@@ -1289,6 +1289,56 @@ impl Host {
                 return failure;
             }
         };
+        if profile.provider == ProviderKind::KiroCli {
+            // Kiro may open an interactive login for other subcommands when signed
+            // out. whoami is a documented safe readiness probe; it may refresh the
+            // CLI-owned login, but Relay never starts login or handles credentials.
+            let mut readiness = self.run_supervised(
+                CommandSpec {
+                    workspace_lease: false,
+                    git_inventory: false,
+                    catalog: false,
+                    claude_control: false,
+                    app_server: None,
+                    provider: None,
+                    read_only: false,
+                    clear_env: false,
+                    program: profile.program.clone(),
+                    args: vec!["whoami".into()],
+                    env: profile.env.clone(),
+                    cwd: workspace.join("repository"),
+                    input: String::new(),
+                    timeout_ms: remaining_ms(deadline).min(30_000),
+                    output_limit_bytes: 1024,
+                },
+                cancellation,
+                workspace,
+                "kiro-auth-readiness",
+            );
+            if readiness.outcome != Outcome::Success
+                || readiness.error.is_some()
+                || readiness.stdout_truncated
+                || readiness.stderr_truncated
+            {
+                if readiness.outcome == Outcome::Success {
+                    readiness.outcome = Outcome::Failure;
+                }
+                // Readiness identity output is not task output and must not be
+                // persisted in a result, including a failed or truncated probe.
+                readiness.stdout.clear();
+                readiness.stderr.clear();
+                readiness.error = Some(if readiness.outcome == Outcome::Unknown {
+                    "Kiro readiness process cleanup is unconfirmed; inspect the host before retrying"
+                } else {
+                    "Kiro authentication readiness failed; sign in with the configured CLI separately, then retry. Relay did not start login"
+                }.into());
+                if let Some(failure) = &mut readiness.failure {
+                    failure.cause = readiness.error.clone().expect("sanitized readiness error");
+                }
+                readiness.provider = Some(ProviderResult::new(profile, Some(probe.cli_version)));
+                return readiness;
+            }
+        }
         if let Some(outcome) = interrupted(cancellation, deadline) {
             let mut failure =
                 CommandResult::error(outcome, "native command interrupted before execution");
@@ -2090,7 +2140,12 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
     if spec.git_inventory {
         output.inventory = Some(crate::git_inventory::Framing::default());
     }
-    let bidirectional = spec.app_server.is_some() || spec.catalog || spec.claude_control;
+    let kiro_acp = spec
+        .provider
+        .as_ref()
+        .is_some_and(|result| result.provider == ProviderKind::KiroCli);
+    let bidirectional =
+        spec.app_server.is_some() || spec.catalog || spec.claude_control || kiro_acp;
     let mut protocol = spec.provider.map(|result| {
         if spec.catalog {
             ProtocolParser::catalog(result)
@@ -2098,6 +2153,17 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
             ProtocolParser::claude_task(result, spec.input.clone()).read_only(spec.read_only)
         } else if let Some(start) = spec.app_server {
             ProtocolParser::app_server(result, start)
+        } else if kiro_acp {
+            let start = crate::kiro_acp::Start {
+                cwd: spec.cwd.clone(),
+                prompt: spec.input.clone(),
+                model: result.requested_model.clone(),
+                native_permission: result
+                    .selection
+                    .as_ref()
+                    .and_then(|selection| selection.requested.native_permission),
+            };
+            ProtocolParser::kiro_acp(result, start)
         } else {
             ProtocolParser::new(result).read_only(spec.read_only)
         }
@@ -2209,7 +2275,15 @@ fn supervise(spec: CommandSpec, mut control: io::Stdin) -> CommandResult {
         if let Some(writer) = &mut input {
             match writer.write(&input_bytes[input_offset..]) {
                 Ok(written) => {
+                    let completing_kiro_batch =
+                        kiro_acp && written > 0 && input_offset + written == input_bytes.len();
                     input_offset += written;
+                    if completing_kiro_batch {
+                        protocol
+                            .as_mut()
+                            .expect("native protocol")
+                            .mark_kiro_input_complete();
+                    }
                     if spec.catalog && input_offset == input_bytes.len() {
                         protocol
                             .as_mut()

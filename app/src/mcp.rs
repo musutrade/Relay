@@ -15,7 +15,7 @@ fn role_selection_schema() -> Value {
             }}
         }},
         "effort":{"type":"string","minLength":1,"maxLength":256,"description":"Requires this model's current catalog-supported effort metadata"},
-        "native_permission":{"enum":["codex_workspace_write","codex_full_access","claude_dont_ask","claude_auto","claude_bypass_permissions","claude_restricted"]},
+        "native_permission":{"enum":["codex_workspace_write","codex_full_access","claude_dont_ask","claude_auto","claude_bypass_permissions","claude_restricted","kiro_workspace_write"]},
         "confirm_permission_expansion":{"type":"boolean","const":true,"description":"Explicitly confirm the native permission change. Full access/bypass expands filesystem AND network access. Host policy and fixed reviewer restrictions still apply."}
     }})
 }

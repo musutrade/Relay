@@ -675,6 +675,164 @@ fn auto_review_config(root: &Path) -> HostConfig {
     config
 }
 
+fn kiro_config(root: &Path) -> HostConfig {
+    let mut config = config(root);
+    let profile = config.native_agents.get_mut("dev").unwrap();
+    profile.provider = relay_app::providers::ProviderKind::KiroCli;
+    profile.allowed_permission_modes = vec![NativePermission::KiroWorkspaceWrite];
+    config
+}
+
+fn kiro_job() -> Value {
+    let mut selected = job();
+    selected["role_selections"] = json!({"developer": {
+        "profile": "dev", "native_permission": "kiro_workspace_write",
+    }});
+    selected
+}
+
+#[test]
+fn kiro_workspace_editing_requires_host_opt_in_and_explicit_developer_consent() {
+    let temp = Fixture::new();
+    let mut config = kiro_config(temp.path());
+    assert!(validate(job(), &config).is_ok());
+    let mut selected = kiro_job();
+    assert!(
+        validate(selected.clone(), &config)
+            .unwrap_err()
+            .contains("explicit confirmation")
+    );
+    selected["role_selections"]["developer"]["confirm_permission_expansion"] = json!(true);
+    assert!(validate(selected.clone(), &config).is_ok());
+    config
+        .native_agents
+        .get_mut("dev")
+        .unwrap()
+        .allowed_permission_modes
+        .clear();
+    assert!(
+        validate(selected.clone(), &config)
+            .unwrap_err()
+            .contains("host policy")
+    );
+    config
+        .native_agents
+        .get_mut("dev")
+        .unwrap()
+        .allowed_permission_modes = vec![NativePermission::KiroWorkspaceWrite];
+    config
+        .native_agents
+        .get_mut("dev")
+        .unwrap()
+        .native_permission = Some(NativePermission::KiroWorkspaceWrite);
+    assert!(validate(job(), &config).is_err());
+    config
+        .native_agents
+        .get_mut("dev")
+        .unwrap()
+        .native_permission = None;
+
+    let mut manual = job();
+    manual["role_selections"] = json!({"developer": {
+        "profile":"dev", "model":{"value":"unverified-kiro-model","source":"manual"}
+    }});
+    assert!(validate(manual.clone(), &config).is_ok());
+    manual["role_selections"]["developer"]["effort"] = json!("high");
+    assert!(validate(manual, &config).is_err());
+    config
+        .workflows
+        .get_mut("checked")
+        .unwrap()
+        .selectable_reviewers = Some(vec!["dev".into()]);
+    let mut reviewer = job();
+    reviewer["role_selections"] = json!({"reviewer":{"profile":"dev"}});
+    assert!(validate(reviewer, &config).is_err());
+}
+
+#[test]
+fn kiro_permission_challenge_and_mcp_schema_preserve_the_native_policy_boundary() {
+    let temp = Fixture::new();
+    let app = Application::open(temp.path().join("queue.db"), kiro_config(temp.path())).unwrap();
+    let mut selected = kiro_job();
+    let issued = challenge(&app, selected.clone());
+    assert_eq!(issued["scope"]["developer"]["provider"], "kiro_cli");
+    assert_eq!(
+        issued["scope"]["developer"]["native_permission"],
+        "kiro_workspace_write"
+    );
+    let text = issued["confirmation_text"].as_str().unwrap();
+    for expected in [
+        "edit-workspace",
+        "not an OS sandbox",
+        "hooks",
+        "MCP",
+        "settings",
+        "rejects interactive permission requests",
+        "does not enable trust-all or dev-shell",
+    ] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    assert!(app.list(None).unwrap().is_empty());
+    assert!(app.submit(serde_json::from_value(json!({
+        "key":"kiro-unconfirmed", "job":selected, "permission_challenge":issued["challenge"],
+    })).unwrap()).is_err());
+    selected["role_selections"]["developer"]["confirm_permission_expansion"] = json!(true);
+    let task = app
+        .submit(
+            serde_json::from_value(json!({
+                "key":"kiro-confirmed", "job":selected, "permission_challenge":issued["challenge"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let admitted: Value = serde_json::from_str(&task.payload).unwrap();
+    assert_eq!(
+        admitted["role_binding"]["developer"]["native_permission"],
+        "kiro_workspace_write"
+    );
+
+    let public = app.public_config();
+    let profile = public["native_agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "dev")
+        .unwrap();
+    assert_eq!(profile["reviewer_supported"], false);
+    assert_eq!(profile["reviewer_contract"], "unsupported");
+    assert_eq!(profile["permission_modes"].as_array().unwrap().len(), 1);
+    assert_eq!(profile["permission_modes"][0]["id"], "kiro_workspace_write");
+    assert_eq!(
+        profile["permission_modes"][0]["requires_confirmation"],
+        true
+    );
+    assert_eq!(profile["permission_modes"][0]["host_allowed"], true);
+
+    let tools = relay_app::mcp::handle(&app, json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .unwrap();
+    for tool in tools["result"]["tools"].as_array().unwrap() {
+        let schema = &tool["inputSchema"]["properties"];
+        let modes = match tool["name"].as_str().unwrap() {
+            "relay_submit" | "relay_permission_challenge" => {
+                &schema["job"]["properties"]["role_selections"]["properties"]["developer"]["properties"]
+                    ["native_permission"]["enum"]
+            }
+            "relay_retry" | "relay_continue_review" | "relay_replacement_challenge" => {
+                &schema["replacement"]["properties"]["native_permission"]["enum"]
+            }
+            _ => continue,
+        };
+        assert!(
+            modes
+                .as_array()
+                .unwrap()
+                .contains(&json!("kiro_workspace_write")),
+            "{}",
+            tool["name"]
+        );
+    }
+}
+
 fn auto_review_job() -> Value {
     let mut selected = expanded_job();
     selected["role_selections"]["developer"]["native_permission"] = json!("codex_auto_review");

@@ -326,7 +326,8 @@ impl Checkpoint {
     }
 }
 pub(crate) fn enabled(profile: &NativeProfile) -> bool {
-    !profile.native_sandboxed_review()
+    profile.provider != ProviderKind::KiroCli
+        && !profile.native_sandboxed_review()
         && (profile.provider == ProviderKind::CodexAppServer || profile.session_continuity)
 }
 /// Checkout isolation is independent of retaining a provider conversation.
@@ -408,6 +409,19 @@ mod tests {
             serde_json::from_value(json!({"provider":"codex_app_server","program":"/bin/true"}))
                 .unwrap();
         (tmp, cwd, profile)
+    }
+
+    #[test]
+    fn kiro_never_retains_a_session_even_for_unvalidated_profiles() {
+        for continuity in [false, true] {
+            let profile = serde_json::from_value(json!({
+                "provider": "kiro_cli", "program": "/bin/true",
+                "session_continuity": continuity,
+            }))
+            .unwrap();
+            assert!(!enabled(&profile));
+            assert!(!reviewer_checkout(&profile));
+        }
     }
 
     #[test]
