@@ -242,21 +242,21 @@
       if (choice?.source !== 'catalog' || !envelope || choice.catalog?.cache_epoch !== envelope.cache_epoch || choice.catalog?.generation !== envelope.generation) return null;
       return envelope.catalog.models.find(model => isRecord(model) && model.model === choice.value) || null;
     }
-    function roleEfforts(role) { const efforts = roleCatalogModel(role)?.supported_efforts; return Array.isArray(efforts) ? efforts.filter(item => isRecord(item) && typeof item.effort === 'string').slice(0, 64) : []; }
+    function roleEfforts(role) { if (roleConfig(role)?.provider === 'kiro_cli') return []; const efforts = roleCatalogModel(role)?.supported_efforts; return Array.isArray(efforts) ? efforts.filter(item => isRecord(item) && typeof item.effort === 'string').slice(0, 64) : []; }
     function reviewerContract(profile) {
       if (profile?.reviewer_supported !== true) return 'unsupported';
       if (profile.provider === 'claude_cli' && [undefined, 'strict_no_execution'].includes(profile.reviewer_contract) && (!profile.native_permission || profile.native_permission === 'claude_restricted')) return 'strict_no_execution';
       const mode = profile.permission_modes?.find(mode => mode.id === 'codex_native_sandboxed_review');
       return profile.provider === 'codex_app_server' && profile.reviewer_contract === 'native_local_read_only' && profile.native_permission === mode?.id && mode?.host_allowed === true && mode.availability !== 'unsupported' && mode.reviewer_only === true && mode.requires_confirmation === true ? 'native_local_read_only' : 'unsupported';
     }
-    function reviewerUnavailableReason(profile) { return profile?.provider === 'claude_cli' ? '此 Claude 配置的默认权限模式不符合 Relay 严格无执行审查契约；不能在页面放宽或静默替换' : '此配置不支持审查。Codex 严格无执行审查仍缺少独立隔离技术证明；仅宿主明确允许并配置的 Codex app-server 原生本地只读审查可选，不会自动替换适配器或契约'; }
+    function reviewerUnavailableReason(profile) { return profile?.provider === 'kiro_cli' ? 'Kiro 适配器仅支持全新开发调用，不支持审查或可恢复会话；不能在页面放宽审查契约' : profile?.provider === 'claude_cli' ? '此 Claude 配置的默认权限模式不符合 Relay 严格无执行审查契约；不能在页面放宽或静默替换' : '此配置不支持审查。Codex 严格无执行审查仍缺少独立隔离技术证明；仅宿主明确允许并配置的 Codex app-server 原生本地只读审查可选，不会自动替换适配器或契约'; }
     function reviewerContractText(profile) {
       const contract = reviewerContract(profile);
       return contract === 'native_local_read_only' ? 'Codex 原生审查（本地只读，允许命令）：独立 checkout 与全新独立会话，不恢复旧会话。允许在本地只读沙箱内执行命令，原生审批 never；hooks、MCP、插件和远程工具不受本地沙箱约束，只可使用可信启动配置和集成。此模式不等同于严格无执行审查'
         : contract === 'strict_no_execution' ? 'Relay 严格无执行审查契约；不能切换为 Full access。claude_restricted 不是原生 --permission-mode 值'
         : profile?.reviewer_supported === undefined && !Array.isArray(profile?.permission_modes) ? '沿用固定审查配置；旧服务未提供新的选择元数据' : reviewerUnavailableReason(profile);
     }
-    function nativeModeLabel(mode) { return mode.id === 'codex_native_sandboxed_review' ? 'Codex 原生审查（本地只读，允许命令）' : mode.label.slice(0, 150); }
+    function nativeModeLabel(mode) { return mode.id === 'kiro_workspace_write' ? 'Kiro 原生工作区编辑许可' : mode.id === 'codex_native_sandboxed_review' ? 'Codex 原生审查（本地只读，允许命令）' : mode.label.slice(0, 150); }
     function roleMode(role) { const profile = roleConfig(role); return profile?.permission_modes?.find(mode => mode.id === (roleState[role].native_permission || profile.native_permission)); }
     function modeAllowed(role, mode) { return allowedNativeMode(role, roleConfig(role), mode); }
     function allowedNativeMode(role, profile, mode) {
@@ -270,6 +270,7 @@
         : mode?.id === 'codex_full_access' ? '我确认 Full access 将扩大文件系统访问和网络访问（expanded filesystem AND network access），且没有原生批准提示（no native approval prompts）。'
         : mode?.id === 'claude_bypass_permissions' ? '我确认绕过原生权限检查，并扩大此进程的文件系统和网络访问（expanded filesystem AND network access）。'
         : mode?.id === 'codex_auto_review' ? '我确认使用 Codex 原生 Auto-review；它可自动批准工作区之外的文件、网络或工具权限请求，不是绝对只读或禁止网络。审批模型由 Codex 选择，与开发或代码审查模型分开；托管策略仍生效。'
+        : mode?.id === 'kiro_workspace_write' ? '我确认授予 Kiro 原生工作区编辑许可，仅启用 edit-workspace 策略预设。这不是 OS 沙箱；现有原生 hooks、MCP 和 settings 仍须由操作员信任。Relay 拒绝交互权限请求，不启用 trust-all 或 dev-shell。'
         : mode?.id === 'claude_auto' ? '我确认使用 Claude 原生分类器 auto；它不是 bypass，账户、模型或托管策略可能拒绝或回退，实际可用性仍未知。'
         : '我确认本次开发者原生权限模式变更；原生策略仍决定允许的访问。';
       return consequences + (mode?.confirmation_text ? ' ' + mode.confirmation_text.slice(0, 600) : '');
@@ -300,7 +301,7 @@
           choice.model = null; choice.effort = ''; resetRoleConsent(role); choice.source = 'catalog'; choice.notice = '目录已变化、陈旧或发现中；原模型与 effort 已失效，请重新选择，或明确改用未验证的手动 ID';
         }
         const source = choice.model?.source || choice.source || '', envelope = freshRoleCatalog(role), model = roleCatalogModel(role);
-        $(role + '-defaults').textContent = '配置：' + roleProfile(role) + ' · ' + catalogText(profile?.provider) + '；默认模型 ' + catalogText(profile?.model, '由 CLI 决定') + '；默认 effort ' + catalogText(profile?.effort, '由 CLI 决定') + '；默认模式 ' + catalogText(profile?.native_permission, '沿用原生配置');
+        $(role + '-defaults').textContent = '配置：' + roleProfile(role) + ' · ' + catalogText(profile?.provider) + '；默认模型 ' + catalogText(profile?.model, '由 CLI 决定') + '；默认 effort ' + (profile?.provider === 'kiro_cli' ? 'Kiro 适配器暂不支持' : catalogText(profile?.effort, '由 CLI 决定')) + '；默认模式 ' + catalogText(profile?.native_permission, '沿用原生配置');
         $(role + '-model-source').value = source;
         $(role + '-catalog-field').hidden = source !== 'catalog'; $(role + '-manual-field').hidden = source !== 'manual';
         const select = $(role + '-model'); select.replaceChildren();
@@ -315,7 +316,7 @@
         $(role + '-model-note').textContent = state.pending ? '原提交已冻结：模型来源、目录版本、effort、权限确认与幂等键不变；缓存过期或服务重启也只重试原请求'
           : source === 'manual' ? '手动模型 ID 未验证；不推测支持的 effort，不提供 effort 覆盖。调用权限和实际模型须由执行证据确认'
           : choice.notice || (!envelope ? '当前没有可用的新鲜目录。可在上方读取缓存或显式刷新发现，也可选择未验证的手动模型 ID' : '使用已读取的缓存，选择会固定 cache epoch 与 generation；目录不是模型调用授权');
-        const efforts = roleEfforts(role); populateSelect(role + '-effort', efforts.map(item => item.effort), '沿用配置 effort（生效待证据）');
+        const efforts = roleEfforts(role); populateSelect(role + '-effort', efforts.map(item => item.effort), profile?.provider === 'kiro_cli' ? 'Kiro 适配器暂不支持 effort' : '沿用配置 effort（生效待证据）');
         if (state.pending && choice.effort && !efforts.some(item => item.effort === choice.effort)) { const option = catalogNode('option', choice.effort + '（原提交）'); option.value = choice.effort; $(role + '-effort').append(option); }
         $(role + '-effort').value = choice.effort || ''; $(role + '-effort').disabled = locked || !native || source !== 'catalog' || !model || !efforts.length;
         const permissions = $(role + '-permission'); populateSelect(role + '-permission', [], '沿用配置模式');
@@ -329,7 +330,7 @@
         if (state.pending && choice.native_permission && !Array.from(permissions.children).some(option => option.value === choice.native_permission)) { const option = catalogNode('option', choice.native_permission + '（原提交）'); option.value = choice.native_permission; permissions.append(option); }
         permissions.value = choice.native_permission || '';
         const mode = roleMode(role), confirmation = mode?.requires_confirmation === true || Boolean(state.pending && choice.confirm_permission_expansion);
-        $(role + '-permission-note').textContent = role === 'reviewer' ? reviewerContractText(profile) : mode?.id === 'codex_auto_review' ? 'Codex 原生 Auto-review：workspace-write + on-request，可能自动批准越界请求。不是绝对只读；审批模型由 Codex 选择，可用性需运行时回传验证' : mode?.id === 'claude_auto' ? 'Claude auto 是原生分类器，不是 bypass；可能因账户、模型或策略不满足而拒绝或回退。执行证据将分别呈现请求和观测' : '宿主授权与原生能力分别判断；未知不保证 CLI 支持、隔离或实际执行约束';
+        $(role + '-permission-note').textContent = role === 'reviewer' ? reviewerContractText(profile) : profile?.provider === 'kiro_cli' ? 'Kiro 使用现有原生权限策略；显式选择后仅添加 edit-workspace 预设。没有 OS 沙箱；hooks、MCP 和 settings 仍须由操作员信任，交互权限请求会被拒绝' : mode?.id === 'codex_auto_review' ? 'Codex 原生 Auto-review：workspace-write + on-request，可能自动批准越界请求。不是绝对只读；审批模型由 Codex 选择，可用性需运行时回传验证' : mode?.id === 'claude_auto' ? 'Claude auto 是原生分类器，不是 bypass；可能因账户、模型或策略不满足而拒绝或回退。执行证据将分别呈现请求和观测' : '宿主授权与原生能力分别判断；未知不保证 CLI 支持、隔离或实际执行约束';
         $(role + '-confirm-field').hidden = !confirmation;
         $(role + '-confirm-text').textContent = permissionRisk(mode) + (permissionState.text ? ' 服务端确认：' + permissionState.text.slice(0, 1000) : ''); $(role + '-confirm').checked = choice.confirm_permission_expansion === true;
         $(role + '-challenge').disabled = locked || permissionState.loading;
@@ -521,7 +522,7 @@
       const choice = replacementState.choice.model, envelope = freshProfileCatalog(replacementState.choice.profile);
       return choice?.source === 'catalog' && envelope && choice.catalog?.cache_epoch === envelope.cache_epoch && choice.catalog?.generation === envelope.generation ? envelope.catalog.models.find(model => isRecord(model) && model.model === choice.value) || null : null;
     }
-    function replacementEfforts() { const efforts = replacementCatalogModel()?.supported_efforts; return Array.isArray(efforts) ? efforts.filter(item => isRecord(item) && typeof item.effort === 'string').slice(0, 64) : []; }
+    function replacementEfforts() { if (replacementProfile()?.provider === 'kiro_cli') return []; const efforts = replacementCatalogModel()?.supported_efforts; return Array.isArray(efforts) ? efforts.filter(item => isRecord(item) && typeof item.effort === 'string').slice(0, 64) : []; }
     function requestedReplacement() {
       const choice = replacementState.choice, mode = replacementMode(), native = choice.native_permission || (mode?.requires_confirmation ? mode.id : '');
       return { profile: choice.profile, ...(choice.model ? { model: JSON.parse(JSON.stringify(choice.model)) } : {}), ...(choice.effort ? { effort: choice.effort } : {}), ...(native ? { native_permission: native } : {}), ...(choice.confirm_permission_expansion === true ? { confirm_permission_expansion: true } : {}) };
@@ -591,10 +592,10 @@
         if (role === 'reviewer' && reviewerContract(item) === 'unsupported') { option.disabled = true; if (option.value) option.textContent += '（审查契约不可用）'; }
       }
       const stage = capability?.stopped_stage;
-      $('replacement-session').textContent = role === 'reviewer' && reviewerContract(profile) === 'native_local_read_only' ? '本次审查使用独立 checkout 与全新独立 Codex 会话，不恢复旧会话。保留原工作区、候选与原结果，不从源仓库重新复制或清理现场' : (native || !choice.profile || pending ? '将建立新的执行调用；原生角色使用新会话与有界交接，旧原生历史不能跨供应商兼容恢复' : '通用命令配置使用新的执行调用与有界交接，没有可恢复的原生会话') + '。保留原工作区、候选与原结果，不重新复制或清理现场';
+      $('replacement-session').textContent = profile?.provider === 'kiro_cli' ? 'Kiro 使用全新开发调用与有界交接，不恢复原生会话。保留原工作区、候选与原结果，不从源仓库重新复制或清理现场' : role === 'reviewer' && reviewerContract(profile) === 'native_local_read_only' ? '本次审查使用独立 checkout 与全新独立 Codex 会话，不恢复旧会话。保留原工作区、候选与原结果，不从源仓库重新复制或清理现场' : (native || !choice.profile || pending ? '将建立新的执行调用；原生角色使用新会话与有界交接，旧原生历史不能跨供应商兼容恢复' : '通用命令配置使用新的执行调用与有界交接，没有可恢复的原生会话') + '。保留原工作区、候选与原结果，不重新复制或清理现场';
       $('replacement-stage').textContent = role === 'reviewer' ? '同一候选 ' + (stage?.candidate_sha || '见服务端已冻结候选') + '；原配置测试只运行一次，通过后仅审查，不开发、不修复'
         : '保留原轮次 ' + (stage?.round ?? '不适用 / 未提供') + ' 与剩余修复预算 ' + (stage?.remaining_repairs ?? '不适用 / 未提供') + '；不重置修复次数';
-      $('replacement-defaults').textContent = pending ? '实际冻结选择：' + replacementSelectionText(choice) : '配置 ' + selectionText(choice.profile) + ' · ' + selectionText(profile?.provider) + '；默认模型 ' + catalogText(profile?.model, '由 CLI 决定') + '；默认 effort ' + catalogText(profile?.effort, '由 CLI 决定') + '；默认模式 ' + catalogText(profile?.native_permission, '沿用原生配置');
+      $('replacement-defaults').textContent = pending ? '实际冻结选择：' + replacementSelectionText(choice) : '配置 ' + selectionText(choice.profile) + ' · ' + selectionText(profile?.provider) + '；默认模型 ' + catalogText(profile?.model, '由 CLI 决定') + '；默认 effort ' + (profile?.provider === 'kiro_cli' ? 'Kiro 适配器暂不支持' : catalogText(profile?.effort, '由 CLI 决定')) + '；默认模式 ' + catalogText(profile?.native_permission, '沿用原生配置');
       $('replacement-native-settings').hidden = !native && !pending;
       const source = choice.model?.source || choice.source || '', envelope = freshProfileCatalog(choice.profile);
       for (const suffix of ['model-source', 'manual-model', 'permission']) $('replacement-' + suffix).disabled = locked || !native;
@@ -607,7 +608,7 @@
       $('replacement-model-note').textContent = pending ? '原请求与权限凭证已冻结；未知结果、目录过期或服务重启后仍重试原请求'
         : source === 'manual' ? '手动模型 ID 未验证，不推测 effort；调用权限与实际模型需要执行证据'
         : !envelope ? '没有已读取的新鲜缓存；关闭此框后可读取目录，或显式使用未验证的手动 ID。不会自动探测' : '只使用已读取缓存并固定 epoch / generation；目录不证明调用权限';
-      const efforts = pending ? [] : replacementEfforts(); populateSelect('replacement-effort', efforts.map(item => item.effort), '沿用配置 effort（生效待证据）');
+      const efforts = pending ? [] : replacementEfforts(); populateSelect('replacement-effort', efforts.map(item => item.effort), profile?.provider === 'kiro_cli' ? 'Kiro 适配器暂不支持 effort' : '沿用配置 effort（生效待证据）');
       if (pending && choice.effort) { const option = catalogNode('option', choice.effort + '（已冻结）'); option.value = choice.effort; $('replacement-effort').append(option); }
       $('replacement-effort').value = choice.effort || ''; $('replacement-effort').disabled = locked || !native || source !== 'catalog' || !efforts.length;
       populateSelect('replacement-permission', [], '沿用配置模式'); $('replacement-mode-reasons').replaceChildren();
@@ -619,7 +620,7 @@
       }
       if (pending && choice.native_permission && !Array.from($('replacement-permission').children).some(option => option.value === choice.native_permission)) { const option = catalogNode('option', choice.native_permission + '（已冻结）'); option.value = choice.native_permission; $('replacement-permission').append(option); }
       $('replacement-permission').value = choice.native_permission || '';
-      $('replacement-permission-note').textContent = role === 'reviewer' ? reviewerContractText(profile) : choice.native_permission === 'codex_auto_review' ? 'Codex 原生 Auto-review 可能自动批准文件、网络或工具越界请求；不是绝对只读，审批模型由 Codex 选择' : choice.native_permission === 'claude_auto' ? 'Claude auto 是原生分类器，不是 bypass；账户、模型或策略可能拒绝或回退' : '宿主允许与原生能力分别判断；未知不保证隔离或生效';
+      $('replacement-permission-note').textContent = role === 'reviewer' ? reviewerContractText(profile) : profile?.provider === 'kiro_cli' ? 'Kiro 使用现有原生权限策略；显式选择后仅添加 edit-workspace 预设。没有 OS 沙箱；hooks、MCP 和 settings 仍须由操作员信任，交互权限请求会被拒绝' : choice.native_permission === 'codex_auto_review' ? 'Codex 原生 Auto-review 可能自动批准文件、网络或工具越界请求；不是绝对只读，审批模型由 Codex 选择' : choice.native_permission === 'claude_auto' ? 'Claude auto 是原生分类器，不是 bypass；账户、模型或策略可能拒绝或回退' : '宿主允许与原生能力分别判断；未知不保证隔离或生效';
       const mode = pending ? null : replacementMode(), confirmation = Boolean(pending?.body.replacement?.confirm_permission_expansion || mode?.requires_confirmation);
       $('replacement-confirm-field').hidden = !confirmation; $('replacement-confirm').checked = choice.confirm_permission_expansion === true;
       $('replacement-confirm').disabled = locked || !validReplacementChallenge(); $('replacement-challenge').disabled = locked || replacementState.loading;
@@ -835,7 +836,7 @@
         card.append(catalogNode('p', 'CLI 版本：' + catalogText(catalog?.cli_version), 'catalog-meta'));
         if (catalogState.errors.has(profile.name)) card.append(catalogNode('p', catalogState.errors.get(profile.name), 'catalog-error'));
         const selection = catalog?.selection, selected = catalogNode('div', undefined, 'catalog-selection'), pairs = catalogNode('dl');
-        for (const [label, value] of [['请求模型', catalogText(selection?.requested_model ?? profile.model, '未指定（由 CLI 决定）')], ['请求 effort', catalogText(selection?.requested_effort ?? profile.effort, '未指定（由 CLI 决定）')], ['实际模型', catalogText(selection?.effective_model, '未知（尚无执行证据）')], ['实际 effort', catalogText(selection?.effective_effort, '未知（尚无执行证据）')]]) {
+        for (const [label, value] of [['请求模型', catalogText(selection?.requested_model ?? profile.model, '未指定（由 CLI 决定）')], ['请求 effort', profile.provider === 'kiro_cli' ? 'Kiro 适配器暂不支持' : catalogText(selection?.requested_effort ?? profile.effort, '未指定（由 CLI 决定）')], ['实际模型', catalogText(selection?.effective_model, '未知（尚无执行证据）')], ['实际 effort', profile.provider === 'kiro_cli' ? 'Kiro 适配器暂不支持' : catalogText(selection?.effective_effort, '未知（尚无执行证据）')]]) {
           const group = catalogNode('div'); group.append(catalogNode('dt', label), catalogNode('dd', value)); pairs.append(group);
         }
         selected.append(pairs, catalogNode('p', '配置验证：' + (catalogEvidence(selection?.status).state === 'unknown' ? '未验证' : catalogEvidence(selection?.status).state === 'supported' ? '目录已验证' : '不支持') + '。目录匹配不等于实际生效或调用授权')); card.append(selected);

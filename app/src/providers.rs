@@ -18,6 +18,7 @@ pub enum ProviderKind {
     CodexCli,
     CodexAppServer,
     ClaudeCli,
+    KiroCli,
 }
 
 /// An explicit native developer permission mode, or Relay's fixed reviewer contract.
@@ -34,6 +35,8 @@ pub enum NativePermission {
     ClaudeAuto,
     ClaudeBypassPermissions,
     ClaudeRestricted,
+    /// Native workspace-edit rules, not an OS sandbox; runtime asks are denied.
+    KiroWorkspaceWrite,
 }
 impl NativePermission {
     pub fn requires_confirmation(self) -> bool {
@@ -53,6 +56,7 @@ impl NativePermission {
                     false,
                 )
                 | (Self::ClaudeRestricted, ProviderKind::ClaudeCli, true)
+                | (Self::KiroWorkspaceWrite, ProviderKind::KiroCli, false)
                 | (
                     Self::CodexNativeSandboxedReview,
                     ProviderKind::CodexAppServer,
@@ -202,6 +206,11 @@ impl NativeProfile {
                 "allow_startup_discovery is only supported for Claude native profiles".into(),
             );
         }
+        if self.provider == ProviderKind::KiroCli
+            && (self.session_continuity || self.effort.is_some())
+        {
+            return Err("Kiro ACP supports fresh developer sessions only; session continuity and effort are unsupported".into());
+        }
         if self.session_continuity && self.provider == ProviderKind::CodexCli {
             return Err("Codex session continuity requires provider codex_app_server".into());
         }
@@ -226,13 +235,26 @@ impl NativeProfile {
     pub fn compile(&self, read_only: bool) -> Result<CommandProfile, String> {
         self.validate()?;
         if read_only && !self.reviewer_supported() {
-            return Err("review_profile_unsupported: requires restricted Claude or explicitly host-allowed Codex native sandboxed review; strict Codex reviewer isolation contract is unproven".into());
+            return Err("review_profile_unsupported: requires restricted Claude or explicitly host-allowed Codex native sandboxed review; strict reviewer isolation contract is unproven for unsupported native adapters".into());
         }
         if self
             .native_permission
             .is_some_and(|mode| !mode.compatible(self.provider, read_only))
         {
             return Err("native permission mode is incompatible with the provider role".into());
+        }
+        if self.provider == ProviderKind::KiroCli {
+            return Ok(CommandProfile {
+                program: self.program.clone(),
+                args: vec![
+                    "acp".into(),
+                    "--agent-engine".into(),
+                    "v3".into(),
+                    "--auth-method".into(),
+                    "cli".into(),
+                ],
+                env: self.env.clone(),
+            });
         }
         if self.provider == ProviderKind::CodexAppServer {
             return Ok(CommandProfile {
@@ -242,7 +264,7 @@ impl NativeProfile {
             });
         }
         let mut args: Vec<String> = match self.provider {
-            ProviderKind::CodexAppServer => unreachable!(),
+            ProviderKind::CodexAppServer | ProviderKind::KiroCli => unreachable!(),
             ProviderKind::CodexCli => vec![
                 "exec".into(),
                 "--json".into(),
@@ -276,7 +298,7 @@ impl NativeProfile {
                         args.extend(["--permission-mode".into(), mode.into()]);
                     }
                 }
-                ProviderKind::CodexAppServer => unreachable!(),
+                ProviderKind::CodexAppServer | ProviderKind::KiroCli => unreachable!(),
             }
         }
         if let Some(model) = &self.model {
@@ -290,6 +312,7 @@ impl NativeProfile {
                     args.extend(["-c".into(), format!("model_reasoning_effort={literal}")])
                 }
                 ProviderKind::ClaudeCli => args.extend(["--effort".into(), effort.clone()]),
+                ProviderKind::KiroCli => unreachable!("Kiro effort was rejected"),
             }
         }
         if let Some(turns) = self.max_turns {
@@ -333,6 +356,7 @@ impl NativeProfile {
             ProviderKind::CodexCli => vec!["exec".into(), "--help".into()],
             ProviderKind::CodexAppServer => vec!["app-server".into(), "--help".into()],
             ProviderKind::ClaudeCli => vec!["--help".into()],
+            ProviderKind::KiroCli => vec!["acp".into(), "--help".into()],
         }
     }
 
@@ -366,7 +390,7 @@ impl NativeProfile {
         hidden_max_turns_verified: bool,
     ) -> Result<String, String> {
         if read_only && !self.reviewer_supported() {
-            return Err("review_profile_unsupported: requires restricted Claude or explicitly host-allowed Codex native sandboxed review; strict Codex reviewer isolation contract is unproven".into());
+            return Err("review_profile_unsupported: requires restricted Claude or explicitly host-allowed Codex native sandboxed review; strict reviewer isolation contract is unproven for unsupported native adapters".into());
         }
         if self
             .native_permission
@@ -374,7 +398,26 @@ impl NativeProfile {
         {
             return Err("native permission mode is incompatible with the provider role".into());
         }
+        if self.provider == ProviderKind::KiroCli && !version.to_ascii_lowercase().contains("kiro")
+        {
+            return Err("Kiro CLI version banner was not recognizable".into());
+        }
         let version = parse_version(version).ok_or("CLI version was not recognizable")?;
+        if self.provider == ProviderKind::KiroCli {
+            if version.0 < (2, 28, 0) {
+                return Err(
+                    "Kiro CLI 2.28.0 or later is required for the verified ACP V3 adapter".into(),
+                );
+            }
+            for flag in ["--agent-engine", "--auth-method"] {
+                if !help_has_flag(help, flag) {
+                    return Err(format!(
+                        "Kiro ACP help does not advertise required capability {flag}"
+                    ));
+                }
+            }
+            return Ok(version.1);
+        }
         if self.provider == ProviderKind::ClaudeCli && version.0 < (2, 1, 259) {
             return Err(
                 "Claude CLI 2.1.259 or later is required for --permission-prompts none".into(),
@@ -390,7 +433,7 @@ impl NativeProfile {
             return Ok(version.1);
         }
         let mut required = match self.provider {
-            ProviderKind::CodexAppServer => unreachable!(),
+            ProviderKind::CodexAppServer | ProviderKind::KiroCli => unreachable!(),
             ProviderKind::CodexCli => vec![
                 "--json",
                 "--sandbox",
@@ -849,6 +892,7 @@ pub struct ProtocolParser {
     read_only: bool,
     answer_seen: bool,
     app_server: Option<crate::app_server::Driver>,
+    kiro_acp: Option<crate::kiro_acp::Driver>,
     catalog: Option<crate::capabilities::CatalogDriver>,
     claude_control: Option<crate::claude_control::Driver>,
     task_output: Vec<u8>,
@@ -870,6 +914,7 @@ impl ProtocolParser {
             read_only: false,
             answer_seen: false,
             app_server: None,
+            kiro_acp: None,
             catalog: None,
             claude_control: None,
             task_output: Vec::new(),
@@ -884,6 +929,16 @@ impl ProtocolParser {
         let mut parser = Self::new(result.clone());
         parser.app_server = Some(crate::app_server::Driver::new(result, start));
         parser
+    }
+    pub(crate) fn kiro_acp(result: ProviderResult, start: crate::kiro_acp::Start) -> Self {
+        let mut parser = Self::new(result.clone());
+        parser.kiro_acp = Some(crate::kiro_acp::Driver::new(result, start));
+        parser
+    }
+    pub(crate) fn mark_kiro_input_complete(&mut self) {
+        if let Some(driver) = &mut self.kiro_acp {
+            driver.mark_input_complete();
+        }
     }
     pub(crate) fn catalog(result: ProviderResult) -> Self {
         let mut parser = Self::new(result);
@@ -935,6 +990,9 @@ impl ProtocolParser {
             .is_some_and(|driver| driver.input_done())
     }
     pub(crate) fn task_output_eof(&mut self) -> Option<Vec<u8>> {
+        if self.kiro_acp.is_some() {
+            return Some(Vec::new());
+        }
         if self.claude_control.as_ref()?.is_catalog() {
             return Some(Vec::new());
         }
@@ -945,6 +1003,11 @@ impl ProtocolParser {
         self.task_output()
     }
     pub(crate) fn task_output(&mut self) -> Option<Vec<u8>> {
+        // ACP envelopes may contain native account/configuration metadata or
+        // approval inputs. Only the normalized bounded answer is persisted.
+        if self.kiro_acp.is_some() {
+            return Some(Vec::new());
+        }
         self.claude_control.as_ref()?;
         Some(std::mem::take(&mut self.task_output))
     }
@@ -970,6 +1033,9 @@ impl ProtocolParser {
             })
     }
     pub(crate) fn pending(&mut self) -> Vec<u8> {
+        if let Some(driver) = &mut self.kiro_acp {
+            return driver.take_pending();
+        }
         if let Some(driver) = &mut self.claude_control {
             return driver.pending();
         }
@@ -982,6 +1048,9 @@ impl ProtocolParser {
             .unwrap_or_default()
     }
     pub(crate) fn stopped(&self) -> bool {
+        if let Some(driver) = &self.kiro_acp {
+            return driver.stopped();
+        }
         if let Some(driver) = &self.catalog {
             return driver.stopped();
         }
@@ -994,6 +1063,9 @@ impl ProtocolParser {
             || self.error.is_some()
     }
     pub(crate) fn failure(&self) -> Option<&str> {
+        if let Some(driver) = &self.kiro_acp {
+            return driver.failure();
+        }
         if let Some(driver) = &self.catalog {
             return driver.failure();
         }
@@ -1012,6 +1084,10 @@ impl ProtocolParser {
         self
     }
     pub fn feed(&mut self, bytes: &[u8]) {
+        if let Some(driver) = &mut self.kiro_acp {
+            driver.feed(bytes);
+            return;
+        }
         if let Some(driver) = &mut self.catalog {
             driver.feed(bytes);
             return;
@@ -1179,8 +1255,8 @@ impl ProtocolParser {
             return Err("provider reported an error or denied permission".into());
         }
         match self.result.provider {
-            ProviderKind::CodexAppServer => {
-                return Err("app-server requires bidirectional protocol driver".into());
+            ProviderKind::CodexAppServer | ProviderKind::KiroCli => {
+                return Err("provider requires bidirectional protocol driver".into());
             }
             ProviderKind::CodexCli => match kind {
                 "thread.started" => {
@@ -1402,6 +1478,9 @@ impl ProtocolParser {
         Ok(())
     }
     pub fn finish(mut self) -> (ProviderResult, Option<String>) {
+        if let Some(driver) = self.kiro_acp.take() {
+            return driver.finish();
+        }
         if let Some(driver) = self.catalog.take() {
             return (self.result, driver.finish().err());
         }

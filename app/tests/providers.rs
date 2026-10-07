@@ -703,3 +703,68 @@ fn native_review_is_separate_opt_in_fresh_and_version_verified() {
     assert!(p.compile(true).is_err());
     assert!(NativePermission::CodexNativeSandboxedReview.requires_confirmation());
 }
+
+#[test]
+fn kiro_profile_is_fresh_developer_acp_with_only_typed_native_policy() {
+    let mut p = profile(ProviderKind::KiroCli);
+    p.model = Some("future-model".into());
+    assert_eq!(
+        p.compile(false).unwrap().args,
+        ["acp", "--agent-engine", "v3", "--auth-method", "cli"]
+    );
+    assert_eq!(p.help_args(), ["acp", "--help"]);
+    assert!(!p.reviewer_supported());
+    assert_eq!(p.reviewer_contract(), "unsupported");
+    assert!(
+        p.compile(true)
+            .unwrap_err()
+            .contains("review_profile_unsupported")
+    );
+    p.native_permission = Some(NativePermission::KiroWorkspaceWrite);
+    assert!(p.compile(false).is_ok());
+    assert!(NativePermission::KiroWorkspaceWrite.requires_confirmation());
+    assert!(!NativePermission::KiroWorkspaceWrite.compatible(ProviderKind::ClaudeCli, false));
+    p.session_continuity = true;
+    assert!(p.validate().is_err());
+    p.session_continuity = false;
+    p.effort = Some("high".into());
+    assert!(p.validate().is_err());
+    p.effort = None;
+    p.max_turns = Some(5);
+    assert!(p.validate().is_err());
+    p.max_turns = None;
+    p.max_budget_usd = Some(1.0);
+    assert!(p.validate().is_err());
+    p.max_budget_usd = None;
+    p.allow_startup_discovery = true;
+    assert!(p.validate().is_err());
+    p.allow_startup_discovery = false;
+    p.native_permission = Some(NativePermission::ClaudeDontAsk);
+    assert!(p.validate().is_err());
+}
+#[test]
+fn kiro_acp_requires_current_vendor_version_and_advertised_flags() {
+    let p = profile(ProviderKind::KiroCli);
+    let help = "Start ACP --agent-engine <ENGINE> --auth-method <METHOD>";
+    assert_eq!(
+        p.validate_probe("kiro-cli 2.28.0", help, false).unwrap(),
+        "2.28.0"
+    );
+    for version in [
+        "kiro-cli 2.27.9",
+        "kiro-cli 2.28.0-beta",
+        "Amazon Q 2.28.0",
+        "2.28.0",
+    ] {
+        assert!(p.validate_probe(version, help, false).is_err(), "{version}");
+    }
+    assert!(
+        p.validate_probe(
+            "kiro-cli 2.28.0",
+            "--agent-engine --auth-method-fake",
+            false
+        )
+        .is_err()
+    );
+    assert!(p.validate_probe("kiro-cli 2.28.0", help, true).is_err());
+}

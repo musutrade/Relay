@@ -325,6 +325,7 @@ pub(crate) fn annotate(
     }
 }
 const NATIVE_REVIEW_CONFIRMATION: &str = "I confirm commands may execute in Codex's local read-only sandbox with approval never. Native hooks, MCP, plugins and remote tools are outside that sandbox; I trust this native startup configuration and its integrations. This is not strict no-execution review.";
+const KIRO_WORKSPACE_CONFIRMATION: &str = "I confirm Kiro native workspace editing permission using only the edit-workspace policy preset. This is not an OS sandbox. Existing native hooks, MCP and settings remain operator-trusted; Relay rejects interactive permission requests and does not enable trust-all or dev-shell.";
 
 pub(crate) fn permission_choices(profile: &NativeProfile) -> Vec<Value> {
     use NativePermission::*;
@@ -342,6 +343,7 @@ pub(crate) fn permission_choices(profile: &NativeProfile) -> Vec<Value> {
             ClaudeBypassPermissions,
             ClaudeRestricted,
         ],
+        ProviderKind::KiroCli => &[KiroWorkspaceWrite],
     };
     choices.iter().map(|mode| {
         let safe = matches!(mode, CodexWorkspaceWrite | ClaudeRestricted);
@@ -355,10 +357,11 @@ pub(crate) fn permission_choices(profile: &NativeProfile) -> Vec<Value> {
             ClaudeAuto => ("Claude auto", "Native classifier availability is unknown until execution; model, provider, account and managed policy may reject or fall back"),
             ClaudeBypassPermissions => ("Claude bypassPermissions", "Bypasses native permission checks; expands filesystem and network access available to the process"),
             ClaudeRestricted => ("Relay restricted reviewer", "Fixed read-only reviewer tools and isolation contract; not a native --permission-mode value"),
+            KiroWorkspaceWrite => ("Kiro native workspace editing", "Developer only: edit-workspace native policy preset; no OS sandbox. Existing native hooks, MCP and settings remain operator-trusted. Interactive permission requests are rejected; no trust-all or dev-shell preset"),
         };
         json!({"id":mode,"label":label,"host_allowed":allowed,"availability":if allowed {"unknown"} else {"unsupported"},
             "reason":if allowed {reason} else {"Not allowed by the configured host policy"},"reviewer_only":matches!(mode, ClaudeRestricted | CodexNativeSandboxedReview),
-            "requires_confirmation":mode.requires_confirmation(),"confirmation_text":if mode.requires_confirmation() {Some(if *mode == CodexNativeSandboxedReview {NATIVE_REVIEW_CONFIRMATION} else if *mode == CodexAutoReview {"I confirm native automatic approval of eligible developer sandbox escalations; this is not an absolute read-only or no-network guarantee"} else if *mode == CodexFullAccess || *mode == ClaudeBypassPermissions {"I confirm expanded filesystem AND network access for this developer execution"} else {"I confirm this developer native permission-mode change; native policy still controls allowed access"})} else {None::<&str>}})
+            "requires_confirmation":mode.requires_confirmation(),"confirmation_text":if mode.requires_confirmation() {Some(if *mode == CodexNativeSandboxedReview {NATIVE_REVIEW_CONFIRMATION} else if *mode == KiroWorkspaceWrite {KIRO_WORKSPACE_CONFIRMATION} else if *mode == CodexAutoReview {"I confirm native automatic approval of eligible developer sandbox escalations; this is not an absolute read-only or no-network guarantee"} else if *mode == CodexFullAccess || *mode == ClaudeBypassPermissions {"I confirm expanded filesystem AND network access for this developer execution"} else {"I confirm this developer native permission-mode change; native policy still controls allowed access"})} else {None::<&str>}})
     }).collect()
 }
 
@@ -531,6 +534,8 @@ impl PermissionChallenges {
             "This expands filesystem AND network access for this developer execution."
         } else if role.native_permission == Some(NativePermission::CodexAutoReview) {
             "Codex native Auto-review may approve eligible filesystem, network and tool escalations beyond workspace-write. This is not absolute read-only or no-network access. Codex chooses the approval reviewer independently of the developer/code-review model; native account and managed policy still apply."
+        } else if role.native_permission == Some(NativePermission::KiroWorkspaceWrite) {
+            KIRO_WORKSPACE_CONFIRMATION
         } else {
             "This changes the developer's native access decisions. Native policy and model/provider eligibility still apply; Claude auto is a classifier, not bypassPermissions."
         };
@@ -540,9 +545,13 @@ impl PermissionChallenges {
             role.model
                 .as_deref()
                 .unwrap_or("native default (unverified)"),
-            role.effort
-                .as_deref()
-                .unwrap_or("native default (unverified)"),
+            if role.provider == Some(ProviderKind::KiroCli) {
+                "unsupported by the Relay Kiro adapter"
+            } else {
+                role.effort
+                    .as_deref()
+                    .unwrap_or("native default (unverified)")
+            },
             mode.as_str().unwrap_or("native default"),
             consequence
         );

@@ -8,6 +8,7 @@ mod claude_control;
 mod git_inventory;
 pub mod host;
 pub mod http;
+mod kiro_acp;
 pub mod mcp;
 pub mod providers;
 pub mod replacement;

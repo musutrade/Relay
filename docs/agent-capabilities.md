@@ -90,3 +90,10 @@ relay-app doctor <config.json> --confirm-catalog-stopped
 ```
 
 此命令声明操作员已确认之前的发现进程树停止，仅清除对应的恢复标记，不杀进程、不推断停止、不调用模型。仍在运行并持锁的发现操作会被拒绝；服务随后允许重新刷新，无需手工删除文件。不要在未核对进程时使用这个确认选项。
+
+
+## Kiro CLI（可选开发适配器）
+
+`kiro_cli` 的刷新仅运行版本与 ACP 帮助检查，不调用 `whoami`、`chat --list-models` 或 `session/new`。模型目录与认证保持 `unknown`；不会借用 Codex / Claude 目录或硬编码模型名称。手工模型 ID 仍可以显式提交，标记未验证，由原生会话接纳或拒绝。
+
+任务运行前才检查原生认证就绪；每次创建全新 ACP V3 会话。审查与 Relay session resume 明确不支持，effort、token、费用没有合格证据时不提供伪造值。原生 session 配置若返回模型，只代表 session 报告，不能证明本回合实际执行模型。详见 [Kiro 接入与官方依据](kiro-adapter.md)。

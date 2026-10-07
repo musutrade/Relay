@@ -140,3 +140,8 @@ Claude 独立启动发现由 host profile 的 `allow_startup_discovery` 显式 o
 ## 原生自动审批选项
 
 `codex_auto_review` 只在允许的 app-server 开发 profile 上复用 Codex 的 `on-request` / `auto_review` 路由，与代码审查角色和模型选择分开。现有权限 challenge、宿主策略摘要、会话绑定及幂等接纳继续生效；启动 / 恢复回传必须完整确认所选模式才能发送 turn，运行中模式漂移停止。结果保留有界原生审批观察，不创建 Relay 审批器或自动批准客户端请求。默认、只读 reviewer 和内核不变；越界自动批准的风险与未验证限制见[原生 Auto-review](native-auto-review.md)。
+
+
+## Kiro ACP 开发适配器
+
+`app/src/kiro_acp.rs` 实现 Kiro V3 的单会话 ACP JSON-RPC 驱动：握手、全新会话、单个关联 prompt 与有界回答。只在请求全部写入后接纳响应；拒绝运行时权限提升、文件/终端/认证回调。配置在原生 profile 中，生命周期继续由既有 supervisor 拥有，不修改内核、队列或重试语义。Kiro 的原生 hooks、MCP 与已有权限仍受宿主信任，不据此宣称 OS 沙箱或严格审查隔离。`whoami` 仅是任务前认证就绪门禁，结果身份信息不持久化；目录刷新不启动 ACP、认证或模型列表子进程。详情见 [Kiro 接入](kiro-adapter.md)。

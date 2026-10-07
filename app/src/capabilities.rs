@@ -164,7 +164,7 @@ impl ProfileCatalog {
                 )
             } else {
                 Capability::unsupported(
-                    "Relay has not verified the complete Codex no-execution, hooks, MCP and configuration-loading reviewer isolation contract",
+                    "Relay has not verified this adapter's complete no-execution, hooks, MCP and configuration-loading reviewer isolation contract",
                     "relay:reviewer_contract",
                 )
             },
@@ -458,6 +458,10 @@ fn discover_inner(
                         "relay:native_reviewer_contract",
                     )
                 }
+                ProviderKind::KiroCli => Capability::unsupported(
+                    "Relay Kiro ACP starts fresh sessions only; persisted native sessions are never resumed",
+                    "relay:kiro_adapter_contract",
+                ),
                 ProviderKind::CodexCli => Capability::unsupported(
                     "The configured Codex exec adapter is ephemeral",
                     "relay:adapter_contract",
@@ -482,6 +486,16 @@ fn discover_inner(
                 ),
             };
             match profile.provider {
+                ProviderKind::KiroCli => {
+                    catalog.model_catalog = Capability::unknown(
+                        "Kiro model listing may authenticate or load native configuration; this refresh only checks version/help. Bounded manual model IDs remain available and unverified",
+                        "relay:kiro_adapter_contract",
+                    );
+                    catalog.startup_context = Capability::unknown(
+                        "No ACP session or model-list process started; native hooks, MCP and settings remain operator-trusted during task execution",
+                        "relay:kiro_adapter_contract",
+                    );
+                }
                 ProviderKind::CodexCli | ProviderKind::CodexAppServer => {
                     discover_codex(host, profile, &workspace, deadline, &mut catalog);
                 }
