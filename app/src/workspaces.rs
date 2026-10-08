@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -28,6 +28,8 @@ pub struct Continuation {
     pub review_only: Option<crate::workflow::ReviewContinuation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_adoption: Option<crate::workflow::PinnedReviewAdoption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_approved: Option<crate::publication::PinnedPublication>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,7 +76,7 @@ fn normalized(job: &Job) -> Job {
     job.continuation = None;
     job
 }
-fn config_binding(config: &HostConfig, job: &Job) -> io::Result<String> {
+pub(crate) fn config_binding(config: &HostConfig, job: &Job) -> io::Result<String> {
     if job.role_selections.is_some() {
         let workflow = job
             .workflow
@@ -228,7 +230,16 @@ fn inspect(config: &HostConfig, task: &Task, job: &Job, path: &Path) -> io::Resu
             "workspace task, job, or selected profile binding changed",
         ));
     }
-    if path.join("publication-attempt.json").exists() {
+    if fs::symlink_metadata(path.join("publication-attempt.json"))
+        .map(|_| true)
+        .or_else(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        })?
+    {
         return Err(io::Error::other(
             "publication was attempted; reconcile external effects locally before continuing",
         ));
@@ -405,6 +416,7 @@ pub(crate) fn continuation_under_lease(
         predecessor_generation: task.generation,
         review_only: None,
         operator_adoption: None,
+        publish_approved: None,
     })
 }
 pub(crate) fn consume_fresh_role_epoch(path: &Path, reviewer: bool) -> io::Result<()> {
@@ -436,10 +448,20 @@ pub(crate) fn mark_ready(path: &Path) -> io::Result<()> {
     crate::sessions::atomic_write(&path.join("workspace-ready"), &json!({"version":1}))
 }
 pub(crate) fn mark_publication(path: &Path, task: &Task) -> io::Result<()> {
-    crate::sessions::atomic_write(
-        &path.join("publication-attempt.json"),
-        &json!({"task_id":task.id,"generation":task.generation}),
-    )
+    // Never replace this marker, including a partial/crashed write. Its presence
+    // means external effects may exist and manual reconciliation is required.
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path.join("publication-attempt.json"))?;
+    file.write_all(
+        &serde_json::to_vec(&json!({"task_id":task.id,"generation":task.generation}))
+            .map_err(io::Error::other)?,
+    )?;
+    file.sync_all()?;
+    File::open(path)?.sync_all()
 }
 
 pub(crate) fn exists_for(config: &HostConfig, task: &Task, job: &Job) -> bool {
@@ -488,7 +510,11 @@ pub(crate) fn mark_finished(path: &Path, task: &Task) -> io::Result<()> {
         },
     )
 }
-pub(crate) fn cleanup(config: &HostConfig, store: &relay::Store) -> io::Result<usize> {
+pub(crate) fn cleanup(
+    config: &HostConfig,
+    store: &relay::Store,
+    control: &mut Connection,
+) -> io::Result<usize> {
     let Some(retention) = config.successful_workspace_retention_seconds else {
         return Ok(0);
     };
@@ -497,6 +523,11 @@ pub(crate) fn cleanup(config: &HostConfig, store: &relay::Store) -> io::Result<u
         .map_err(io::Error::other)?
         .as_secs();
     let mut removed = 0;
+    // Reservations and host claims use this same database writer boundary.
+    // Take it before workspace locks, matching publish-approved admission order.
+    let transaction = control
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(io::Error::other)?;
     for entry in fs::read_dir(&config.workspace_root)?.take(10_001) {
         let entry = entry?;
         let name = entry.file_name();
@@ -519,6 +550,11 @@ pub(crate) fn cleanup(config: &HostConfig, store: &relay::Store) -> io::Result<u
         let Ok(finished_at) = successful_completion(&path, &path, &record, store) else {
             continue;
         };
+        match crate::publication::pending_retention(&transaction, record.task_id, now) {
+            Ok(Some(pending)) if pending.protected => continue,
+            Err(_) => continue,
+            _ => {}
+        }
         if now.saturating_sub(finished_at) < retention {
             continue;
         }
@@ -528,6 +564,7 @@ pub(crate) fn cleanup(config: &HostConfig, store: &relay::Store) -> io::Result<u
             break;
         }
     }
+    transaction.commit().map_err(io::Error::other)?;
     Ok(removed)
 }
 
@@ -681,6 +718,11 @@ fn inventory_entry(
         entry["references"] = json!(references);
         entry["references_complete"] = json!(complete);
         entry["successor_reserved"] = json!(reserved);
+        let publication_retention =
+            crate::publication::pending_retention(control, record.task_id, observed_at)?;
+        let released_publication = publication_retention
+            .as_ref()
+            .is_some_and(|pending| !pending.protected);
         if started.elapsed() < Duration::from_millis(250) {
             entry["allocated_usage"] = json!(crate::resources::measure_allocated_directory(
                 &directory, config
@@ -689,9 +731,15 @@ fn inventory_entry(
             entry["allocated_usage"]["reason"] =
                 json!("inventory request time bound reached before allocation observation");
         }
-        if active || current.state != relay::State::Finished || reserved {
+        if let Some(pending) = &publication_retention
+            && pending.protected
+        {
+            entry["retention"] = json!({"status":"protected","reason":pending.reason,"eligible_at":null,"authorization_expires_at":pending.expires_at});
+        } else if !released_publication
+            && (active || current.state != relay::State::Finished || reserved)
+        {
             entry["retention"] = json!({"status":"protected","reason":"an active/queued owner or reserved successor still references this workspace","eligible_at":null});
-        } else if !complete || !current_is_latest {
+        } else if !complete || (!current_is_latest && !released_publication) {
             return Err(io::Error::other(
                 "shared task history is incomplete or does not end at the current owner",
             ));
@@ -745,6 +793,10 @@ fn inventory_entry(
                     "eligible_at":eligible_at});
             } else {
                 entry["retention"] = json!({"status":"disabled","reason":"automatic successful-workspace retention is not configured; no cleanup is enabled by this preview","eligible_at":null});
+            }
+            if let Some(pending) = &publication_retention {
+                entry["retention"]["reason"] = json!(pending.reason);
+                entry["retention"]["authorization_expires_at"] = json!(pending.expires_at);
             }
         }
         Ok(())
@@ -819,7 +871,7 @@ pub(crate) fn read_stopped_result(path: &Path) -> io::Result<RunResult> {
     )?)
     .map_err(io::Error::other)
 }
-fn read_bounded_record(path: &Path, limit: u64) -> io::Result<String> {
+pub(crate) fn read_bounded_record(path: &Path, limit: u64) -> io::Result<String> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)

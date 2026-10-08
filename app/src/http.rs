@@ -46,6 +46,7 @@ pub fn router_with_auth(app: Arc<Application>, auth: Auth) -> Router {
             post(replacement_challenge),
         )
         .route("/tasks/{id}/continue-review", post(continue_review))
+        .route("/tasks/{id}/publish-approved", post(publish_approved))
         .layer(DefaultBodyLimit::max(96 * 1024))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
@@ -293,6 +294,16 @@ async fn continue_review(
         Json(state.app.continue_review(id, input)?),
     ))
 }
+async fn publish_approved(
+    State(state): State<Web>,
+    Path(id): Path<i64>,
+    Json(input): Json<crate::PublishApprovedRequest>,
+) -> Result<(StatusCode, Json<relay::Task>), ApiError> {
+    let task = tokio::task::spawn_blocking(move || state.app.publish_approved(id, input))
+        .await
+        .map_err(|_| Error::Poisoned)??;
+    Ok((StatusCode::CREATED, Json(task)))
+}
 struct ApiError(Error);
 impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
@@ -316,17 +327,21 @@ impl IntoResponse for ApiError {
         } else {
             self.0.to_string()
         };
-        let failure = match &self.0 {
-            Error::ActionUnavailable { code, cause } => {
-                Some(crate::resources::Failure::new(code, "request", cause))
-            }
-            Error::Invalid(cause) => Some(crate::resources::Failure::new(
-                "invalid_request",
-                "request",
-                cause,
-            )),
-            _ => None,
-        };
+        let failure =
+            match &self.0 {
+                Error::Core(relay::Error::IdempotencyConflict) => Some(
+                    crate::resources::Failure::new("idempotency_conflict", "request", &message),
+                ),
+                Error::ActionUnavailable { code, cause } => {
+                    Some(crate::resources::Failure::new(code, "request", cause))
+                }
+                Error::Invalid(cause) => Some(crate::resources::Failure::new(
+                    "invalid_request",
+                    "request",
+                    cause,
+                )),
+                _ => None,
+            };
         (status, Json(json!({"error":message,"failure":failure}))).into_response()
     }
 }

@@ -64,6 +64,7 @@ pub fn handle(app: &Application, request: Value) -> Option<Value> {
             {"name":"relay_submit","description":"Submit a requirement to the durable development queue; use the same key for retries.","inputSchema":{"type":"object","required":["key","job"],"properties":{"permission_challenge":{"type":"string","minLength":64,"maxLength":64},"key":{"type":"string","minLength":1,"maxLength":128},"job":{"type":"object","required":["repository","requirements","agent"],"properties":{"repository":{"type":"string"},"requirements":{"type":"string"},"agent":{"type":"string"},"test":{"type":["string","null"]},"publish":{"type":"boolean","default":false},"draft_pr_adapter":{"type":["string","null"]},"workflow":{"type":["string","null"]},"workspace_quota_bytes":{"type":["integer","null"],"minimum":1,"maximum":1099511627776u64},"role_selections":role_selections_schema()},"additionalProperties":false}},"additionalProperties":false}},
             {"name":"relay_retry","description":"Explicitly continue a stopped unsuccessful task in its preserved workspace. Inspect side effects first; repeated calls return the same successor.","inputSchema":{"type":"object","required":["id","key","confirm_stopped_and_reconciled"],"properties":{"replacement":role_selection_schema(),"permission_challenge":{"type":"string","minLength":64,"maxLength":64},"id":{"type":"integer","minimum":1},"key":{"type":"string","minLength":1,"maxLength":128},"confirm_stopped_and_reconciled":{"type":"boolean","const":true},"workspace_quota_bytes":{"type":["integer","null"],"minimum":1,"maximum":1099511627776u64}},"additionalProperties":false}},
             {"name":"relay_continue_review","description":"Explicitly continue only the interrupted review of the preserved candidate, rerunning its configured tests first and never invoking the developer. Confirm stopped execution and reconciled side effects. Optional review_focus is 1–8192 UTF-8 bytes; omit to retain the original focus. Original publication choice still applies after approval; prior publication attempts are not replayed. Shares one durable successor with relay_retry; the first reservation fixes its mode and focus.","inputSchema":{"type":"object","required":["id","key","confirm_stopped_and_reconciled","revalidate_tests"],"properties":{"replacement":role_selection_schema(),"permission_challenge":{"type":"string","minLength":64,"maxLength":64},"id":{"type":"integer","minimum":1},"key":{"type":"string","minLength":1,"maxLength":128},"confirm_stopped_and_reconciled":{"type":"boolean","const":true},"workspace_quota_bytes":{"type":["integer","null"],"minimum":1,"maximum":1099511627776u64},"revalidate_tests":{"type":"boolean","const":true},"review_focus":{"type":["string","null"],"minLength":1,"maxLength":8192,"description":"Optional review acceptance criteria, at most 8192 UTF-8 bytes. Omit or null to retain original focus."}},"additionalProperties":false}},
+            {"name":"relay_publish_approved","description":"Explicitly authorize draft publication of a successful, audited, unpublished candidate. First read relay_operator and copy the exact candidate, GitHub target, adapter and publisher_binding. User must confirm that exact publication and accept prior host test evidence: tests, development and review are not rerun, and external test inputs are not frozen or revalidated. Creates one publication-only successor; use the identical key and fields for retries. Authorization lasts 24 hours. Prior publication attempts with unknown effects cannot be replayed. A draft PR is not a merge.","inputSchema":{"type":"object","required":["id","key","confirm_publish","accept_prior_test_evidence","candidate_sha","github_repository","base_branch","draft_pr_adapter","publisher_binding"],"properties":{"id":{"type":"integer","minimum":1},"key":{"type":"string","minLength":1,"maxLength":128},"confirm_publish":{"type":"boolean","const":true},"accept_prior_test_evidence":{"type":"boolean","const":true},"candidate_sha":{"type":"string","pattern":"^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},"github_repository":{"type":"string","minLength":1,"maxLength":256},"base_branch":{"type":"string","minLength":1,"maxLength":128},"draft_pr_adapter":{"type":"string","minLength":1,"maxLength":128},"publisher_binding":{"type":"string","minLength":1,"maxLength":128}},"additionalProperties":false}},
             {"name":"relay_replacement_challenge","description":"Preview permission expansion for only the changed role at a proven stopped stage; scope binds predecessor, action, selection and composed host policy. Explicit attestation remains required.","inputSchema":{"type":"object","required":["id","action","replacement"],"properties":{"id":{"type":"integer","minimum":1},"action":{"enum":["retry","continue_review"]},"replacement":role_selection_schema()},"additionalProperties":false}},
             {"name":"relay_get","description":"Read one task and its durable result.","inputSchema":{"type":"object","required":["id"],"properties":{"id":{"type":"integer","minimum":1}},"additionalProperties":false}},
             {"name":"relay_list","description":"List the newest 100 tasks, optionally before a task ID.","inputSchema":{"type":"object","properties":{"before":{"type":"integer","minimum":1}},"additionalProperties":false}},
@@ -148,6 +149,25 @@ pub fn handle(app: &Application, request: Value) -> Option<Value> {
                                     app.continue_review(id, input)
                                         .map(|task| json!(task))
                                         .map_err(|e| e.to_string())
+                                })
+                        }
+                        None => Err("positive task id required".into()),
+                    }
+                }
+                Some("relay_publish_approved") => {
+                    let mut arguments = arguments;
+                    let id = arguments
+                        .as_object_mut()
+                        .and_then(|object| object.remove("id"))
+                        .and_then(|id| id.as_i64());
+                    match id.filter(|id| *id > 0) {
+                        Some(id) => {
+                            serde_json::from_value::<crate::PublishApprovedRequest>(arguments)
+                                .map_err(|error| error.to_string())
+                                .and_then(|input| {
+                                    app.publish_approved(id, input)
+                                        .map(|task| json!(task))
+                                        .map_err(application_error)
                                 })
                         }
                         None => Err("positive task id required".into()),

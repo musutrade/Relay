@@ -471,6 +471,64 @@ pub(crate) fn review_continuation(
     })
 }
 
+/// Only complete successful host-test and exact terminal approval evidence can
+/// authorize the separate publisher operation. Historical rounds stay intact.
+pub(crate) fn approved_publication_candidate(result: &RunResult) -> Result<(&str, &str), String> {
+    let invalid = || {
+        "publish-approved requires a successful unpublished workflow with complete successful host tests and an approved exact candidate; reconcile any publication attempt separately".to_string()
+    };
+    let workflow = result.workflow.as_ref().ok_or_else(invalid)?;
+    let base = workflow
+        .base_sha
+        .as_deref()
+        .filter(|sha| valid_sha(sha))
+        .ok_or_else(invalid)?;
+    let candidate = workflow
+        .candidate_sha
+        .as_deref()
+        .filter(|sha| valid_sha(sha))
+        .ok_or_else(invalid)?;
+    let tests = result.tests.as_ref().ok_or_else(invalid)?;
+    let round = workflow.rounds.last().ok_or_else(invalid)?;
+    let review = round.review.as_ref().ok_or_else(invalid)?;
+    if result.outcome != Outcome::Success
+        || result.error.is_some()
+        || result.failure.is_some()
+        || result.draft_pr.is_some()
+        || workflow.publication.is_some()
+        || workflow.reconciliation_required
+        || workflow.publish_approved.is_some()
+        || workflow.evidence_truncated
+        || workflow.reviewed_sha.as_deref() != Some(candidate)
+        || round.candidate_sha != candidate
+        || tests.outcome != Outcome::Success
+        || tests.exit_code != Some(0)
+        || tests.signal.is_some()
+        || tests.error.is_some()
+        || !round
+            .tests
+            .as_ref()
+            .is_some_and(|test| test.outcome == Outcome::Success && test.exit_code == Some(0))
+        || review.verdict != ReviewVerdict::Approved
+        || review.candidate_sha != candidate
+        || review.summary.trim().is_empty()
+        || !review.findings.is_empty()
+        || !(round.reviewer.as_ref().is_some_and(|reviewer| {
+            reviewer.outcome == Outcome::Success && reviewer.exit_code == Some(0)
+        }) || workflow.operator_adoption.as_ref().is_some_and(|adoption| {
+            adoption.provenance == "operator_attested" && adoption.accepted_prior_host_tests
+        }))
+    {
+        return Err(invalid());
+    }
+    ReviewResult::parse(
+        &serde_json::to_string(review).map_err(|_| invalid())?,
+        candidate,
+    )
+    .map_err(|_| invalid())?;
+    Ok((base, candidate))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicationResult {
     pub dry_run: bool,
@@ -487,6 +545,8 @@ pub struct WorkflowResult {
     pub review_continuation: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_adoption: Option<ReviewAdoptionReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_approved: Option<crate::publication::PublicationReceipt>,
     pub base_sha: Option<String>,
     pub candidate_sha: Option<String>,
     pub reviewed_sha: Option<String>,
@@ -502,6 +562,7 @@ impl WorkflowResult {
             name: name.into(),
             review_continuation: None,
             operator_adoption: None,
+            publish_approved: None,
             base_sha: None,
             candidate_sha: None,
             reviewed_sha: None,
@@ -1475,6 +1536,60 @@ fn run(
     result: &mut RunResult,
     workflow: &mut WorkflowResult,
 ) -> Result<(), Stop> {
+    if let Some(pinned) = crate::publication::current(context.job) {
+        // Branch before native probes, development, host tests and reviewer work.
+        // This operation consumes the immutable approved evidence exactly once.
+        let previous = crate::publication::verify_execution(
+            context.host.config(),
+            context.job,
+            context.workspace,
+            pinned,
+        )
+        .map_err(|error| Stop::failure(error.to_string()))?;
+        let base = context.prepare(config)?;
+        if base != pinned.base_sha {
+            return Err(Stop::failure("approved publication baseline changed"));
+        }
+        let candidate = &pinned.request.candidate_sha;
+        context.verify(config, candidate)?;
+        if crate::sessions::reviewer_checkout(&context.reviewer_profile()) {
+            let reviewer_repository = context.workspace.join("reviewer-repository");
+            if crate::workspaces::read_marker(&context.workspace.join("reviewer-candidate.txt"))
+                .map_err(|error| Stop::failure(error.to_string()))?
+                != *candidate
+            {
+                return Err(Stop::failure(
+                    "approved reviewer candidate checkpoint changed",
+                ));
+            }
+            Execution {
+                repository: &reviewer_repository,
+                ..*context
+            }
+            .verify(config, candidate)?;
+        }
+        if context.sha(config, context.repository, &format!("{base}^{{tree}}"))?
+            == context.sha(config, context.repository, &format!("{candidate}^{{tree}}"))?
+        {
+            return Err(Stop::failure(
+                "approved candidate has no changes to publish",
+            ));
+        }
+        *workflow = previous.workflow.expect("verified approved workflow");
+        workflow.publish_approved = Some(crate::publication::PublicationReceipt {
+            provenance: "inherited_approved_evidence".into(),
+            predecessor_task_id: context
+                .job
+                .continuation
+                .as_ref()
+                .expect("publication continuation")
+                .predecessor_task_id,
+            predecessor_result_sha256: pinned.predecessor_result_sha256.clone(),
+            accepted_prior_test_evidence: true,
+        });
+        result.tests = previous.tests;
+        return publish(context, config, result, workflow, &base, candidate);
+    }
     if let Some(adoption) = context
         .job
         .continuation
@@ -2129,6 +2244,12 @@ fn publish(
             adoption.predecessor_task_id, adoption.raw_sha256,
         );
     }
+    if let Some(handoff) = &workflow.publish_approved {
+        evidence = format!(
+            "Explicit publish-approved handoff from task {} (original result SHA-256 {}). Original tests and review are inherited evidence, not new executions. Prior host tests explicitly accepted without revalidation; external test inputs/provenance are not frozen. No development, test or reviewer command reran.\n{evidence}",
+            handoff.predecessor_task_id, handoff.predecessor_result_sha256,
+        );
+    }
     // Review JSON is already bounded at 4 KiB. Preserve final caveats in the
     // publication evidence rather than silently clipping a display preview.
     let extra: BTreeMap<String, String> = [
@@ -2154,6 +2275,18 @@ fn publish(
     .into_iter()
     .map(|(key, value)| (key.into(), value))
     .collect();
+    if let Some(pinned) = crate::publication::current(context.job) {
+        // Candidate verification may take time; never start an external effect
+        // after the fixed authorization window has closed.
+        crate::publication::verify_execution(
+            context.host.config(),
+            context.job,
+            context.workspace,
+            pinned,
+        )
+        .map_err(|error| Stop::failure(error.to_string()))?;
+    }
+    context.active()?;
     crate::workspaces::mark_publication(context.workspace, context.task)
         .map_err(|e| Stop::failure(e.to_string()))?;
     let publication = context.profile(profile, "draft-pr", &context.job.requirements, &extra);

@@ -185,6 +185,19 @@ impl Job {
         }) {
             return Err(HostError::Job("invalid continuation reference".into()));
         }
+        if let Some(continuation) = &self.continuation
+            && continuation.publish_approved.is_some()
+            && (self.publish
+                || continuation.review_only.is_some()
+                || continuation.operator_adoption.is_some()
+                || continuation.replacement.is_some()
+                || continuation.developer_stage.is_some()
+                || continuation.quota_increase.is_some())
+        {
+            return Err(HostError::Job(
+                "publish-approved must be a separate publication-only authorization".into(),
+            ));
+        }
         if self.requirements.trim().is_empty() || self.requirements.len() > MAX_REQUIREMENTS {
             return Err(HostError::Job(
                 "requirements must contain 1–32768 UTF-8 bytes".into(),
@@ -734,6 +747,32 @@ impl Host {
             Ok(job) => job,
             Err(error) => return RunResult::new(Outcome::Failure, Some(error.to_string())),
         };
+        if let Some(pinned) = crate::publication::current(&job)
+            && task.generation == 1
+        {
+            // Queued cancellation/expiry must not transfer the successful
+            // predecessor's workspace into failed ownership and pin it forever.
+            // Requeued generations must inspect the durable attempt marker first:
+            // expiry/cancellation cannot establish that an earlier publisher did
+            // not run or erase its external-effect reconciliation requirement.
+            if cancellation.load(Ordering::Acquire) {
+                return RunResult::new(
+                    Outcome::Cancelled,
+                    Some(
+                        "publication cancelled before workspace acquisition; no publisher ran"
+                            .into(),
+                    ),
+                );
+            }
+            if crate::publication::now().map_or(true, |now| now >= pinned.expires_at_unix_seconds) {
+                return RunResult::new(
+                    Outcome::Failure,
+                    Some(
+                        "publication authorization expired after 24 hours; no publisher ran".into(),
+                    ),
+                );
+            }
+        }
         if cancellation.load(Ordering::Acquire)
             && !crate::workspaces::exists_for(&self.config, task, &job)
         {
