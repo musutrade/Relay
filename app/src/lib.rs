@@ -10,6 +10,7 @@ mod git_inventory;
 pub mod host;
 pub mod http;
 mod kiro_acp;
+pub mod merge_authorization;
 mod publication;
 pub use publication::PublishApprovedRequest;
 pub mod mcp;
@@ -166,6 +167,7 @@ pub struct Application {
     ci_database_identity: String,
     ci_storage_root: std::path::PathBuf,
     ci_running: Mutex<CiRunning>,
+    merge_running: Mutex<CiRunning>,
     permission_challenges: Mutex<selection::PermissionChallenges>,
     resource_measurements:
         Mutex<std::collections::BTreeMap<(i64, i64), (std::time::Instant, resources::Usage)>>,
@@ -184,6 +186,7 @@ impl Application {
         // Adapter-owned metadata. It does not change the core queue state machine.
         control.execute_batch("CREATE TABLE IF NOT EXISTS app_continuations(predecessor_id INTEGER PRIMARY KEY, key TEXT NOT NULL, payload TEXT NOT NULL, task_id INTEGER); CREATE TABLE IF NOT EXISTS app_cancellations(task_id INTEGER PRIMARY KEY REFERENCES tasks(id)); CREATE TABLE IF NOT EXISTS app_diagnostics(task_id INTEGER PRIMARY KEY, generation INTEGER NOT NULL, result TEXT NOT NULL);")?;
         ci_tracking::initialize(&control)?;
+        merge_authorization::initialize(&control)?;
         let ci_database_identity = publication::digest(
             db.as_ref()
                 .canonicalize()
@@ -200,6 +203,7 @@ impl Application {
             ci_database_identity,
             ci_storage_root,
             ci_running: Mutex::new(None),
+            merge_running: Mutex::new(None),
             permission_challenges: Mutex::new(selection::PermissionChallenges::default()),
             resource_measurements: Mutex::new(std::collections::BTreeMap::new()),
             catalogs: Mutex::new(catalog_cache::CatalogCache::default()),
@@ -1311,6 +1315,11 @@ impl Application {
     }
     pub fn stop(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        if let Ok(running) = self.merge_running.lock()
+            && let Some((_, _, flag)) = &*running
+        {
+            flag.store(true, Ordering::SeqCst);
+        }
         if let Ok(running) = self.ci_running.lock()
             && let Some((_, _, flag)) = &*running
         {

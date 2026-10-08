@@ -24,6 +24,28 @@ fn role_selections_schema() -> Value {
     json!({"type":"object","minProperties":1,"additionalProperties":false,"properties":{"developer":choice,"reviewer":choice}})
 }
 
+fn merge_authorize_schema() -> Value {
+    json!({"type":"object","additionalProperties":false,
+        "required":["id","key","confirm_merge","policy","policy_digest","ci_track_id","scope_digest","deadline","allow_ready","accept_non_atomic_target_guard","deadline_semantics","accept_existing_automation","risk_disclosure_version","risk_disclosure_sha256"],
+        "properties":{
+            "id":{"type":"integer","minimum":1},
+            "key":{"type":"string","minLength":1,"maxLength":128},
+            "confirm_merge":{"type":"boolean","const":true},
+            "policy":{"type":"string","minLength":1,"maxLength":128},
+            "policy_digest":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+            "ci_track_id":{"type":"integer","minimum":1},
+            "scope_digest":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+            "deadline":{"type":"integer","minimum":1},
+            "allow_ready":{"type":"boolean","description":"Explicitly allow draft-to-ready only if the named host policy permits it; false by default."},
+            "accept_non_atomic_target_guard":{"type":"boolean","const":true},
+            "deadline_semantics":{"type":"string","const":"last_dispatch"},
+            "accept_existing_automation":{"type":"boolean","const":true},
+            "risk_disclosure_version":{"type":"integer","const":1},
+            "risk_disclosure_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}
+        }
+    })
+}
+
 pub fn handle(app: &Application, request: Value) -> Option<Value> {
     let id = request.get("id").cloned();
     let method = request.get("method").and_then(Value::as_str);
@@ -65,6 +87,12 @@ pub fn handle(app: &Application, request: Value) -> Option<Value> {
             {"name":"relay_retry","description":"Explicitly continue a stopped unsuccessful task in its preserved workspace. Inspect side effects first; repeated calls return the same successor.","inputSchema":{"type":"object","required":["id","key","confirm_stopped_and_reconciled"],"properties":{"replacement":role_selection_schema(),"permission_challenge":{"type":"string","minLength":64,"maxLength":64},"id":{"type":"integer","minimum":1},"key":{"type":"string","minLength":1,"maxLength":128},"confirm_stopped_and_reconciled":{"type":"boolean","const":true},"workspace_quota_bytes":{"type":["integer","null"],"minimum":1,"maximum":1099511627776u64}},"additionalProperties":false}},
             {"name":"relay_continue_review","description":"Explicitly continue only the interrupted review of the preserved candidate, rerunning its configured tests first and never invoking the developer. Confirm stopped execution and reconciled side effects. Optional review_focus is 1–8192 UTF-8 bytes; omit to retain the original focus. Original publication choice still applies after approval; prior publication attempts are not replayed. Shares one durable successor with relay_retry; the first reservation fixes its mode and focus.","inputSchema":{"type":"object","required":["id","key","confirm_stopped_and_reconciled","revalidate_tests"],"properties":{"replacement":role_selection_schema(),"permission_challenge":{"type":"string","minLength":64,"maxLength":64},"id":{"type":"integer","minimum":1},"key":{"type":"string","minLength":1,"maxLength":128},"confirm_stopped_and_reconciled":{"type":"boolean","const":true},"workspace_quota_bytes":{"type":["integer","null"],"minimum":1,"maximum":1099511627776u64},"revalidate_tests":{"type":"boolean","const":true},"review_focus":{"type":["string","null"],"minLength":1,"maxLength":8192,"description":"Optional review acceptance criteria, at most 8192 UTF-8 bytes. Omit or null to retain original focus."}},"additionalProperties":false}},
             {"name":"relay_publish_approved","description":"Explicitly authorize draft publication of a successful, audited, unpublished candidate. First read relay_operator and copy the exact candidate, GitHub target, adapter and publisher_binding. User must confirm that exact publication and accept prior host test evidence: tests, development and review are not rerun, and external test inputs are not frozen or revalidated. Creates one publication-only successor; use the identical key and fields for retries. Authorization lasts 24 hours. Prior publication attempts with unknown effects cannot be replayed. A draft PR is not a merge.","inputSchema":{"type":"object","required":["id","key","confirm_publish","accept_prior_test_evidence","candidate_sha","github_repository","base_branch","draft_pr_adapter","publisher_binding"],"properties":{"id":{"type":"integer","minimum":1},"key":{"type":"string","minLength":1,"maxLength":128},"confirm_publish":{"type":"boolean","const":true},"accept_prior_test_evidence":{"type":"boolean","const":true},"candidate_sha":{"type":"string","pattern":"^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},"github_repository":{"type":"string","minLength":1,"maxLength":256},"base_branch":{"type":"string","minLength":1,"maxLength":128},"draft_pr_adapter":{"type":"string","minLength":1,"maxLength":128},"publisher_binding":{"type":"string","minLength":1,"maxLength":128}},"additionalProperties":false}},
+            {"name":"relay_merge_preview","description":"Read local trustworthy publication/CI identity, default-off host merge policies, the complete risk disclosure and persisted authorizations. No GitHub contact or process starts. A configured policy is not consent; show the exact repository, numeric IDs, PR, HEAD, base branch, method, CI source, validity window and complete disclosure before asking the user to authorize.","inputSchema":{"type":"object","required":["id"],"additionalProperties":false,"properties":{"id":{"type":"integer","minimum":1}}}},
+            {"name":"relay_merge_list","description":"List local merge authorization records for a publication task. Read-only; does not authorize or dispatch any remote action.","inputSchema":{"type":"object","required":["id"],"additionalProperties":false,"properties":{"id":{"type":"integer","minimum":1}}}},
+            {"name":"relay_merge_get","description":"Read one local merge authorization, revision, immutable consent and remote request state. Accepted or pending does not mean merged. Remote observed merge is distinct from Relay-confirmed merge.","inputSchema":{"type":"object","required":["id"],"additionalProperties":false,"properties":{"id":{"type":"integer","minimum":1}}}},
+            {"name":"relay_authorize_merge","description":"Explicitly authorize one immutable, default-off exact-HEAD async GitHub merge after user confirmation of relay_merge_preview scope and full disclosure. CI may still be waiting. Copy policy/scope/disclosure digests and deadline; never invent consent. GitHub locks HEAD and bypass_rules=false, but base/stack/ready checks are non-atomic; observed stacks, queues and existing auto-merge are refused. Already-dispatched or accepted async work may finish after expiry/revoke; accepted work has no documented cancellation. Deadline is last dispatch, not completion. Existing repository automation, including configured branch deletion, can run on merge; Relay issues no separate delete/deploy/settings actions. Freeze identical key and fields on unknown response; new HEAD/target/config invalidates authorization. Never automatically retry unknown external effects.","inputSchema":merge_authorize_schema()},
+            {"name":"relay_merge_revoke","description":"Revoke future writes for this authorization at expected_revision. Already-dispatched or accepted GitHub work may still finish; this is not remote cancellation. Does not change scope or authorize another write.","inputSchema":{"type":"object","required":["id","expected_revision"],"additionalProperties":false,"properties":{"id":{"type":"integer","minimum":1},"expected_revision":{"type":"integer","minimum":1}}}},
+            {"name":"relay_merge_reconcile","description":"Explicitly request read-only remote reconciliation of this fixed authorization at expected_revision. Never authorizes or redispatches a write, even after revoke/expiry or unknown effects. Unknown local processes require trusted local recovery; this tool cannot bypass that gate.","inputSchema":{"type":"object","required":["id","expected_revision"],"additionalProperties":false,"properties":{"id":{"type":"integer","minimum":1},"expected_revision":{"type":"integer","minimum":1}}}},
             {"name":"relay_ci_preview","description":"Read local publication identity, host-allowlisted CI policies and persisted tracks. This does not contact GitHub or start any process.","inputSchema":{"type":"object","required":["id"],"additionalProperties":false,"properties":{"id":{"type":"integer","minimum":1}}}},
             {"name":"relay_track_ci","description":"Explicitly start read-only background CI tracking for a successful real publication. Copy policy and policy_digest from relay_ci_preview and keep the same key for exact retries. The published SHA and PR are fixed; no developer, tests or reviewer run, no queue claim is held, and no merge occurs. Configured checks passed does not establish remote merge eligibility.","inputSchema":{"type":"object","required":["id","key","policy","policy_digest"],"additionalProperties":false,"properties":{"id":{"type":"integer","minimum":1},"key":{"type":"string","minLength":1,"maxLength":128},"policy":{"type":"string","minLength":1,"maxLength":128},"policy_digest":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}},
             {"name":"relay_ci_get","description":"Read one persisted CI tracking record without network or subprocess activity. configured_checks_passed means configured checks passed; remote merge eligibility not established. Draft PR remains draft.","inputSchema":{"type":"object","required":["id"],"additionalProperties":false,"properties":{"id":{"type":"integer","minimum":1}}}},
@@ -176,6 +204,68 @@ pub fn handle(app: &Application, request: Value) -> Option<Value> {
                                 })
                         }
                         None => Err("positive task id required".into()),
+                    }
+                }
+                Some("relay_merge_preview" | "relay_merge_list" | "relay_merge_get") => {
+                    #[derive(serde::Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Input {
+                        id: i64,
+                    }
+                    serde_json::from_value::<Input>(arguments)
+                        .map_err(|error| error.to_string())
+                        .and_then(|input| {
+                            if input.id <= 0 {
+                                return Err("positive id required".into());
+                            }
+                            match params["name"].as_str() {
+                                Some("relay_merge_preview") => {
+                                    app.merge_preview(input.id).map_err(application_error)
+                                }
+                                Some("relay_merge_list") => app
+                                    .merge_for_task(input.id)
+                                    .map(|records| json!(records))
+                                    .map_err(application_error),
+                                _ => app
+                                    .merge_get(input.id)
+                                    .map(|record| json!(record))
+                                    .map_err(application_error),
+                            }
+                        })
+                }
+                Some("relay_authorize_merge" | "relay_merge_revoke" | "relay_merge_reconcile") => {
+                    let mut arguments = arguments;
+                    let id = arguments
+                        .as_object_mut()
+                        .and_then(|object| object.remove("id"))
+                        .and_then(|id| id.as_i64());
+                    match id.filter(|id| *id > 0) {
+                        Some(id) if params["name"] == "relay_authorize_merge" => {
+                            serde_json::from_value::<
+                                crate::merge_authorization::MergeAuthorizeRequest,
+                            >(arguments)
+                            .map_err(|error| error.to_string())
+                            .and_then(|input| {
+                                app.merge_authorize(id, input)
+                                    .map(|record| json!(record))
+                                    .map_err(application_error)
+                            })
+                        }
+                        Some(id) => serde_json::from_value::<
+                            crate::merge_authorization::MergeControlRequest,
+                        >(arguments)
+                        .map_err(|error| error.to_string())
+                        .and_then(|input| {
+                            let result = if params["name"] == "relay_merge_revoke" {
+                                app.merge_revoke(id, input)
+                            } else {
+                                app.merge_reconcile(id, input)
+                            };
+                            result
+                                .map(|record| json!(record))
+                                .map_err(application_error)
+                        }),
+                        None => Err("positive id required".into()),
                     }
                 }
                 Some("relay_ci_preview" | "relay_ci_get") => {

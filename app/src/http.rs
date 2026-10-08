@@ -53,6 +53,15 @@ pub fn router_with_auth(app: Arc<Application>, auth: Auth) -> Router {
         .route("/ci-tracks/{id}", get(ci_get))
         .route("/ci-tracks/{id}/stop", post(ci_stop))
         .route("/ci-tracks/{id}/resume", post(ci_resume))
+        .route("/tasks/{id}/merge-preview", get(merge_preview))
+        .route("/tasks/{id}/merge-authorizations", get(merge_for_task))
+        .route("/tasks/{id}/authorize-merge", post(merge_authorize))
+        .route("/merge-authorizations/{id}", get(merge_get))
+        .route("/merge-authorizations/{id}/revoke", post(merge_revoke))
+        .route(
+            "/merge-authorizations/{id}/reconcile",
+            post(merge_reconcile),
+        )
         .layer(DefaultBodyLimit::max(96 * 1024))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
@@ -364,6 +373,78 @@ async fn ci_resume(
         .await
         .map_err(|_| Error::Poisoned)??;
     Ok(Json(json!(track)))
+}
+async fn merge_preview(
+    State(state): State<Web>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    if id <= 0 {
+        return Err(Error::Invalid("positive id required".into()).into());
+    }
+    let result = tokio::task::spawn_blocking(move || state.app.merge_preview(id))
+        .await
+        .map_err(|_| Error::Poisoned)??;
+    Ok(Json(json!(result)))
+}
+async fn merge_for_task(
+    State(state): State<Web>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    if id <= 0 {
+        return Err(Error::Invalid("positive id required".into()).into());
+    }
+    let result = tokio::task::spawn_blocking(move || state.app.merge_for_task(id))
+        .await
+        .map_err(|_| Error::Poisoned)??;
+    Ok(Json(json!(result)))
+}
+async fn merge_get(State(state): State<Web>, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    if id <= 0 {
+        return Err(Error::Invalid("positive id required".into()).into());
+    }
+    let result = tokio::task::spawn_blocking(move || state.app.merge_get(id))
+        .await
+        .map_err(|_| Error::Poisoned)??;
+    Ok(Json(json!(result)))
+}
+async fn merge_authorize(
+    State(state): State<Web>,
+    Path(id): Path<i64>,
+    Json(input): Json<crate::merge_authorization::MergeAuthorizeRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if id <= 0 {
+        return Err(Error::Invalid("positive id required".into()).into());
+    }
+    let result = tokio::task::spawn_blocking(move || state.app.merge_authorize(id, input))
+        .await
+        .map_err(|_| Error::Poisoned)??;
+    Ok((StatusCode::CREATED, Json(json!(result))))
+}
+async fn merge_revoke(
+    State(state): State<Web>,
+    Path(id): Path<i64>,
+    Json(input): Json<crate::merge_authorization::MergeControlRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if id <= 0 {
+        return Err(Error::Invalid("positive id required".into()).into());
+    }
+    let result = tokio::task::spawn_blocking(move || state.app.merge_revoke(id, input))
+        .await
+        .map_err(|_| Error::Poisoned)??;
+    Ok(Json(json!(result)))
+}
+async fn merge_reconcile(
+    State(state): State<Web>,
+    Path(id): Path<i64>,
+    Json(input): Json<crate::merge_authorization::MergeControlRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if id <= 0 {
+        return Err(Error::Invalid("positive id required".into()).into());
+    }
+    let result = tokio::task::spawn_blocking(move || state.app.merge_reconcile(id, input))
+        .await
+        .map_err(|_| Error::Poisoned)??;
+    Ok(Json(json!(result)))
 }
 struct ApiError(Error);
 impl From<Error> for ApiError {

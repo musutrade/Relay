@@ -58,6 +58,8 @@ function fixture(authMode = 'bearer', restored = false) {
     if (url === '/auth/status') data = {mode: authMode, authenticated: f.authenticated};
     else if (url === '/auth/login') { f.authenticated = true; data = {authenticated: true}; }
     else if (url === '/auth/logout') { f.authenticated = false; data = {authenticated: false}; delayed = f.delayLogout; }
+    else if (url.endsWith('/merge-preview'))data={eligible:false,reason:'Merge disabled in fixture',policies:[],authorizations:[],risk_disclosure:null,lane_diagnostic:null};
+    else if(url.endsWith('/merge-authorizations'))data=[];
     else if (url === '/api/config') { data = f.config; delayed = f.delayConfig; }
     else if (url === '/api/tasks') data = [];
     else if (url === '/api/status') data = {active: null, recovery_required: false, diagnostic: null};

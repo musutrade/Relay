@@ -64,6 +64,8 @@ POST /api/tasks/<id>/track-ci   # 显式启动固定 PR/SHA/来源的只读 CI �
 
 真实发布后可以[跟踪同一候选的 CI](docs/exact-head-ci-tracking.md)：独立应用 worker 查询宿主允许的精确 GitHub Actions 来源，等待不占开发队列 claim，不调用模型。“已配置检查通过”不表示远端允许合并，也不会自动转正 draft 或合并。
 
+需要自动推进时，可再[明确授权同一候选的异步合并](docs/authorized-async-merge.md)：默认关闭，按 PR 保存完整同意；可选先转正 draft，再等待新鲜检查并使用 GitHub 不绕过规则的精确 SHA 请求。已受理不等于已合并，过期或撤销不能取消已发出的远端请求。
+
 ## 可靠性边界
 
 - 内核最大 payload 64 KiB、result 16 KiB；key / owner 1–128 UTF-8 字节
