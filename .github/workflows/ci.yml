@@ -38,6 +38,10 @@ jobs:
         env:
           RELAY_UI_SCREENSHOTS: .relay/ui-smoke
         run: python3 app/tests/ui_publication_smoke.py
+      - name: Check exact-HEAD CI tracking on desktop and mobile
+        env:
+          RELAY_UI_SCREENSHOTS: .relay/ui-smoke
+        run: python3 app/tests/ui_ci_tracking_smoke.py
       - name: Preserve fake-data UI screenshots
         if: always()
         uses: actions/upload-artifact@v7.0.1

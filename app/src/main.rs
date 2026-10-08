@@ -13,6 +13,21 @@ fn main() {
 }
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("confirm-ci-stopped") {
+        if args.len() != 7 || args[6] != "--confirm-process-tree-stopped" {
+            return Err("usage: relay-app confirm-ci-stopped <config.json> <db-path> <track-id> <attempt> --confirm-process-tree-stopped\nUse only after inspecting this exact retained CI process tree and confirming it stopped.".into());
+        }
+        let app = Application::open(&args[3], HostConfig::load(&args[2])?)?;
+        println!(
+            "{}",
+            serde_json::to_string(&app.confirm_ci_stopped(
+                args[4].parse()?,
+                args[5].parse()?,
+                true
+            )?)?
+        );
+        return Ok(());
+    }
     if args.get(1).map(String::as_str) == Some("adopt-review") {
         if args.len() != 6 {
             return Err("usage: relay-app adopt-review <config.json> <db-path> <predecessor-id> <request.json>".into());
@@ -125,6 +140,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     let worker_app = Arc::clone(&app);
     let worker = std::thread::spawn(move || worker_app.worker());
+    let ci_app = Arc::clone(&app);
+    let ci_worker = std::thread::spawn(move || ci_app.ci_worker());
     let signal_app = Arc::clone(&app);
     let served = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -139,6 +156,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     worker
         .join()
         .map_err(|_| "worker panicked; inspect active claim before restarting")?;
+    ci_worker
+        .join()
+        .map_err(|_| "CI worker panicked; inspect retained CI process guard before resuming")?;
     served?;
     Ok(())
 }

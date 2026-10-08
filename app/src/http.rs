@@ -47,6 +47,12 @@ pub fn router_with_auth(app: Arc<Application>, auth: Auth) -> Router {
         )
         .route("/tasks/{id}/continue-review", post(continue_review))
         .route("/tasks/{id}/publish-approved", post(publish_approved))
+        .route("/tasks/{id}/ci-preview", get(ci_preview))
+        .route("/tasks/{id}/ci-tracks", get(ci_for_task))
+        .route("/tasks/{id}/track-ci", post(ci_start))
+        .route("/ci-tracks/{id}", get(ci_get))
+        .route("/ci-tracks/{id}/stop", post(ci_stop))
+        .route("/ci-tracks/{id}/resume", post(ci_resume))
         .layer(DefaultBodyLimit::max(96 * 1024))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
@@ -303,6 +309,61 @@ async fn publish_approved(
         .await
         .map_err(|_| Error::Poisoned)??;
     Ok((StatusCode::CREATED, Json(task)))
+}
+async fn ci_preview(
+    State(state): State<Web>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        tokio::task::spawn_blocking(move || state.app.ci_preview(id))
+            .await
+            .map_err(|_| Error::Poisoned)??,
+    ))
+}
+async fn ci_for_task(
+    State(state): State<Web>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let tracks = tokio::task::spawn_blocking(move || state.app.ci_for_task(id))
+        .await
+        .map_err(|_| Error::Poisoned)??;
+    Ok(Json(json!(tracks)))
+}
+async fn ci_get(State(state): State<Web>, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    let track = tokio::task::spawn_blocking(move || state.app.ci_get(id))
+        .await
+        .map_err(|_| Error::Poisoned)??;
+    Ok(Json(json!(track)))
+}
+async fn ci_start(
+    State(state): State<Web>,
+    Path(id): Path<i64>,
+    Json(input): Json<crate::ci_tracking::CiStartRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let track = tokio::task::spawn_blocking(move || state.app.ci_start(id, input))
+        .await
+        .map_err(|_| Error::Poisoned)??;
+    Ok((StatusCode::CREATED, Json(json!(track))))
+}
+async fn ci_stop(
+    State(state): State<Web>,
+    Path(id): Path<i64>,
+    Json(input): Json<crate::ci_tracking::CiControlRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let track = tokio::task::spawn_blocking(move || state.app.ci_stop(id, input))
+        .await
+        .map_err(|_| Error::Poisoned)??;
+    Ok(Json(json!(track)))
+}
+async fn ci_resume(
+    State(state): State<Web>,
+    Path(id): Path<i64>,
+    Json(input): Json<crate::ci_tracking::CiControlRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let track = tokio::task::spawn_blocking(move || state.app.ci_resume(id, input))
+        .await
+        .map_err(|_| Error::Poisoned)??;
+    Ok(Json(json!(track)))
 }
 struct ApiError(Error);
 impl From<Error> for ApiError {

@@ -77,6 +77,8 @@ pub struct HostConfig {
     pub tests: BTreeMap<String, CommandProfile>,
     #[serde(default)]
     pub draft_pr_adapters: BTreeMap<String, CommandProfile>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ci_policies: BTreeMap<String, crate::ci_tracking::CiPolicy>,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
     #[serde(default = "default_output")]
@@ -570,6 +572,7 @@ impl Host {
             .chain(config.workflows.keys())
             .chain(config.tests.keys())
             .chain(config.draft_pr_adapters.keys())
+            .chain(config.ci_policies.keys())
         {
             if name.is_empty()
                 || name.len() > 128
@@ -596,6 +599,7 @@ impl Host {
             .values()
             .chain(config.tests.values())
             .chain(config.draft_pr_adapters.values())
+            .chain(config.ci_policies.values().map(|policy| &policy.observer))
         {
             if !profile.program.is_absolute() || !profile.program.is_file() {
                 return Err(HostError::Config(
@@ -614,6 +618,9 @@ impl Host {
                     "invalid command argument or environment".into(),
                 ));
             }
+        }
+        for policy in config.ci_policies.values() {
+            policy.validate().map_err(HostError::Config)?;
         }
         for workflow in config.workflows.values() {
             workflow.validate(&config)?;
@@ -1489,6 +1496,52 @@ impl Host {
             result.error = Some(format!("cannot persist completed session: {error}"));
         }
         result
+    }
+
+    /// Independent read-only CI lane. It has no core claim or task workspace.
+    /// The exact durable guard open-file description is inherited by supervisor.
+    pub(crate) fn run_ci_observer(
+        &self,
+        profile: &CommandProfile,
+        input: &str,
+        workspace: &Path,
+        guard: Arc<File>,
+        cancellation: &AtomicBool,
+        timeout_seconds: u64,
+    ) -> CommandResult {
+        let mut config = self.config.clone();
+        config.max_workspace_bytes = Some(1024 * 1024);
+        config.max_snapshot_entries = 128;
+        let lane = Self {
+            config,
+            supervisor: self.supervisor.clone(),
+            leases: Mutex::new(BTreeMap::from([(workspace.to_path_buf(), guard)])),
+            model_observations: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        let mut env = profile.env.clone();
+        env.insert("RELAY_CI_OBSERVE".into(), "1".into());
+        lane.run_supervised(
+            CommandSpec {
+                workspace_lease: false,
+                git_inventory: false,
+                catalog: false,
+                claude_control: false,
+                app_server: None,
+                provider: None,
+                read_only: false,
+                clear_env: false,
+                program: profile.program.clone(),
+                args: profile.args.clone(),
+                env,
+                cwd: workspace.to_path_buf(),
+                input: input.to_owned(),
+                timeout_ms: timeout_seconds * 1000,
+                output_limit_bytes: 64 * 1024,
+            },
+            cancellation,
+            workspace,
+            "ci-observer",
+        )
     }
 
     pub(crate) fn run_supervised(
