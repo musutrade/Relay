@@ -250,6 +250,15 @@ with sync_playwright() as p:
             # it generated a fresh key and opened its dialog before another tab.
             data['frozen_lists'].pop(req.frame.page,None)
             result=task_response(result)
+        elif path.startswith('/api/tasks/') and path.endswith(('/ci-preview','/ci-tracks')):
+            assert req.method=='GET' and not req.post_data
+            task_id=int(path.split('/')[-2])
+            assert any(value['id']==task_id for value in data['tasks'])
+            # These recovery fixtures have no successful real publication receipt.
+            result=[] if path.endswith('/ci-tracks') else {'eligible':False,'reason':'Fixture has no real publication receipt','publication':None,'policies':[],'tracks':[],'remote_merge_eligibility':'not_established'}
+        elif path.startswith('/api/ci-tracks/'):
+            assert req.method=='GET' and not req.post_data
+            r.fulfill(status=404,content_type='application/json',body=json.dumps({'error':'CI track does not exist'}));return
         elif path.endswith('/cancel'): result={'requested':True}
         elif path.startswith('/api/tasks/'): result=task_response(next(t for t in data['tasks'] if t['id']==int(path.rsplit('/',1)[-1])))
         else: raise Exception(path)

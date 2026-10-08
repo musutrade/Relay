@@ -92,8 +92,23 @@ try:
                         response = [task(2), task(1)]
                     elif path.endswith('/operator'):
                         response = operator(task(int(path.split('/')[-2])))
-                    elif path.endswith('/ci-preview'):
-                        response = data['ci']
+                    elif path.startswith('/api/tasks/') and path.endswith(('/ci-preview', '/ci-tracks')):
+                        assert req.method == 'GET' and not req.post_data
+                        task_id = int(path.split('/')[-2])
+                        assert task_id in (1, 2)
+                        ci = data['ci'] if task_id == 1 else {
+                            'eligible': False, 'reason': 'Fixture has no real publication receipt',
+                            'publication': None, 'policies': [], 'tracks': [],
+                            'remote_merge_eligibility': 'not_established'}
+                        response = ci['tracks'] if path.endswith('/ci-tracks') else ci
+                    elif path.startswith('/api/ci-tracks/') and req.method == 'GET':
+                        assert not req.post_data
+                        track_id = int(path.split('/')[-1])
+                        response = next((value for value in data['ci']['tracks'] if value['id'] == track_id), None)
+                        if response is None:
+                            intercept.fulfill(status=404, content_type='application/json',
+                                body=json.dumps({'error': 'CI track does not exist'}))
+                            return
                     elif req.method == 'POST':
                         body = req.post_data_json
                         posts.append((path, copy.deepcopy(body)))
