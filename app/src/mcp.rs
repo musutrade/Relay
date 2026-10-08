@@ -65,6 +65,11 @@ pub fn handle(app: &Application, request: Value) -> Option<Value> {
             {"name":"relay_retry","description":"Explicitly continue a stopped unsuccessful task in its preserved workspace. Inspect side effects first; repeated calls return the same successor.","inputSchema":{"type":"object","required":["id","key","confirm_stopped_and_reconciled"],"properties":{"replacement":role_selection_schema(),"permission_challenge":{"type":"string","minLength":64,"maxLength":64},"id":{"type":"integer","minimum":1},"key":{"type":"string","minLength":1,"maxLength":128},"confirm_stopped_and_reconciled":{"type":"boolean","const":true},"workspace_quota_bytes":{"type":["integer","null"],"minimum":1,"maximum":1099511627776u64}},"additionalProperties":false}},
             {"name":"relay_continue_review","description":"Explicitly continue only the interrupted review of the preserved candidate, rerunning its configured tests first and never invoking the developer. Confirm stopped execution and reconciled side effects. Optional review_focus is 1–8192 UTF-8 bytes; omit to retain the original focus. Original publication choice still applies after approval; prior publication attempts are not replayed. Shares one durable successor with relay_retry; the first reservation fixes its mode and focus.","inputSchema":{"type":"object","required":["id","key","confirm_stopped_and_reconciled","revalidate_tests"],"properties":{"replacement":role_selection_schema(),"permission_challenge":{"type":"string","minLength":64,"maxLength":64},"id":{"type":"integer","minimum":1},"key":{"type":"string","minLength":1,"maxLength":128},"confirm_stopped_and_reconciled":{"type":"boolean","const":true},"workspace_quota_bytes":{"type":["integer","null"],"minimum":1,"maximum":1099511627776u64},"revalidate_tests":{"type":"boolean","const":true},"review_focus":{"type":["string","null"],"minLength":1,"maxLength":8192,"description":"Optional review acceptance criteria, at most 8192 UTF-8 bytes. Omit or null to retain original focus."}},"additionalProperties":false}},
             {"name":"relay_publish_approved","description":"Explicitly authorize draft publication of a successful, audited, unpublished candidate. First read relay_operator and copy the exact candidate, GitHub target, adapter and publisher_binding. User must confirm that exact publication and accept prior host test evidence: tests, development and review are not rerun, and external test inputs are not frozen or revalidated. Creates one publication-only successor; use the identical key and fields for retries. Authorization lasts 24 hours. Prior publication attempts with unknown effects cannot be replayed. A draft PR is not a merge.","inputSchema":{"type":"object","required":["id","key","confirm_publish","accept_prior_test_evidence","candidate_sha","github_repository","base_branch","draft_pr_adapter","publisher_binding"],"properties":{"id":{"type":"integer","minimum":1},"key":{"type":"string","minLength":1,"maxLength":128},"confirm_publish":{"type":"boolean","const":true},"accept_prior_test_evidence":{"type":"boolean","const":true},"candidate_sha":{"type":"string","pattern":"^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},"github_repository":{"type":"string","minLength":1,"maxLength":256},"base_branch":{"type":"string","minLength":1,"maxLength":128},"draft_pr_adapter":{"type":"string","minLength":1,"maxLength":128},"publisher_binding":{"type":"string","minLength":1,"maxLength":128}},"additionalProperties":false}},
+            {"name":"relay_ci_preview","description":"Read local publication identity, host-allowlisted CI policies and persisted tracks. This does not contact GitHub or start any process.","inputSchema":{"type":"object","required":["id"],"additionalProperties":false,"properties":{"id":{"type":"integer","minimum":1}}}},
+            {"name":"relay_track_ci","description":"Explicitly start read-only background CI tracking for a successful real publication. Copy policy and policy_digest from relay_ci_preview and keep the same key for exact retries. The published SHA and PR are fixed; no developer, tests or reviewer run, no queue claim is held, and no merge occurs. Configured checks passed does not establish remote merge eligibility.","inputSchema":{"type":"object","required":["id","key","policy","policy_digest"],"additionalProperties":false,"properties":{"id":{"type":"integer","minimum":1},"key":{"type":"string","minLength":1,"maxLength":128},"policy":{"type":"string","minLength":1,"maxLength":128},"policy_digest":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}},
+            {"name":"relay_ci_get","description":"Read one persisted CI tracking record without network or subprocess activity. configured_checks_passed means configured checks passed; remote merge eligibility not established. Draft PR remains draft.","inputSchema":{"type":"object","required":["id"],"additionalProperties":false,"properties":{"id":{"type":"integer","minimum":1}}}},
+            {"name":"relay_ci_stop","description":"Request stopping CI observation at the expected persisted revision. Active observation must be safely reclaimed before stopped is established; an unknown process requires trusted local reconciliation.","inputSchema":{"type":"object","required":["id","expected_revision"],"additionalProperties":false,"properties":{"id":{"type":"integer","minimum":1},"expected_revision":{"type":"integer","minimum":1}}}},
+            {"name":"relay_ci_resume","description":"Explicitly resume a stopped, blocked, failed or expired track at the expected revision, opening a fresh bounded observation window while retaining its exact SHA, PR, policy and numeric source identities. Retrying the same revision does not extend the window again. Cannot resume an unknown process; trusted local reconciliation is required for unknown execution.","inputSchema":{"type":"object","required":["id","expected_revision"],"additionalProperties":false,"properties":{"id":{"type":"integer","minimum":1},"expected_revision":{"type":"integer","minimum":1}}}},
             {"name":"relay_replacement_challenge","description":"Preview permission expansion for only the changed role at a proven stopped stage; scope binds predecessor, action, selection and composed host policy. Explicit attestation remains required.","inputSchema":{"type":"object","required":["id","action","replacement"],"properties":{"id":{"type":"integer","minimum":1},"action":{"enum":["retry","continue_review"]},"replacement":role_selection_schema()},"additionalProperties":false}},
             {"name":"relay_get","description":"Read one task and its durable result.","inputSchema":{"type":"object","required":["id"],"properties":{"id":{"type":"integer","minimum":1}},"additionalProperties":false}},
             {"name":"relay_list","description":"List the newest 100 tasks, optionally before a task ID.","inputSchema":{"type":"object","properties":{"before":{"type":"integer","minimum":1}},"additionalProperties":false}},
@@ -171,6 +176,58 @@ pub fn handle(app: &Application, request: Value) -> Option<Value> {
                                 })
                         }
                         None => Err("positive task id required".into()),
+                    }
+                }
+                Some("relay_ci_preview" | "relay_ci_get") => {
+                    #[derive(serde::Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Input {
+                        id: i64,
+                    }
+                    serde_json::from_value::<Input>(arguments)
+                        .map_err(|error| error.to_string())
+                        .and_then(|input| {
+                            if input.id <= 0 {
+                                return Err("positive id required".into());
+                            }
+                            if params["name"] == "relay_ci_preview" {
+                                app.ci_preview(input.id).map_err(application_error)
+                            } else {
+                                app.ci_get(input.id)
+                                    .map(|track| json!(track))
+                                    .map_err(application_error)
+                            }
+                        })
+                }
+                Some("relay_track_ci" | "relay_ci_stop" | "relay_ci_resume") => {
+                    let mut arguments = arguments;
+                    let id = arguments
+                        .as_object_mut()
+                        .and_then(|object| object.remove("id"))
+                        .and_then(|id| id.as_i64());
+                    match id.filter(|id| *id > 0) {
+                        Some(id) if params["name"] == "relay_track_ci" => {
+                            serde_json::from_value::<crate::ci_tracking::CiStartRequest>(arguments)
+                                .map_err(|error| error.to_string())
+                                .and_then(|input| {
+                                    app.ci_start(id, input)
+                                        .map(|track| json!(track))
+                                        .map_err(application_error)
+                                })
+                        }
+                        Some(id) => serde_json::from_value::<crate::ci_tracking::CiControlRequest>(
+                            arguments,
+                        )
+                        .map_err(|error| error.to_string())
+                        .and_then(|input| {
+                            let result = if params["name"] == "relay_ci_stop" {
+                                app.ci_stop(id, input)
+                            } else {
+                                app.ci_resume(id, input)
+                            };
+                            result.map(|track| json!(track)).map_err(application_error)
+                        }),
+                        None => Err("positive id required".into()),
                     }
                 }
                 Some("relay_get") => arguments["id"]

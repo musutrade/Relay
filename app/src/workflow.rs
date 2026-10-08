@@ -531,6 +531,8 @@ pub(crate) fn approved_publication_candidate(result: &RunResult) -> Result<(&str
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicationResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
     pub dry_run: bool,
     pub draft: bool,
     pub repository: String,
@@ -2352,6 +2354,7 @@ fn publish(
         ));
     }
     workflow.publication = Some(PublicationResult {
+        base_branch: Some(config.base_branch.clone()),
         dry_run: !execute,
         draft: true,
         repository: repository.clone(),

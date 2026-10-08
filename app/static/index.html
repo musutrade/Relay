@@ -23,6 +23,7 @@
     @media(min-width:1600px){.shell{max-width:1510px}.workspace{grid-template-columns:380px minmax(0,1fr)}.queue-body{grid-template-columns:300px minmax(0,1fr)}}
     @media(max-width:1100px){.shell{padding-left:24px;padding-right:24px}.workspace{grid-template-columns:305px minmax(0,1fr);gap:16px}.queue-body{grid-template-columns:1fr}.task-list{border-right:0;border-bottom:1px solid var(--line);max-height:260px}.detail{padding:21px}.queue-tools{flex-wrap:wrap}.sync-time{display:none}.composer{padding-left:20px;padding-right:20px}.panel-head{padding-left:20px;padding-right:20px}.auth{grid-template-columns:1fr 1.2fr;gap:20px}}
     @media(max-width:720px){.shell{padding-left:18px;padding-right:18px}.topbar-inner{min-height:67px}.brand-label{display:none}.header-actions{gap:5px}.connection{font-size:10px}.brand{font-size:19px}.brand-mark{height:32px;width:32px}.icon-button{width:36px;height:36px}main{padding-top:25px!important}.intro{margin-bottom:21px}.intro h1{font-size:24px}.intro p{font-size:12px}.local-tag{display:none}.auth{padding:21px;grid-template-columns:1fr;gap:18px}.auth-controls{flex-wrap:wrap}.auth-controls input{flex-basis:100%}.auth-controls .button{width:100%}.metrics{gap:8px;margin-bottom:17px}.metric{padding:13px 11px;gap:8px}.metric-icon{display:none}.metric-number{font-size:22px}.metric-label{font-size:10px}.workspace{grid-template-columns:1fr;gap:18px}.composer textarea{min-height:148px}.panel-head{padding-top:20px;padding-bottom:17px}.queue-tools{padding-left:20px;padding-right:20px}.queue-body{min-height:340px}.task-list{max-height:300px}.detail{padding:20px}.help-footer{flex-wrap:wrap;gap:4px}.banner{padding:13px;gap:9px}.banner-action{padding:7px;min-width:45px}.banner strong{font-size:12px}.banner p{font-size:11px}.detail-meta{gap:12px}.queue{min-height:370px}.empty{min-height:265px}.header-actions .text-button{padding:7px;font-size:11px}.filters{gap:1px}.filter{padding:5px 9px}}
+      .ci-scope{white-space:pre-wrap;overflow-wrap:anywhere}.ci-track{border-top:1px solid var(--border);margin-top:16px;padding-top:12px;min-width:0}.ci-track h4{margin:0 0 8px}.ci-result{font-weight:600;overflow-wrap:anywhere}.ci-boundary{margin-top:14px}
   </style>
 </head>
 <body>
@@ -76,7 +77,7 @@
       </section>
       <section class="panel queue" aria-labelledby="queue-title"><div class="queue-header"><div class="panel-head"><h2 id="queue-title" class="section-label"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="1.7"/><path d="M9 4v16" stroke="currentColor" stroke-width="1.7"/></svg>任务队列</h2><button id="refresh" type="button" class="text-button" disabled aria-label="刷新任务队列">刷新 ↻</button></div><div class="queue-tools"><div class="filters" role="group" aria-label="筛选任务状态"><button class="filter" data-filter="all" type="button" aria-pressed="true">全部</button><button class="filter" data-filter="queued" type="button" aria-pressed="false">排队中</button><button class="filter" data-filter="claimed" type="button" aria-pressed="false">已领取</button><button class="filter" data-filter="finished" type="button" aria-pressed="false">已结束</button></div><span id="sync-time" class="sync-time">连接后每 2 秒同步</span></div></div>
         <div id="queue-empty" class="empty"><div class="empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7h16v13H4V7Zm3-4h10v4H7V3Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M9 12h6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></div><h3 id="empty-title">等待你的第一份交接</h3><p id="empty-description">连接工作台后，提交需求并查看任务进展</p></div>
-        <div id="queue-body" class="queue-body" hidden><ul id="task-list" class="task-list" aria-label="任务列表"></ul><div id="detail-empty" class="empty" hidden><h3>选择一个任务</h3><p>在左侧列表查看需求、状态和结果</p></div><article id="task-detail" class="detail" aria-labelledby="detail-title" hidden><div class="detail-head"><div><h3 id="detail-title" class="detail-title"></h3><p id="detail-key" class="detail-subtitle"></p></div><span id="detail-badge" class="badge"></span></div><p id="detail-warning" class="detail-warning" role="status" hidden></p><section id="detail-diagnostic" class="detail-section" hidden><div class="detail-section-head"><h3>宿主诊断 · 尚未确认结束</h3></div><pre id="detail-diagnostic-text" class="result" tabindex="0" aria-label="当前任务宿主诊断"></pre></section><dl id="detail-meta" class="detail-meta"></dl><p id="continuation-choice" class="detail-warning" role="status" hidden></p><section class="detail-section"><div class="detail-section-head"><h3>任务需求</h3></div><div id="detail-requirements" class="content-text" tabindex="0" aria-label="完整任务需求"></div></section><section id="detail-selection" class="detail-section role-evidence" aria-labelledby="selection-title" hidden><h3 id="selection-title">角色选择与执行证据</h3><p>请求值、服务端解析的会话设置与消息 / reroute 观测分开显示。会话设置不是每回合实际生效的证明；没有证据时显示未知</p><div id="selection-stages"></div></section><section id="detail-usage" class="detail-section" aria-labelledby="usage-title" hidden><div class="detail-section-head"><h3 id="usage-title">Token 用量</h3></div><p class="usage-note">仅显示已保存阶段，各阶段不合并为任务或工作流总量。失败或中断阶段的已观测值可能不完整。“未知”表示未提供或无法确认；不同供应商的缓存口径不同，各字段不另行相加</p><div id="usage-stages"></div></section><section id="detail-operator" class="resource-box" aria-labelledby="operator-title" hidden><div class="detail-section-head"><h3 id="operator-title">失败、容量与恢复</h3><button id="operator-read" class="button small" type="button">刷新此任务资源</button></div><p id="operator-status" role="status"></p><div id="operator-failure"></div><dl id="operator-resources" class="detail-meta"></dl><p id="operator-retained"></p><p id="operator-recovery"></p><div id="operator-replacement"></div><p>容量为有界观测的逻辑字节；不等于 OS 硬配额或已预留磁盘。恢复资格由宿主核对，不从日志推断</p></section><section class="detail-section"><div class="detail-section-head"><h3>执行结果</h3><button id="copy-result" type="button" class="text-button" hidden>复制结果</button></div><pre id="detail-result" class="result" tabindex="0" aria-label="完整执行结果" hidden></pre><p id="result-placeholder" class="result-placeholder"></p></section><p id="detail-error" class="detail-error" role="alert" hidden></p><div class="detail-actions"><button id="cancel-task" type="button" class="button small danger">请求取消</button><button id="retry-task" type="button" class="button small" hidden>继续保留的工作</button><button id="review-task" type="button" class="button small" hidden>仅继续审查（先复验测试）</button><button id="publish-task" type="button" class="button small" hidden>发布已批准候选（Draft PR）</button><button id="continuation-next" type="button" class="button small" hidden></button><span id="cancel-note" class="cancel-note"></span></div></article></div>
+        <div id="queue-body" class="queue-body" hidden><ul id="task-list" class="task-list" aria-label="任务列表"></ul><div id="detail-empty" class="empty" hidden><h3>选择一个任务</h3><p>在左侧列表查看需求、状态和结果</p></div><article id="task-detail" class="detail" aria-labelledby="detail-title" hidden><div class="detail-head"><div><h3 id="detail-title" class="detail-title"></h3><p id="detail-key" class="detail-subtitle"></p></div><span id="detail-badge" class="badge"></span></div><p id="detail-warning" class="detail-warning" role="status" hidden></p><section id="detail-diagnostic" class="detail-section" hidden><div class="detail-section-head"><h3>宿主诊断 · 尚未确认结束</h3></div><pre id="detail-diagnostic-text" class="result" tabindex="0" aria-label="当前任务宿主诊断"></pre></section><dl id="detail-meta" class="detail-meta"></dl><p id="continuation-choice" class="detail-warning" role="status" hidden></p><section class="detail-section"><div class="detail-section-head"><h3>任务需求</h3></div><div id="detail-requirements" class="content-text" tabindex="0" aria-label="完整任务需求"></div></section><section id="detail-selection" class="detail-section role-evidence" aria-labelledby="selection-title" hidden><h3 id="selection-title">角色选择与执行证据</h3><p>请求值、服务端解析的会话设置与消息 / reroute 观测分开显示。会话设置不是每回合实际生效的证明；没有证据时显示未知</p><div id="selection-stages"></div></section><section id="detail-usage" class="detail-section" aria-labelledby="usage-title" hidden><div class="detail-section-head"><h3 id="usage-title">Token 用量</h3></div><p class="usage-note">仅显示已保存阶段，各阶段不合并为任务或工作流总量。失败或中断阶段的已观测值可能不完整。“未知”表示未提供或无法确认；不同供应商的缓存口径不同，各字段不另行相加</p><div id="usage-stages"></div></section><section id="detail-operator" class="resource-box" aria-labelledby="operator-title" hidden><div class="detail-section-head"><h3 id="operator-title">失败、容量与恢复</h3><button id="operator-read" class="button small" type="button">刷新此任务资源</button></div><p id="operator-status" role="status"></p><div id="operator-failure"></div><dl id="operator-resources" class="detail-meta"></dl><p id="operator-retained"></p><p id="operator-recovery"></p><div id="operator-replacement"></div><p>容量为有界观测的逻辑字节；不等于 OS 硬配额或已预留磁盘。恢复资格由宿主核对，不从日志推断</p></section><section id="detail-ci" class="resource-box" aria-labelledby="ci-title" hidden><div class="detail-section-head"><h3 id="ci-title">精确 HEAD · GitHub CI</h3><button id="ci-read" class="button small" type="button">刷新本地 CI 记录</button></div><p id="ci-status" role="status" aria-live="polite"></p><p id="ci-scope" class="ci-scope"></p><div id="ci-policy-field" class="field"><label for="ci-policy">宿主允许的 CI 策略</label><select id="ci-policy" disabled></select></div><p id="ci-policy-scope" class="ci-scope"></p><button id="ci-start" class="button small primary" type="button" disabled>开始跟踪此 HEAD 的 CI</button><p id="ci-error" class="detail-error" role="alert" hidden></p><div id="ci-tracks"></div><p class="ci-boundary">仅观察已发布的固定 SHA，不重跑开发、测试或审查，不占用开发队列。页面刷新只读本地记录；显式开始后由宿主进行有期限的只读 GitHub 观察。configured checks passed; remote merge eligibility not established。未证明全部分支规则通过，不自动合并，Draft PR 保持 draft。恢复或重新跟踪会显式开启新的有界观察期限，始终保留原 SHA、目标和来源；未知进程必须先由本机核对</p></section><section class="detail-section"><div class="detail-section-head"><h3>执行结果</h3><button id="copy-result" type="button" class="text-button" hidden>复制结果</button></div><pre id="detail-result" class="result" tabindex="0" aria-label="完整执行结果" hidden></pre><p id="result-placeholder" class="result-placeholder"></p></section><p id="detail-error" class="detail-error" role="alert" hidden></p><div class="detail-actions"><button id="cancel-task" type="button" class="button small danger">请求取消</button><button id="retry-task" type="button" class="button small" hidden>继续保留的工作</button><button id="review-task" type="button" class="button small" hidden>仅继续审查（先复验测试）</button><button id="publish-task" type="button" class="button small" hidden>发布已批准候选（Draft PR）</button><button id="continuation-next" type="button" class="button small" hidden></button><span id="cancel-note" class="cancel-note"></span></div></article></div>
       </section>
     </div>
     <details class="help"><summary>使用说明与安全边界</summary><ol><li>使用当前服务配置的 Bearer 令牌连接。令牌只存于页面内存；刷新页面或断开连接后需重新输入</li><li>只能选择服务端允许的仓库、Agent 与测试配置。需求及结果按纯文本显示，不执行其中的 HTML 或命令</li><li>列表显示服务端返回的最近任务，并始终包含当前已领取任务；概况数字仅统计当前列表。任务按队列串行领取。“已结束”表示结果已落库，具体成功、失败或未知状态请查看执行结果</li><li>提交遇到网络故障时，请使用“重试原提交”。页面会复用同一幂等键，不会因为重试生成新任务；确认前不要刷新或关闭页面</li><li>取消是请求，不代表进程已经停止。遇到需要恢复或结果未知的任务，请由可信宿主检查后处理</li><li>可用 Tab 在控件间移动，Enter 或空格激活按钮，Escape 关闭取消确认框。配色默认跟随系统，右上角可切换</li></ol></details><footer class="help-footer"><span>Relay · 可靠交接，清晰边界</span><span>任务状态持久化于本地 · 页面不自动发布</span></footer>
@@ -93,6 +94,192 @@
     const fields = ['workflow', 'repository', 'requirements', 'agent', 'test'];
     const state = { authMode: null, loggingOut: false, token: '', session: 0, authenticated: false, connecting: false, controllers: new Set(), timer: null, syncing: false, refreshAgain: false, revision: 0, tasks: [], listedTaskIds: new Set(), config: null, ordinarySelection: null, status: null, selectedId: null, selection: 0, detailController: null, filter: 'all', pending: null, submitting: false, submitVersion: 0, canceling: new Set(), cancelRequested: new Set(), cancelTarget: null, retryTarget: null, retryMode: null, retrying: new Set(), retryRequests: new Map(), continuationNotices: new Map(), online: false };
     const publicationState = { confirmation: null, requests: new Map(), publishing: new Set() };
+    // CI is an independent persisted record. UI reads never launch an observer.
+    const ciState = { task: null, evidence: null, data: null, loading: false, version: 0, controller: null, error: '', selectedPolicy: '', requests: new Map(), controls: new Map(), identities: new Map(), windows: new Map(), revisions: new Map(), observed: new Map(), busy: new Set() };
+    const ciStatuses = { watching: '正在跟踪', configured_checks_passed: 'configured checks passed; remote merge eligibility not established', checks_failed: '配置检查失败', blocked: '跟踪受阻', process_unknown: '观察进程状态未知，需本机核对', expired: '观察期限已到', stopped: '已停止', pr_closed: 'PR 已关闭', pr_merged: '观察到 PR 已合并（非 Relay 合并）' };
+    const ciPositive = value => Number.isSafeInteger(value) && value > 0;
+    const ciText = (value, max = 256) => typeof value === 'string' && value.length > 0 && value.length <= max;
+    const ciSha = value => typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
+    function validCiPublication(value) {
+      return isRecord(value) && ciText(value.repository) && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value.repository)
+        && ciText(value.base_branch) && ciText(value.head_branch) && ciSha(value.head_sha) && ciPositive(value.pr_number)
+        && value.pr_url === 'https://github.com/' + value.repository + '/pull/' + value.pr_number;
+    }
+    function validCiPolicy(value, track = false) {
+      return isRecord(value) && ciText(track ? value.policy : value.name, 128) && typeof value.policy_digest === 'string' && /^[0-9a-f]{64}$/.test(value.policy_digest)
+        && ciPositive(value.workflow_id) && ciPositive(value.app_id) && value.event === 'pull_request'
+        && Array.isArray(value.required_jobs) && value.required_jobs.length > 0 && value.required_jobs.length <= 32 && value.required_jobs.every(job => ciText(job)) && new Set(value.required_jobs).size === value.required_jobs.length
+        && ciPositive(value.poll_interval_seconds) && ciPositive(value.observation_window_seconds);
+    }
+    function validCiEvidence(value, track) {
+      const jobs = value?.run?.jobs;
+      return isRecord(value) && value.version === 1 && value.observation === 'ok' && value.complete === true && value.remote_merge_eligibility === 'not_established' && ciPositive(value.observed_at)
+        && ['missing_jobs', 'failed_jobs'].every(field => Array.isArray(value[field]) && value[field].every(name => track.required_jobs.includes(name)))
+        && (value.run === null || (isRecord(value.run) && ciPositive(value.run.id) && ciPositive(value.run.run_attempt) && Array.isArray(jobs) && jobs.every(job => isRecord(job) && ciText(job.name) && ciText(job.status) && (job.conclusion === null || ciText(job.conclusion)))));
+    }
+    function validCiTrack(value, taskId) {
+      return validCiPublication(value) && validCiPolicy(value, true) && ciPositive(value.id) && value.publication_task_id === taskId && Number.isSafeInteger(value.attempt) && value.attempt >= 0 && ciPositive(value.revision)
+        && ciPositive(value.window_generation) && ciPositive(value.window_started_at) && value.deadline === value.window_started_at + value.observation_window_seconds && (value.last_observed_at === null || ciPositive(value.last_observed_at))
+        && Object.hasOwn(ciStatuses, value.status) && typeof value.stop_requested === 'boolean' && ciPositive(value.created_at) && ciPositive(value.deadline)
+        && (value.observed_repository_id === null || ciPositive(value.observed_repository_id)) && (value.observed_pr_id === null || ciPositive(value.observed_pr_id)) && (value.observed_base_sha === null || ciSha(value.observed_base_sha))
+        && (value.next_poll_at === null || value.next_poll_at === 0 || ciPositive(value.next_poll_at)) && (value.latest_evidence === null || validCiEvidence(value.latest_evidence, value))
+        && (value.diagnostic === null || (isRecord(value.diagnostic) && ciText(value.diagnostic.code) && ciText(value.diagnostic.message, 8192)))
+        && value.remote_merge_eligibility === 'not_established';
+    }
+    function ciSource(value) { return JSON.stringify(['repository', 'base_branch', 'head_sha', 'head_branch', 'pr_number', 'pr_url'].map(field => value?.[field])); }
+    function validCiPreview(value, id) {
+      return isRecord(value) && typeof value.eligible === 'boolean' && (value.reason === null || typeof value.reason === 'string')
+        && (value.publication === null || validCiPublication(value.publication)) && (!value.eligible || value.publication !== null)
+        && (value.lane_diagnostic == null || (isRecord(value.lane_diagnostic) && ciText(value.lane_diagnostic.code) && ciText(value.lane_diagnostic.message, 8192)))
+        && (value.unavailable_policies === undefined || (Array.isArray(value.unavailable_policies) && value.unavailable_policies.every(policy => isRecord(policy) && ciText(policy.name, 128) && ciText(policy.reason, 8192))))
+        && Array.isArray(value.policies) && value.policies.length <= 64 && value.policies.every(policy => validCiPolicy(policy)) && new Set(value.policies.map(policy => policy.name)).size === value.policies.length
+        && Array.isArray(value.tracks) && value.tracks.every(track => validCiTrack(track, id) && (value.publication === null || ciSource(track) === ciSource(value.publication))) && new Set(value.tracks.map(track => track.id)).size === value.tracks.length
+        && value.remote_merge_eligibility === 'not_established';
+    }
+    function ciObservedMatches(track) { const previous = ciState.observed.get(track.id); return !previous || ['observed_repository_id', 'observed_pr_id', 'observed_base_sha'].every(field => previous[field] === null || previous[field] === track[field]); }
+    function ciTrackIdentity(track) { return JSON.stringify([ciSource(track), track.policy, track.policy_digest, track.workflow_id, track.app_id, track.event, track.required_jobs, track.created_at, track.poll_interval_seconds, track.observation_window_seconds]); }
+    function ciFor(task) { return task && ciState.task === task.id && ciState.evidence === taskEvidence(task) ? ciState.data : null; }
+    function resetCiRead() { ciState.version++; ciState.controller?.abort(); ciState.controller = null; ciState.loading = false; ciState.task = null; ciState.evidence = null; ciState.data = null; ciState.error = ''; ciState.selectedPolicy = ''; }
+    function reconcileCi(data, task) {
+      const pending = ciState.requests.get(task.id);
+      if (pending && pending.identity === retryIdentity(task) && data.tracks.some(track => track.policy === pending.body.policy && track.policy_digest === pending.body.policy_digest && ciSource(track) === pending.source)) ciState.requests.delete(task.id);
+      for (const track of data.tracks) {
+        const control = ciState.controls.get(track.id);
+        if (control && ciSource(track) === control.source && track.policy_digest === control.digest && track.revision > control.body.expected_revision
+            && ((control.action === 'stop' && (track.stop_requested || ['stopped', 'process_unknown'].includes(track.status))) || (control.action === 'resume' && track.window_generation > control.window))) ciState.controls.delete(track.id);
+      }
+    }
+    async function readCi(id = state.selectedId) {
+      const task = state.tasks.find(item => item.id === id);
+      if (!state.authenticated || state.loggingOut || !task || id !== state.selectedId || task.state !== 'finished') return;
+      const session = state.session, selection = state.selection, evidence = taskEvidence(task), version = ++ciState.version, controller = new AbortController();
+      ciState.controller?.abort(); ciState.controller = controller; ciState.loading = true; ciState.error = '';
+      if (ciState.task !== id || ciState.evidence !== evidence) { ciState.data = null; ciState.selectedPolicy = ''; }
+      ciState.task = id; ciState.evidence = evidence; renderCi(task);
+      try {
+        const data = await api('/api/tasks/' + encodeURIComponent(id) + '/ci-preview', { signal: controller.signal });
+        if (!validCiPreview(data, id)) throw new ApiError('CI 来源或跟踪记录格式不匹配，未启用操作');
+        if (session !== state.session || selection !== state.selection || version !== ciState.version || id !== state.selectedId || evidence !== taskEvidence(state.tasks.find(item => item.id === id) || {})) return;
+        if (data.tracks.some(track => track.revision < (ciState.revisions.get(track.id) || 0))) throw new ApiError('CI 返回旧修订，未覆盖新状态，请刷新核对');
+        if (data.tracks.some(track => !ciObservedMatches(track) || (ciState.identities.has(track.id) && ciState.identities.get(track.id) !== ciTrackIdentity(track)))) throw new ApiError('CI 固定来源或原期限已变化，操作已停用，请由本机核对');
+        if (data.tracks.some(track => { const old = ciState.windows.get(track.id); return old && (track.window_generation < old.generation || (track.window_generation === old.generation && (track.window_started_at !== old.start || track.deadline !== old.deadline))); })) throw new ApiError('CI 观察期限与已读取的固定窗口不匹配，请刷新核对');
+        for (const track of data.tracks) { ciState.observed.set(track.id, { observed_repository_id: track.observed_repository_id, observed_pr_id: track.observed_pr_id, observed_base_sha: track.observed_base_sha }); ciState.revisions.set(track.id, track.revision); ciState.identities.set(track.id, ciTrackIdentity(track)); ciState.windows.set(track.id, { generation: track.window_generation, start: track.window_started_at, deadline: track.deadline }); }
+        ciState.data = data; reconcileCi(data, task);
+      } catch (error) {
+        if (session !== state.session || selection !== state.selection || version !== ciState.version || isAborted(error)) return;
+        ciState.data = null;
+        if (error.status === 401 || error.status === 403) handleReadError(error, session); else ciState.error = 'CI 状态读取失败：' + formatError(error);
+      } finally { if (session === state.session && version === ciState.version) { ciState.loading = false; ciState.controller = null; renderCi(state.tasks.find(item => item.id === state.selectedId)); } }
+    }
+    function ciTime(value) { return value === null || value === undefined || value === 0 ? '尚无记录' : new Date(value * 1000).toLocaleString('zh-CN', { hour12: false }); }
+    function ciScopeText(value) { return 'GitHub：' + value.repository + ' · PR #' + value.pr_number + '\nPR：' + value.pr_url + '\n固定 HEAD SHA：' + value.head_sha + '\n分支：' + value.head_branch + ' → ' + value.base_branch; }
+    function ciPolicyText(value) { return 'Workflow ID：' + value.workflow_id + ' · App ID：' + value.app_id + ' · 事件：' + value.event + '\n指定 jobs：' + value.required_jobs.join('、') + '\n观察间隔：' + value.poll_interval_seconds + ' 秒 · 总期限：' + value.observation_window_seconds + ' 秒\n策略绑定：' + value.policy_digest; }
+    function ciStartPolicy(task, data) {
+      if (!data?.eligible || !state.authenticated || state.loggingOut || ciState.loading || ciState.busy.has('task:' + task.id)) return null;
+      const pending = ciState.requests.get(task.id), name = pending?.body.policy || ciState.selectedPolicy;
+      const policy = data.policies.find(policy => policy.name === name);
+      if (!policy || data.tracks.some(track => track.policy === policy.name) || (pending && (pending.identity !== retryIdentity(task) || pending.body.policy_digest !== policy.policy_digest || pending.source !== ciSource(data.publication)))) return null;
+      return policy;
+    }
+    function renderCi(task) {
+      const visible = state.authenticated && task?.state === 'finished';
+      $('detail-ci').hidden = !visible; $('ci-read').disabled = !visible || state.loggingOut || ciState.loading;
+      $('ci-scope').textContent = ''; $('ci-policy-scope').textContent = ''; $('ci-tracks').replaceChildren(); $('ci-start').disabled = true; $('ci-policy').disabled = true;
+      if (!visible) { $('ci-status').textContent = ''; $('ci-policy').replaceChildren(); showMessage('ci-error', ''); return; }
+      const data = ciFor(task), pending = ciState.requests.get(task.id);
+      $('ci-status').textContent = ciState.loading ? '正在读取本地 CI 记录…' : data ? data.eligible ? '可显式开始只读 CI 跟踪' : data.reason || '此任务尚无可跟踪的真实发布记录' : '读取本地记录后可选择宿主允许的 CI 策略';
+      showMessage('ci-error', ciState.task === task.id ? ciState.error : '');
+      const old = ciState.selectedPolicy; $('ci-policy').replaceChildren();
+      const available = (data?.policies || []).filter(policy => !data.tracks.some(track => track.policy === policy.name));
+      for (const policy of available) { const option = catalogNode('option', policy.name); option.value = policy.name; $('ci-policy').append(option); }
+      ciState.selectedPolicy = pending?.body.policy || (available.some(policy => policy.name === old) ? old : available[0]?.name || ''); $('ci-policy').value = ciState.selectedPolicy;
+      $('ci-policy-field').hidden = !available.length;
+      $('ci-start').hidden = !pending && (!data?.eligible || !available.length);
+      $('ci-start').textContent = ciState.busy.has('task:' + task.id) ? '正在保存跟踪请求…' : pending ? '重试原 CI 跟踪请求' : '开始跟踪此 HEAD 的 CI';
+      if (data?.publication) $('ci-scope').textContent = ciScopeText(data.publication);
+      const policy = data?.policies.find(policy => policy.name === ciState.selectedPolicy);
+      if (policy) $('ci-policy-scope').textContent = ciPolicyText(policy);
+      $('ci-policy').disabled = !data?.eligible || Boolean(pending) || ciState.loading || state.loggingOut || ciState.busy.has('task:' + task.id);
+      $('ci-start').disabled = !ciStartPolicy(task, data);
+      if (data?.lane_diagnostic) $('ci-status').textContent += '。宿主观察通道受阻 [' + data.lane_diagnostic.code + ']：' + data.lane_diagnostic.message + '。仅可信本机核对可恢复此通道';
+      for (const unavailable of data?.unavailable_policies || []) $('ci-status').textContent += '。策略 ' + unavailable.name + ' 不可用：' + unavailable.reason;
+      if (pending) $('ci-status').textContent += '。原请求已冻结，不自动重试，不可更改 SHA、来源或策略；请先刷新核对已有记录';
+      for (const track of data?.tracks || []) {
+        const box = catalogNode('section', undefined, 'ci-track'), busy = ciState.busy.has('track:' + track.id), control = ciState.controls.get(track.id);
+        box.append(catalogNode('h4', 'CI 跟踪 #' + track.id + ' · ' + track.policy), catalogNode('p', ciStatuses[track.status], 'ci-result'), catalogNode('p', ciScopeText(track), 'ci-scope'), catalogNode('p', ciPolicyText(track), 'ci-scope'));
+        box.append(catalogNode('p', '尝试 ' + track.attempt + ' · 修订 ' + track.revision + ' · 观察窗口 ' + track.window_generation + '\n最近观察时间：' + ciTime(track.last_observed_at) + '\n下一次观察：' + (track.status === 'watching' && !track.stop_requested ? ciTime(track.next_poll_at) : '已暂停或结束') + '\n当前窗口固定截止时间：' + ciTime(track.deadline), 'ci-scope'));
+        box.append(catalogNode('p', '已观察 Repository ID：' + (track.observed_repository_id ?? '尚未建立') + ' · PR ID：' + (track.observed_pr_id ?? '尚未建立') + '\n首次观察固定 Base SHA：' + (track.observed_base_sha || '尚未建立'), 'ci-scope'));
+        if (track.stop_requested && track.status === 'watching') box.append(catalogNode('p', '停止已请求，仍在等待宿主确认观察进程已结束；不能据此启动新观察'));
+        if (track.diagnostic) box.append(catalogNode('p', track.diagnostic.code + '：' + track.diagnostic.message, 'detail-warning'));
+        if (track.status === 'process_unknown') box.append(catalogNode('p', '仅可信本机操作员核对旧进程并完成 reconciliation 后才能恢复；页面重试、恢复或等待超时都不能绕过此门禁', 'detail-warning'));
+        if (track.latest_evidence) {
+          const latest = track.latest_evidence, pendingJobs = (latest.run?.jobs || []).filter(job => track.required_jobs.includes(job.name) && job.status !== 'completed').map(job => job.name);
+          box.append(catalogNode('p', '最新观察：' + ciTime(latest.observed_at) + (latest.run ? '\nActions run #' + latest.run.id + ' · run attempt ' + latest.run.run_attempt : '\n尚无匹配的 Actions run'), 'ci-scope'));
+          for (const [label, names] of [['缺失检查', latest.missing_jobs], ['失败检查', latest.failed_jobs], ['等待中检查', pendingJobs]]) box.append(catalogNode('p', label + '：' + (names.length ? names.join('、') : '无')));
+          const evidence = catalogNode('details'); evidence.append(catalogNode('summary', '最近一次本地保存的观察证据'), catalogNode('pre', JSON.stringify(latest, null, 2), 'result')); box.append(evidence);
+        }
+        else box.append(catalogNode('p', '最新观察：尚未收到远程证据；所配置检查尚未确认'));
+        if (control) box.append(catalogNode('p', '操作响应尚未确认；保留原修订请求，请先刷新记录，不自动重试', 'detail-warning'));
+        const actions = catalogNode('div', undefined, 'detail-actions');
+        for (const action of ['stop', 'resume']) {
+          const allowed = action === 'stop' ? track.status === 'watching' && !track.stop_requested : ['stopped', 'blocked', 'checks_failed', 'expired'].includes(track.status);
+          if (!allowed || (control && control.action !== action)) continue;
+          const button = catalogNode('button', busy ? '正在处理…' : (control ? '重试原操作：' : '') + (action === 'stop' ? '停止跟踪' : (track.status === 'expired' ? '重新跟踪同一 HEAD（新观察期限）' : '恢复同一 HEAD（新观察期限）')), 'button small'); button.type = 'button'; button.dataset.ciAction = action; button.dataset.ciTrack = String(track.id);
+          button.disabled = busy || ciState.loading || state.loggingOut || Boolean(data.lane_diagnostic);
+          button.addEventListener('click', () => controlCi(task.id, track.id, action, track.revision)); actions.append(button);
+        }
+        box.append(actions); $('ci-tracks').append(box);
+      }
+    }
+    async function startCi() {
+      const task = state.tasks.find(task => task.id === state.selectedId), data = ciFor(task), policy = task && ciStartPolicy(task, data);
+      if (!policy || $('ci-start').disabled) return;
+      const id = task.id, session = state.session, selection = state.selection;
+      if (!ciState.requests.has(id)) ciState.requests.set(id, { identity: retryIdentity(task), source: ciSource(data.publication), body: { key: createKey(), policy: policy.name, policy_digest: policy.policy_digest } });
+      const request = ciState.requests.get(id), ambiguous = request.ambiguous === true; request.ambiguous = true;
+      ciState.busy.add('task:' + id); ciState.error = ''; renderCi(task);
+      try {
+        const track = await api('/api/tasks/' + encodeURIComponent(id) + '/track-ci', { method: 'POST', body: request.body });
+        if (session !== state.session) return;
+        if (!validCiTrack(track, id) || track.policy !== request.body.policy || track.policy_digest !== request.body.policy_digest || ciSource(track) !== request.source) throw new ApiError('CI 跟踪响应不匹配，结果尚未确认');
+        if (track.revision < (ciState.revisions.get(track.id) || 0)) return;
+        if (!ciObservedMatches(track)) throw new ApiError('CI 已观察来源身份发生变化，未接受响应');
+        ciState.observed.set(track.id, { observed_repository_id: track.observed_repository_id, observed_pr_id: track.observed_pr_id, observed_base_sha: track.observed_base_sha }); ciState.revisions.set(track.id, track.revision); ciState.identities.set(track.id, ciTrackIdentity(track)); ciState.windows.set(track.id, { generation: track.window_generation, start: track.window_started_at, deadline: track.deadline }); ciState.requests.delete(id);
+        if (selection === state.selection && id === state.selectedId) { const current = ciFor(task) || data; ciState.data = { ...current, tracks: [track, ...current.tracks.filter(item => item.id !== track.id)] }; announce('已保存精确 HEAD 的 CI 跟踪；不会合并 PR'); }
+      } catch (error) {
+        if (session !== state.session) return;
+        const rejected = !ambiguous && ([400, 413, 422].includes(error.status) || (error.status === 409 && ['idempotency_conflict', 'ci_idempotency_conflict', 'ci_policy_changed'].includes(error.failureCode)));
+        if (rejected) ciState.requests.delete(id);
+        handleReadError(error, session);
+        if (state.authenticated && selection === state.selection && id === state.selectedId) ciState.error = (rejected ? 'CI 请求被拒绝：' : 'CI 请求结果尚未确认：') + formatError(error) + (rejected ? '。请刷新当前来源和策略' : '。原请求已保留，请刷新核对；不会自动重试');
+      } finally { if (session === state.session) { ciState.busy.delete('task:' + id); renderCi(state.tasks.find(task => task.id === state.selectedId)); } }
+    }
+    async function controlCi(taskId, trackId, action, revision) {
+      const task = state.tasks.find(task => task.id === state.selectedId), data = ciFor(task), track = data?.tracks.find(track => track.id === trackId);
+      if (!state.authenticated || state.loggingOut || task?.id !== taskId || !track || data.lane_diagnostic || track.revision !== revision || ciState.loading || ciState.busy.has('track:' + trackId)) return;
+      const allowed = action === 'stop' ? track.status === 'watching' && !track.stop_requested : action === 'resume' && ['stopped', 'blocked', 'checks_failed', 'expired'].includes(track.status);
+      if (!allowed) return;
+      if (!ciState.controls.has(trackId)) ciState.controls.set(trackId, { action, source: ciSource(track), digest: track.policy_digest, window: track.window_generation, body: { expected_revision: revision } });
+      const request = ciState.controls.get(trackId);
+      if (request.action !== action || request.source !== ciSource(track) || request.digest !== track.policy_digest) return;
+      const session = state.session, selection = state.selection; ciState.busy.add('track:' + trackId); ciState.error = ''; renderCi(task);
+      try {
+        const next = await api('/api/ci-tracks/' + encodeURIComponent(trackId) + '/' + action, { method: 'POST', body: request.body });
+        if (session !== state.session) return;
+        if (!validCiTrack(next, taskId) || next.id !== trackId || ciSource(next) !== request.source || next.policy_digest !== request.digest || ciTrackIdentity(next) !== ciTrackIdentity(track) || !ciObservedMatches(next) || next.revision < request.body.expected_revision) throw new ApiError('CI 操作响应与固定记录不匹配');
+        if (next.revision < (ciState.revisions.get(trackId) || 0)) return;
+        ciState.observed.set(trackId, { observed_repository_id: next.observed_repository_id, observed_pr_id: next.observed_pr_id, observed_base_sha: next.observed_base_sha }); ciState.revisions.set(trackId, next.revision);
+        if (selection === state.selection && taskId === state.selectedId) { ciState.windows.set(trackId, { generation: next.window_generation, start: next.window_started_at, deadline: next.deadline }); const current = ciFor(task) || data; ciState.data = { ...current, tracks: current.tracks.map(track => track.id === trackId ? next : track) }; reconcileCi(ciState.data, task); }
+      } catch (error) {
+        if (session !== state.session) return;
+        // A rejected obsolete revision cannot authorize an action on a newer
+        // observation/window. Require a fresh read and another explicit click.
+        const stale = error.status === 409 && error.failureCode === 'ci_stale_revision';
+        if (stale) ciState.controls.delete(trackId);
+        handleReadError(error, session);
+        if (state.authenticated && selection === state.selection && taskId === state.selectedId) { if (stale) ciState.data = null; ciState.error = (stale ? '原 CI 修订已失效：' : 'CI 操作结果尚未确认：') + formatError(error) + '。请刷新记录；不能用恢复或超时绕过未知进程门禁'; }
+      } finally { if (session === state.session) { ciState.busy.delete('track:' + trackId); renderCi(state.tasks.find(task => task.id === state.selectedId)); } }
+    }
     const startupDiscovery = { preparing: null, confirmation: null, timer: null, attempted: new Map() };
     const catalogState = { open: false, profiles: new Map(), refreshing: new Map(), errors: new Map(), epoch: null, epochVersion: 0, retiredEpochs: new Set(), requestVersion: 0, readVersion: 0, readController: null, reading: false, loaded: false };
     const inventoryState = { open: false, data: null, before: null, history: [], version: 0, controller: null, reading: false, error: '' };
@@ -1068,7 +1255,7 @@
       for (const controller of state.controllers) controller.abort(); state.controllers.clear();
       if (state.detailController) state.detailController.abort(); state.detailController = null;
       state.tasks = []; state.listedTaskIds.clear(); state.status = null; state.config = null; state.ordinarySelection = null; state.selectedId = null; state.submitting = false; state.canceling.clear(); state.cancelRequested.clear(); state.continuationNotices.clear(); state.cancelTarget = null; state.retryTarget = null; state.retrying.clear(); publicationState.publishing.clear(); closePublication();
-      resetRoleChoices(); resetCatalog(); resetInventory(); resetEstimate(); $('workspace-quota').value = '';
+      resetCiRead(); ciState.busy.clear(); resetRoleChoices(); resetCatalog(); resetInventory(); resetEstimate(); $('workspace-quota').value = '';
       resourceState.operatorVersion++; resourceState.operatorController?.abort(); resourceState.operatorController = null; resourceState.operator = null; resourceState.operatorTask = null; resourceState.operatorLoading = false; resourceState.operatorError = '';
       if (!preservePending) { state.pending = null; $('requirements').value = ''; showMessage('form-message', ''); }
       $('token').value = ''; $('password').value = ''; $('auth-panel').hidden = false; updateAuthForm();
@@ -1104,6 +1291,7 @@
         state.tasks = mergeActive(tasks, status); state.listedTaskIds = listedTaskIds; state.status = status; state.revision++; state.online = true;
         $('network-banner').hidden = true; updateConnection(); reconcilePending(); render();
         $('sync-time').textContent = '已同步 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
+        if (state.selectedId !== null) await readCi();
       } catch (error) { handleReadError(error, session); }
       finally {
         if (session === state.session) { state.syncing = false; updateForm(); if (state.refreshAgain && state.authenticated) { state.refreshAgain = false; state.timer = setTimeout(refresh, 0); } else scheduleRefresh(session); }
@@ -1200,7 +1388,7 @@
       const publication = task && jobFor(task).continuation?.publish_approved;
       const inheritedEvidence = isRecord(publication) ? '发布后继：下方测试、审查、模型设置与 token 用量证据继承自任务 #' + jobFor(task).continuation.predecessor_task_id + '，不表示本次产生了新的开发、审查或测试调用。这里只执行已授权的精确候选发布，Draft PR 不代表已合并' : '';
       $('continuation-choice').textContent = [state.continuationNotices.get(task?.id), inheritedEvidence].filter(Boolean).join('\n'); $('continuation-choice').hidden = !$('continuation-choice').textContent;
-      renderUsage(task ? parseJson(resultFor(task)) : null); renderSelectionEvidence(task); renderOperator(task); renderPublication(task);
+      renderUsage(task ? parseJson(resultFor(task)) : null); renderSelectionEvidence(task); renderOperator(task); renderPublication(task); renderCi(task);
       $('task-detail').hidden = !task; $('detail-empty').hidden = Boolean(task); if (!task) { ['detail-title', 'detail-key', 'detail-badge', 'detail-meta', 'detail-requirements', 'detail-result', 'detail-diagnostic-text', 'detail-error', 'detail-warning', 'result-placeholder', 'cancel-note'].forEach(id => { $(id).textContent = ''; }); return; }
       const job = jobFor(task), result = resultFor(task), unknown = badgeFor(task).kind === 'unknown';
       $('detail-title').textContent = '任务 #' + task.id; $('detail-key').textContent = task.key; setBadge($('detail-badge'), task);
@@ -1237,7 +1425,7 @@
       if (inList) { state.selectedId = id; } const selection = ++state.selection, session = state.session, revision = state.revision;
       if (state.detailController) state.detailController.abort(); const controller = new AbortController(); state.detailController = controller;
       showMessage('detail-error', ''); $('copy-result').textContent = '复制结果'; render();
-      try { const task = await api('/api/tasks/' + encodeURIComponent(id), { signal: controller.signal }); if (!validTask(task) || task.id !== id) throw new ApiError('任务详情格式不符合预期'); if (session === state.session && selection === state.selection) { if (revision === state.revision || !state.tasks.some(item => item.id === id)) upsertTask(task); state.selectedId = id; if (!inList) state.filter = 'all'; render(); await readOperator(id); } }
+      try { const task = await api('/api/tasks/' + encodeURIComponent(id), { signal: controller.signal }); if (!validTask(task) || task.id !== id) throw new ApiError('任务详情格式不符合预期'); if (session === state.session && selection === state.selection) { if (revision === state.revision || !state.tasks.some(item => item.id === id)) upsertTask(task); state.selectedId = id; if (!inList) state.filter = 'all'; render(); await Promise.all([readOperator(id), readCi(id)]); } }
       catch (error) { if (session !== state.session || selection !== state.selection || isAborted(error)) return; if (error.status === 401 || error.status === 403) handleReadError(error, session); else showMessage('detail-error', '详情刷新失败：' + formatError(error)); }
       finally { if (state.detailController === controller) state.detailController = null; }
     }
@@ -1262,7 +1450,7 @@
         $('auth-panel').hidden = true; $('network-banner').hidden = true; updateConnection(); reconcilePending(); updateForm(); render();
         if (!state.pending && (!config.repositories.length || !config.agents.length)) showMessage('form-message', '服务端尚未配置可用的仓库或 Agent，请先完成服务配置', 'error');
         $('sync-time').textContent = '已连接 · 每 2 秒同步'; announce('工作台已连接，共 ' + tasks.length + ' 个任务'); scheduleRefresh(session); $('repository').focus();
-        renderCatalog(); renderInventory(); readCatalogCache(); if (state.selectedId !== null) await readOperator();
+        renderCatalog(); renderInventory(); readCatalogCache(); if (state.selectedId !== null) await Promise.all([readOperator(), readCi()]);
     }
     async function detectAuth() {
       if (state.connecting) return;
@@ -1505,15 +1693,18 @@
         if (state.authenticated && state.selectedId === id) showMessage('detail-error', (rejected ? '发布请求被拒绝：' : '发布请求结果尚未确认：') + formatError(error) + (rejected ? '。请刷新资格，再重新核对精确候选与目标' : '。原 key 和范围已保留，请先刷新核对后继与外部结果。不会自动重试，也不会重放已有发布标记的未知操作'));
       } finally { if (session === state.session) { publicationState.publishing.delete(id); renderDetail(); refresh(); } }
     });
+    $('ci-read').addEventListener('click', () => readCi());
+    $('ci-start').addEventListener('click', startCi);
+    $('ci-policy').addEventListener('change', () => { ciState.selectedPolicy = $('ci-policy').value; renderCi(state.tasks.find(task => task.id === state.selectedId)); });
     $('copy-result').addEventListener('click', async () => { const id = state.selectedId, session = state.session; try { if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error('unavailable'); await navigator.clipboard.writeText($('detail-result').textContent); if (session === state.session && id === state.selectedId) { $('copy-result').textContent = '已复制'; announce('执行结果已复制'); } } catch (_) { if (session === state.session && id === state.selectedId) { showMessage('detail-error', '浏览器未允许复制，请选中结果文本后手动复制'); $('detail-result').focus(); } } });
     const darkPreference = window.matchMedia('(prefers-color-scheme: dark)');
     function updateThemeLabel() { const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === 'dark' : darkPreference.matches; $('theme-toggle').setAttribute('aria-label', dark ? '切换为浅色模式' : '切换为深色模式'); }
     $('theme-toggle').addEventListener('click', () => { const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === 'dark' : darkPreference.matches; document.documentElement.dataset.theme = dark ? 'light' : 'dark'; updateThemeLabel(); });
     darkPreference.addEventListener('change', updateThemeLabel);
     window.addEventListener('online', () => { if (state.authenticated) refresh(); });
-    window.addEventListener('beforeunload', event => { if (state.pending || state.retryRequests.size || publicationState.requests.size) { event.preventDefault(); event.returnValue = ''; } });
-    window.addEventListener('popstate', () => { closePublication(); invalidateStartupDiscovery(); invalidateCatalogRead(); renderCatalog(); });
-    window.addEventListener('pagehide', () => { closePublication(); invalidateStartupDiscovery(); invalidateCatalogRead(); resetInventory(); state.token = ''; $('token').value = ''; $('password').value = ''; state.session++; clearTimeout(state.timer); for (const controller of state.controllers) controller.abort(); });
+    window.addEventListener('beforeunload', event => { if (state.pending || state.retryRequests.size || publicationState.requests.size || ciState.requests.size || ciState.controls.size) { event.preventDefault(); event.returnValue = ''; } });
+    window.addEventListener('popstate', () => { resetCiRead(); renderCi(state.tasks.find(task => task.id === state.selectedId)); closePublication(); invalidateStartupDiscovery(); invalidateCatalogRead(); renderCatalog(); });
+    window.addEventListener('pagehide', () => { resetCiRead(); closePublication(); invalidateStartupDiscovery(); invalidateCatalogRead(); resetInventory(); state.token = ''; $('token').value = ''; $('password').value = ''; state.session++; clearTimeout(state.timer); for (const controller of state.controllers) controller.abort(); });
     window.addEventListener('pageshow', event => { if (event.persisted) { stopSession(); if (state.authMode !== 'bearer') detectAuth(); } });
     updateThemeLabel(); updateForm(); detectAuth();
   })();

@@ -266,6 +266,9 @@ pub(crate) fn prepare(
         let mut count = 0;
         for entry in entries {
             let entry = entry.map_err(|e| failure(&path, Outcome::Failure, e))?;
+            if crate::ci_tracking::is_control_directory(&entry.path()) {
+                continue;
+            }
             count += 1;
             if entry
                 .file_name()

@@ -82,6 +82,20 @@ try:
                     elif path.endswith('/operator'):
                         value = next(value for value in data['tasks'] if value['id'] == int(path.split('/')[-2]))
                         response = operator(value, data['successor'] if value['id'] == 1 else None)
+                    elif path.startswith('/api/tasks/') and path.endswith(('/ci-preview', '/ci-tracks')):
+                        assert req.method == 'GET' and not req.post_data
+                        task_id = int(path.split('/')[-2])
+                        assert any(value['id'] == task_id for value in data['tasks'])
+                        # This fixture stops at publication admission, without a real PR receipt.
+                        response = [] if path.endswith('/ci-tracks') else {
+                            'eligible': False, 'reason': 'Fixture has no real publication receipt',
+                            'publication': None, 'policies': [], 'tracks': [],
+                            'remote_merge_eligibility': 'not_established'}
+                    elif path.startswith('/api/ci-tracks/'):
+                        assert req.method == 'GET' and not req.post_data
+                        intercept.fulfill(status=404, content_type='application/json',
+                            body=json.dumps({'error': 'CI track does not exist'}))
+                        return
                     elif path == '/api/tasks/1/publish-approved':
                         assert req.method == 'POST'
                         body = req.post_data_json

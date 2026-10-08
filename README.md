@@ -44,6 +44,8 @@ POST /api/tasks/<id>/replacement-challenge # 更换停止角色时的权限范�
 POST /api/tasks/<id>/retry      # 显式核对后继续已停止失败任务，复用原工作区
 POST /api/tasks/<id>/continue-review # 同一候选复验一次测试后只继续审查，不重新开发
 POST /api/tasks/<id>/publish-approved # 显式接受原测试证据，将已审核候选单独交给发布器
+GET  /api/tasks/<id>/ci-preview # 真实发布后的本地策略与跟踪预览，不访问 GitHub
+POST /api/tasks/<id>/track-ci   # 显式启动固定 PR/SHA/来源的只读 CI 跟踪
 ```
 
 同一 key 与相同规范化 job 返回原任务；同 key 配不同 job 返回 409。发送超时后应保留原 key 重试，避免重复执行。身份口令不是任务 owner；owner 仅是数据库一致性标识。
@@ -59,6 +61,8 @@ POST /api/tasks/<id>/publish-approved # 显式接受原测试证据，将已审�
 首次本机安装、真实 CLI 完整配置、停止/重启与备份升级见 [Linux 操作手册](docs/operator-guide.md)。配置、占位符、工作区限制、可选 draft PR 流程及恢复方法见 [运行说明](docs/application.md)。首次接真实 CLI 前先确认其当前版本的调用参数、权限与费用。演示配置是可直接运行的契约示例，不假设你已安装任何模型 CLI。
 
 成功但未发布的已审核候选可[显式交接给发布器](docs/approved-publication.md)，无需重新开发或审查；操作明确接受原宿主测试证据，绑定精确候选和目标，默认仍为 draft PR，不代表 CI 通过或已合并。
+
+真实发布后可以[跟踪同一候选的 CI](docs/exact-head-ci-tracking.md)：独立应用 worker 查询宿主允许的精确 GitHub Actions 来源，等待不占开发队列 claim，不调用模型。“已配置检查通过”不表示远端允许合并，也不会自动转正 draft 或合并。
 
 ## 可靠性边界
 
