@@ -250,6 +250,14 @@ with sync_playwright() as p:
             # it generated a fresh key and opened its dialog before another tab.
             data['frozen_lists'].pop(req.frame.page,None)
             result=task_response(result)
+        elif path.startswith('/api/tasks/') and path.endswith(('/merge-preview','/merge-authorizations')):
+            assert req.method=='GET' and not req.post_data
+            task_id=int(path.split('/')[-2])
+            assert any(value['id']==task_id for value in data['tasks'])
+            result=[] if path.endswith('/merge-authorizations') else {'eligible':False,'reason':'Merge authorization disabled in fixture','policies':[],'authorizations':[],'risk_disclosure':None,'lane_diagnostic':None}
+        elif path.startswith('/api/merge-authorizations/'):
+            assert req.method=='GET' and not req.post_data
+            r.fulfill(status=404,content_type='application/json',body=json.dumps({'error':'Merge authorization does not exist'}));return
         elif path.startswith('/api/tasks/') and path.endswith(('/ci-preview','/ci-tracks')):
             assert req.method=='GET' and not req.post_data
             task_id=int(path.split('/')[-2])

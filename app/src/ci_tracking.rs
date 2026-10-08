@@ -92,7 +92,7 @@ impl CiPolicy {
         }
         Ok(())
     }
-    fn digest(&self, workspace_root: &Path) -> Result<String> {
+    pub(crate) fn digest(&self, workspace_root: &Path) -> Result<String> {
         let m = fs::metadata(&self.observer.program).map_err(invalid_io)?;
         let executable = json!({"path":self.observer.program.canonicalize().map_err(invalid_io)?,"device":m.dev(),"inode":m.ino(),"len":m.len(),"mtime":m.mtime(),"mtime_nsec":m.mtime_nsec(),"ctime":m.ctime(),"ctime_nsec":m.ctime_nsec(),"mode":m.mode()});
         // Never persist command args or environment: either may contain credentials.
@@ -169,13 +169,13 @@ struct Record {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Publication {
-    repository: String,
-    base_branch: String,
-    head_sha: String,
-    head_branch: String,
-    pr_number: u64,
-    pr_url: String,
+pub(crate) struct Publication {
+    pub(crate) repository: String,
+    pub(crate) base_branch: String,
+    pub(crate) head_sha: String,
+    pub(crate) head_branch: String,
+    pub(crate) pr_number: u64,
+    pub(crate) pr_url: String,
 }
 fn invalid_io(error: io::Error) -> Error {
     Error::Invalid(format!("CI local state: {error}"))
@@ -214,7 +214,7 @@ fn diagnostic(record: &mut Record, status: &str, code: &str, message: &str) {
         message: message.into(),
     });
 }
-fn publication(task: &relay::Task) -> Result<Publication> {
+pub(crate) fn publication(task: &relay::Task) -> Result<Publication> {
     if task.state != relay::State::Finished {
         return Err(unavailable(
             "ci_publication_unavailable",
@@ -646,7 +646,7 @@ impl Application {
     fn ci_storage(&self) -> PathBuf {
         self.ci_storage_root.clone()
     }
-    fn ci_prepare_storage(&self, db: &Connection) -> Result<()> {
+    pub(crate) fn ci_prepare_storage(&self, db: &Connection) -> Result<()> {
         if bound_storage(db)?.is_some() {
             return self.ci_validate_storage(db);
         }
@@ -699,7 +699,7 @@ impl Application {
         )?;
         Ok(())
     }
-    fn ci_validate_storage(&self, db: &Connection) -> Result<()> {
+    pub(crate) fn ci_validate_storage(&self, db: &Connection) -> Result<()> {
         let Some((bound, device, inode)) = bound_storage(db)? else {
             return Err(Error::Invalid(
                 "CI durable control-root identity is missing; inspect local state before recovery"
@@ -757,7 +757,7 @@ impl Application {
         self.ci_storage().join(format!("attempt-{id}-{attempt}"))
     }
 }
-fn ci_for_task(db: &Connection, id: i64) -> Result<Vec<CiTrack>> {
+pub(crate) fn ci_for_task(db: &Connection, id: i64) -> Result<Vec<CiTrack>> {
     let mut query =
         db.prepare("SELECT record FROM app_ci_tracks WHERE task_id=?1 ORDER BY id DESC LIMIT 100")?;
     query
@@ -1171,7 +1171,7 @@ struct Marker {
     track_id: i64,
     attempt: u64,
 }
-fn flock(file: &File) -> io::Result<()> {
+pub(crate) fn flock(file: &File) -> io::Result<()> {
     // SAFETY: operates only on an owned fd and never signals a process.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         Ok(())
@@ -1179,20 +1179,20 @@ fn flock(file: &File) -> io::Result<()> {
         Err(io::Error::last_os_error())
     }
 }
-fn matches_file(path: &Path, file: &File) -> bool {
+pub(crate) fn matches_file(path: &Path, file: &File) -> bool {
     fs::symlink_metadata(path)
         .ok()
         .zip(file.metadata().ok())
         .is_some_and(|(p, f)| p.is_file() && p.dev() == f.dev() && p.ino() == f.ino())
 }
-fn sync_parent(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
     File::open(
         path.parent()
             .ok_or_else(|| io::Error::other("missing CI guard parent"))?,
     )?
     .sync_all()
 }
-fn create_marker(path: &Path, marker: &Marker) -> Result<Arc<File>> {
+pub(crate) fn create_marker(path: &Path, marker: &impl Serialize) -> Result<Arc<File>> {
     // Stage a complete locked marker before publishing it atomically. A crash
     // after create_new but before fsync can leave only an inert staging file,
     // never an empty canonical guard whose exact attempt cannot be recovered.
@@ -1229,7 +1229,7 @@ fn create_marker(path: &Path, marker: &Marker) -> Result<Arc<File>> {
     sync_parent(path).map_err(invalid_io)?;
     Ok(Arc::new(file))
 }
-fn open_marker(path: &Path) -> Result<Option<File>> {
+pub(crate) fn open_marker(path: &Path) -> Result<Option<File>> {
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -1574,4 +1574,41 @@ impl Application {
         }
         Ok(record.view)
     }
+}
+
+/// Reuses the exact CI source validator for a new merge-owned observation. Only
+/// the historical base tip/window are reset; source and numeric identities stay fixed.
+/// This never edits the original tracker or claims cached CI establishes eligibility.
+pub(crate) fn validate_merge_observation(
+    track: &CiTrack,
+    evidence: &Value,
+    at: u64,
+) -> Result<CiTrack> {
+    let mut record = Record {
+        view: track.clone(),
+        key: String::new(),
+        publication_result_sha256: String::new(),
+        active: false,
+        transient_failures: 0,
+        last_resume_revision: None,
+    };
+    record.view.observed_base_sha = None;
+    record.view.stop_requested = false;
+    record.view.deadline = u64::MAX;
+    record.view.latest_evidence = None;
+    let mut command = crate::host::CommandResult::error(Outcome::Success, "");
+    command.stdout = evidence.to_string();
+    evaluate(&mut record, &command, at);
+    if !matches!(
+        record.view.status.as_str(),
+        "watching" | "configured_checks_passed" | "checks_failed" | "pr_merged" | "pr_closed"
+    ) || record.view.last_observed_at != Some(at)
+        || record.view.latest_evidence.is_none()
+    {
+        return Err(unavailable(
+            "merge_ci_invalid",
+            "Fresh exact-source CI evidence is invalid or incomplete",
+        ));
+    }
+    Ok(record.view)
 }

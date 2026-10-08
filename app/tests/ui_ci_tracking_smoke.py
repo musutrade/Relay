@@ -92,6 +92,19 @@ try:
                         response = [task(2), task(1)]
                     elif path.endswith('/operator'):
                         response = operator(task(int(path.split('/')[-2])))
+                    elif path.startswith('/api/tasks/') and path.endswith(('/merge-preview', '/merge-authorizations')):
+                        assert req.method == 'GET' and not req.post_data
+                        task_id = int(path.split('/')[-2])
+                        assert task_id in (1, 2)
+                        response = [] if path.endswith('/merge-authorizations') else {
+                            'eligible': False, 'reason': 'Merge authorization disabled in fixture',
+                            'policies': [], 'authorizations': [], 'risk_disclosure': None,
+                            'lane_diagnostic': None}
+                    elif path.startswith('/api/merge-authorizations/'):
+                        assert req.method == 'GET' and not req.post_data
+                        intercept.fulfill(status=404, content_type='application/json',
+                            body=json.dumps({'error': 'Merge authorization does not exist'}))
+                        return
                     elif path.startswith('/api/tasks/') and path.endswith(('/ci-preview', '/ci-tracks')):
                         assert req.method == 'GET' and not req.post_data
                         task_id = int(path.split('/')[-2])

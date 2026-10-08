@@ -79,6 +79,8 @@ pub struct HostConfig {
     pub draft_pr_adapters: BTreeMap<String, CommandProfile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ci_policies: BTreeMap<String, crate::ci_tracking::CiPolicy>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub merge_policies: BTreeMap<String, crate::merge_authorization::MergePolicy>,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
     #[serde(default = "default_output")]
@@ -573,6 +575,7 @@ impl Host {
             .chain(config.tests.keys())
             .chain(config.draft_pr_adapters.keys())
             .chain(config.ci_policies.keys())
+            .chain(config.merge_policies.keys())
         {
             if name.is_empty()
                 || name.len() > 128
@@ -600,6 +603,7 @@ impl Host {
             .chain(config.tests.values())
             .chain(config.draft_pr_adapters.values())
             .chain(config.ci_policies.values().map(|policy| &policy.observer))
+            .chain(config.merge_policies.values().map(|policy| &policy.adapter))
         {
             if !profile.program.is_absolute() || !profile.program.is_file() {
                 return Err(HostError::Config(
@@ -621,6 +625,9 @@ impl Host {
         }
         for policy in config.ci_policies.values() {
             policy.validate().map_err(HostError::Config)?;
+        }
+        for policy in config.merge_policies.values() {
+            policy.validate(&config).map_err(HostError::Config)?;
         }
         for workflow in config.workflows.values() {
             workflow.validate(&config)?;
@@ -1541,6 +1548,86 @@ impl Host {
             cancellation,
             workspace,
             "ci-observer",
+        )
+    }
+
+    // Independent explicitly authorized merge lane, with the same inherited guard.
+    pub(crate) fn run_merge_adapter(
+        &self,
+        profile: &CommandProfile,
+        input: &str,
+        workspace: &Path,
+        guard: Arc<File>,
+        cancellation: &AtomicBool,
+        write_gate: Option<(&Path, &str, u64, u64)>,
+    ) -> CommandResult {
+        let mut config = self.config.clone();
+        config.max_workspace_bytes = Some(1024 * 1024);
+        config.max_snapshot_entries = 128;
+        let lane = Self {
+            config,
+            supervisor: self.supervisor.clone(),
+            leases: Mutex::new(BTreeMap::from([(workspace.to_path_buf(), guard)])),
+            model_observations: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        let mut env = profile.env.clone();
+        env.insert("RELAY_MERGE_CONTROL".into(), "1".into());
+        // Explicit overrides also mask inherited service variables when clear_env=false.
+        env.insert("RELAY_MERGE_WRITE".into(), "0".into());
+        for name in [
+            "RELAY_MERGE_GATE_PATH",
+            "RELAY_MERGE_GATE_BINDING",
+            "RELAY_MERGE_GATE_DEVICE",
+            "RELAY_MERGE_GATE_INODE",
+        ] {
+            env.insert(name.into(), String::new());
+        }
+        if let Some((gate_path, gate_binding, device, inode)) = write_gate {
+            let Ok(meta) = std::fs::symlink_metadata(gate_path) else {
+                return CommandResult::error(Outcome::Unknown, "Exact merge write gate missing");
+            };
+            use std::os::unix::fs::MetadataExt;
+            if !meta.is_file()
+                || meta.dev() != device
+                || meta.ino() != inode
+                || meta.mode() & 0o777 != 0o600
+                || meta.uid() != unsafe { libc::geteuid() }
+            {
+                return CommandResult::error(
+                    Outcome::Unknown,
+                    "Exact merge write gate identity changed",
+                );
+            }
+            env.insert("RELAY_MERGE_WRITE".into(), "1".into());
+            env.insert(
+                "RELAY_MERGE_GATE_PATH".into(),
+                gate_path.to_string_lossy().into_owned(),
+            );
+            env.insert("RELAY_MERGE_GATE_BINDING".into(), gate_binding.into());
+            env.insert("RELAY_MERGE_GATE_DEVICE".into(), meta.dev().to_string());
+            env.insert("RELAY_MERGE_GATE_INODE".into(), meta.ino().to_string());
+        }
+        lane.run_supervised(
+            CommandSpec {
+                workspace_lease: false,
+                git_inventory: false,
+                catalog: false,
+                claude_control: false,
+                app_server: None,
+                provider: None,
+                read_only: false,
+                clear_env: false,
+                program: profile.program.clone(),
+                args: profile.args.clone(),
+                env,
+                cwd: workspace.to_path_buf(),
+                input: input.to_owned(),
+                timeout_ms: 30_000,
+                output_limit_bytes: 64 * 1024,
+            },
+            cancellation,
+            workspace,
+            "authorized-merge",
         )
     }
 

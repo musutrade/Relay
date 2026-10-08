@@ -153,3 +153,8 @@ Claude 独立启动发现由 host profile 的 `allow_startup_discovery` 显式 o
 ## Kiro ACP 开发适配器
 
 `app/src/kiro_acp.rs` 实现 Kiro V3 的单会话 ACP JSON-RPC 驱动：握手、全新会话、单个关联 prompt 与有界回答。只在请求全部写入后接纳响应；拒绝运行时权限提升、文件/终端/认证回调。配置在原生 profile 中，生命周期继续由既有 supervisor 拥有，不修改内核、队列或重试语义。Kiro 的原生 hooks、MCP 与已有权限仍受宿主信任，不据此宣称 OS 沙箱或严格审查隔离。`whoami` 仅是任务前认证就绪门禁，结果身份信息不持久化；目录刷新不启动 ACP、认证或模型列表子进程。详情见 [Kiro 接入](kiro-adapter.md)。
+
+
+## 精确候选的异步合并授权
+
+`merge_authorization.rs` 在应用层保存每个目标的不可变同意范围、数字身份、策略/来源摘要、固定最晚发送期限和有界执行历史。独立 worker 与宿主控制根/进程回收复用，不占核心 claim，不调用模型，不保留开发工作区。参考 GitHub adapter 每次重新核对目标与可信 CI，仅发送 SHA 条件、`bypass_rules=false` 的 direct async merge；基础分支和堆叠检查明确是非原子的预检。撤销与实际发送前的本地门串行化，已发出的远端请求只读追踪，不承诺撤销或恰好一次。默认关闭，未知效果不重放，已受理与真实合并分别展示。详见[异步合并授权](authorized-async-merge.md)。

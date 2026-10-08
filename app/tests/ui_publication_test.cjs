@@ -44,7 +44,9 @@ function fixture(authMode = 'bearer') {
     if(url==='/auth/status')data={mode:authMode,authenticated:false};
     else if(url==='/auth/login')data={authenticated:true};
     else if(url==='/auth/logout'){if(f.logoutError)throw new TypeError('logout failed');data={authenticated:false};}
-    else if(url==='/api/config')data={repositories:['repo','other'],agents:['agent'],tests:['test'],workflows:[{name:'review / flow',repository:'repo',developer:'agent',reviewer:'agent',test:'test',max_repairs:0}]};
+    else if(url.endsWith('/merge-preview'))data={eligible:false,reason:'Merge disabled in fixture',policies:[],authorizations:[],risk_disclosure:null,lane_diagnostic:null};
+    else if(url.endsWith('/merge-authorizations'))data=[];
+    else if (url==='/api/config')data={repositories:['repo','other'],agents:['agent'],tests:['test'],workflows:[{name:'review / flow',repository:'repo',developer:'agent',reviewer:'agent',test:'test',max_repairs:0}]};
     else if(url==='/api/status')data=f.status;
     else if(url==='/api/tasks'&&opts.method==='GET')data=f.tasks;
     else if(url.startsWith('/api/resources?')){data=f.estimate;if(f.estimateError){status=f.estimateError;data={error:'estimate unavailable'};}}

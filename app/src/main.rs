@@ -13,6 +13,22 @@ fn main() {
 }
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("confirm-merge-stopped") {
+        if args.len() != 8 || args[7] != "--confirm-process-tree-stopped" {
+            return Err("usage: relay-app confirm-merge-stopped <config.json> <db-path> <authorization-id> <attempt> <phase> --confirm-process-tree-stopped".into());
+        }
+        let app = Application::open(&args[3], HostConfig::load(&args[2])?)?;
+        println!(
+            "{}",
+            serde_json::to_string(&app.confirm_merge_stopped(
+                args[4].parse()?,
+                args[5].parse()?,
+                &args[6],
+                true
+            )?)?
+        );
+        return Ok(());
+    }
     if args.get(1).map(String::as_str) == Some("confirm-ci-stopped") {
         if args.len() != 7 || args[6] != "--confirm-process-tree-stopped" {
             return Err("usage: relay-app confirm-ci-stopped <config.json> <db-path> <track-id> <attempt> --confirm-process-tree-stopped\nUse only after inspecting this exact retained CI process tree and confirming it stopped.".into());
@@ -142,6 +158,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let worker = std::thread::spawn(move || worker_app.worker());
     let ci_app = Arc::clone(&app);
     let ci_worker = std::thread::spawn(move || ci_app.ci_worker());
+    let merge_app = Arc::clone(&app);
+    let merge_worker = std::thread::spawn(move || merge_app.merge_worker());
     let signal_app = Arc::clone(&app);
     let served = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -159,6 +177,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     ci_worker
         .join()
         .map_err(|_| "CI worker panicked; inspect retained CI process guard before resuming")?;
+    merge_worker.join().map_err(
+        |_| "merge worker panicked; inspect retained merge process guard before recovery",
+    )?;
     served?;
     Ok(())
 }
