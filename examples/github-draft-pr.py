@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 MAX_CAPTURE = 64 * 1024
+MAX_REVIEW_EVIDENCE_BYTES = 8192
 MAX_INVENTORY_BYTES = 4 * 1024 * 1024
 MAX_INVENTORY_ENTRIES = 50_000
 MAX_INVENTORY_PATH_BYTES = 4096
@@ -58,6 +59,13 @@ def plan(env):
             f"Base SHA: {base_sha}\nCandidate SHA: {candidate}\n"
             f"Test result: success\nReview: approved for {candidate}\n\n"
             "Created as a draft for human review. No merge or deployment is performed.")
+    evidence = env.get("RELAY_REVIEW_EVIDENCE", "")
+    if len(evidence.encode("utf-8")) > MAX_REVIEW_EVIDENCE_BYTES or "\0" in evidence:
+        raise ValueError("review evidence exceeds its bounded text contract")
+    if evidence:
+        # Preserve the host's provenance caveat. Historical test acceptance must
+        # not become an unqualified claim that tests were freshly executed.
+        body += "\n\nHost evidence (including any operator attestations):\n" + evidence
     url = f"https://github.com/{repository}.git"
     commands = [
         [git, "push", "--no-follow-tags", url, f"{candidate}:refs/heads/{branch}"],

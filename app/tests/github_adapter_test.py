@@ -112,6 +112,21 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             adapter.main({**self.env, "RELAY_GITHUB_EXECUTE": "1", "RELAY_DRAFT_PR": "false"})
 
+    def test_publication_preserves_prior_test_provenance_and_review_caveats(self):
+        evidence = ("Prior host tests explicitly accepted without revalidation; "
+                    "external test inputs are not frozen.\nReview caveat: remote integration not exercised.")
+        data = adapter.plan({**self.env, "RELAY_REVIEW_EVIDENCE": evidence})
+        command = data["commands"][-1]
+        body = command[command.index("--body") + 1]
+        self.assertIn(evidence, body)
+        self.assertIn("No merge or deployment is performed", body)
+
+    def test_review_evidence_has_utf8_byte_bound_and_rejects_nul(self):
+        adapter.plan({**self.env, "RELAY_REVIEW_EVIDENCE": "é" * 4096})
+        for evidence in ("é" * 4096 + "x", "x" * 8193, "before\0after"):
+            with self.subTest(size=len(evidence)), self.assertRaises(ValueError):
+                adapter.plan({**self.env, "RELAY_REVIEW_EVIDENCE": evidence})
+
     def test_changed_head_dirty_tree_index_and_remote_base_never_publish(self):
         for flag, returned in [("rev-parse", BASE), ("write-tree", BASE),
                                ("ls-files", "new.txt"),

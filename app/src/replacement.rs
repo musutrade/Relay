@@ -432,6 +432,7 @@ mod tests {
                 predecessor_generation: 1,
                 review_only: None,
                 operator_adoption: None,
+                publish_approved: None,
             });
             freeze(&job, &mut next, &result, "host", false, &config).unwrap();
             verify_transition(&normalized(&job), &next, &result, "host", &config).unwrap();

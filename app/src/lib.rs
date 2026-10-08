@@ -9,6 +9,8 @@ mod git_inventory;
 pub mod host;
 pub mod http;
 mod kiro_acp;
+mod publication;
+pub use publication::PublishApprovedRequest;
 pub mod mcp;
 pub mod providers;
 pub mod replacement;
@@ -445,6 +447,12 @@ impl Application {
             // candidate, or an earlier reservation for a different action.
             let reserved: Job =
                 serde_json::from_str(&reservation.1).map_err(|e| Error::Invalid(e.to_string()))?;
+            if publication::current(&reserved).is_some() {
+                return Err(action_unavailable(
+                    "publication_only_operation",
+                    "a publish-approved reservation can only be resumed through publish-approved with its exact original authorization",
+                ));
+            }
             if adoption.is_none()
                 && reserved
                     .continuation
@@ -495,6 +503,12 @@ impl Application {
             }
             let mut job = Job::from_payload(&predecessor.payload, self.host.config())
                 .map_err(|e| Error::Invalid(e.to_string()))?;
+            if publication::current(&job).is_some() {
+                return Err(action_unavailable(
+                    "publication_only_operation",
+                    "a publish-approved operation cannot be retried as development or review; inspect its publication outcome and reconcile external effects",
+                ));
+            }
             let predecessor_job = job.clone();
             let prior_quota = recorded_quota(&result, &job);
             let inherited_quota = job
@@ -920,6 +934,7 @@ impl Application {
                 diagnostic,
             )
         };
+        let publication_view = publication::operator(self, &task, successor, reservation.as_ref());
         let job = Job::from_payload(&task.payload, self.host.config()).ok();
         let result = task
             .result
@@ -1085,6 +1100,17 @@ impl Application {
             blocked_reason =
                 Some("task payload or stopped result is not a verified host record".into());
         }
+        if let Some((publication_actions, publication_request, reason)) = publication_view {
+            actions = publication_actions;
+            reserved_request = publication_request;
+            blocked_reason = reason;
+        } else if job
+            .as_ref()
+            .is_some_and(|job| publication::current(job).is_some())
+        {
+            actions.clear();
+            blocked_reason = Some("this immutable publication-only operation cannot restart development or review; reconcile any external effects before further action".into());
+        }
         let failure = result.as_ref().and_then(|result| result.failure.clone()).or_else(|| result.as_ref().filter(|result|result.outcome != host::Outcome::Success).map(|result|resources::Failure::new("legacy_failure", "unknown", result.error.clone().unwrap_or_else(|| "legacy result has no structured failure; inspect the retained stage output".into()))));
         Ok(
             json!({"task_id":task.id,"generation":task.generation,"failure":failure,"resources":resources,"retained_result":{"available":task.result.is_some(),"immutable":true},"workspace_retained":workspace_retained,"recovery":{"inherited_quota_bytes":inherited_quota,"actions":actions,"blocked_reason":blocked_reason,"successor_id":successor,"reserved_request":reserved_request}}),
@@ -1238,8 +1264,9 @@ impl Application {
         Ok(true)
     }
     pub fn cleanup_completed(&self) -> Result<usize> {
-        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
-        workspaces::cleanup(self.host.config(), &state.store)
+        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let StateData { store, control, .. } = &mut *state;
+        workspaces::cleanup(self.host.config(), store, control)
             .map_err(|e| Error::Invalid(e.to_string()))
     }
     pub fn worker(&self) {

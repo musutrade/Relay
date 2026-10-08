@@ -170,6 +170,28 @@ fn queued_active_and_unsubmitted_successors_remain_protected() {
     let entry = fixture.entry();
     assert_eq!(entry["successor_reserved"], true);
     assert_eq!(entry["retention"]["status"], "protected");
+    assert!(
+        entry["retention"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be verified")
+    );
+    assert!(entry["retention"]["authorization_expires_at"].is_null());
+}
+#[test]
+fn unverified_successor_protects_successful_workspace_without_inventing_expiry() {
+    let fixture = Fixture::new(Some(60));
+    let first = fixture.first(Some("success"));
+    rusqlite::Connection::open(fixture.db()).unwrap().execute(
+        "INSERT INTO app_continuations(predecessor_id,key,payload) VALUES(?1,'unverified-successor','{}')",
+        [first.id],
+    ).unwrap();
+    let entry = fixture.entry();
+    assert_eq!(entry["successor_reserved"], true);
+    assert_eq!(entry["retention"]["status"], "protected");
+    assert!(entry["retention"]["authorization_expires_at"].is_null());
+    assert_eq!(fixture.app.cleanup_completed().unwrap(), 0);
+    assert!(fixture.path(first.id).exists());
 }
 #[test]
 fn missing_or_changed_identity_marker_and_locks_never_become_eligible() {
