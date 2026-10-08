@@ -189,8 +189,8 @@ try:
             current.update(status='configured_checks_passed', revision=current['revision'] + 1)
             current['latest_evidence'].update(missing_jobs=[], failed_jobs=[])
             page.locator('#ci-read').click()
-            expect(page.locator('.ci-result')).to_have_text('configured checks passed; remote merge eligibility not established')
-            expect(page.locator('.ci-boundary')).to_contain_text('Draft PR 保持 draft')
+            expect(page.locator('#detail-ci .ci-result')).to_have_text('configured checks passed; remote merge eligibility not established')
+            expect(page.locator('#detail-ci .ci-boundary')).to_contain_text('Draft PR 保持 draft')
             current.update(status='process_unknown', revision=current['revision'] + 1,
                 diagnostic={'code': 'ci_cleanup_unknown', 'message': 'Inspect exact observer and reconcile locally'})
             page.locator('#ci-read').click()
