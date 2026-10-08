@@ -719,10 +719,7 @@ fn inventory_entry(
         entry["references_complete"] = json!(complete);
         entry["successor_reserved"] = json!(reserved);
         let publication_retention =
-            crate::publication::pending_retention(control, record.task_id, observed_at)?;
-        let released_publication = publication_retention
-            .as_ref()
-            .is_some_and(|pending| !pending.protected);
+            crate::publication::pending_retention(control, record.task_id, observed_at);
         if started.elapsed() < Duration::from_millis(250) {
             entry["allocated_usage"] = json!(crate::resources::measure_allocated_directory(
                 &directory, config
@@ -731,6 +728,20 @@ fn inventory_entry(
             entry["allocated_usage"]["reason"] =
                 json!("inventory request time bound reached before allocation observation");
         }
+        let publication_retention = match publication_retention {
+            Ok(pending) => pending,
+            Err(_) if active || current.state != relay::State::Finished || reserved => {
+                // A known owner/reservation is sufficient evidence of protection
+                // even when optional publication metadata cannot be interpreted.
+                // Do not invent an expiry or downgrade that fact to unknown.
+                entry["retention"] = json!({"status":"protected","reason":"an active/queued owner or reserved successor still references this workspace; publication retention metadata cannot be verified","eligible_at":null});
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let released_publication = publication_retention
+            .as_ref()
+            .is_some_and(|pending| !pending.protected);
         if let Some(pending) = &publication_retention
             && pending.protected
         {
